@@ -12,6 +12,8 @@ RAW="${LPN_RAW:-https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/mai
 PY="$(command -v python3 || command -v python || true)"
 
 die() { printf '%s\n' "lowpingnews: $*" >&2; exit 1; }
+OWNED="news README.md install.sh lowpingnews LICENSE .gitignore"
+owned() { for o in $OWNED; do [ "$1" = "$o" ] && return 0; done; return 1; }
 say() { printf '  %s\n' "$*"; }
 [ -n "$PY" ] || die "python3 not found (pkg install python)"
 
@@ -53,7 +55,7 @@ cmd_status() {
   d="$(newest_download || true)"
   if [ -n "$d" ]; then say "download   $(ver "$d")   $d"; else say "download   none"; fi
   if [ -d "$REPO/.git" ]; then
-    git -C "$REPO" fetch -q origin 2>/dev/null || true
+    [ "${LPN_NOFETCH:-}" = "1" ] || git -C "$REPO" fetch -q origin 2>/dev/null || true
     local_h="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo ?)"
     remote_h="$(git -C "$REPO" rev-parse --short '@{u}' 2>/dev/null || echo ?)"
     dirty=""; [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ] && dirty=" (uncommitted changes)"
@@ -125,6 +127,12 @@ cmd_ship() {
   [ -d "$REPO/.git" ] || die "$REPO is not a git repo"
   [ $# -ge 1 ] || die "usage: lowpingnews ship \"commit message\""
   cmd_install
+  stray=""
+  for f in $(git -C "$REPO" status --porcelain | awk '{print $NF}'); do
+    owned "${f%%/*}" || stray="$stray $f"
+  done
+  [ -n "$stray" ] && die "refusing to commit files this project does not own:$stray
+  remove them, or add to OWNED if they belong here"
   git -C "$REPO" add -A
   git -C "$REPO" diff --cached --quiet && { say "nothing to commit"; return 0; }
   git -C "$REPO" commit -m "$*" || die "commit failed"
@@ -135,6 +143,9 @@ cmd_ship() {
 cmd_release() {
   [ $# -ge 1 ] || die "usage: lowpingnews release <version>"
   v="$1"
+  case "$v" in
+    *[!0-9.]*|""|.*|*.) die "version must be digits and dots, e.g. 2.1" ;;
+  esac
   cur="$(repo_ver)"
   [ "$cur" = "$v" ] || {
     sed -i "s|^VERSION = .*|VERSION = \"$v\"|" "$REPO/news" || die "version bump failed"
@@ -142,6 +153,11 @@ cmd_release() {
   }
   cmd_install
   cmd_test
+  stray=""
+  for f in $(git -C "$REPO" status --porcelain | awk '{print $NF}'); do
+    owned "${f%%/*}" || stray="$stray $f"
+  done
+  [ -n "$stray" ] && die "refusing to release with untracked foreign files:$stray"
   git -C "$REPO" add -A
   git -C "$REPO" diff --cached --quiet || git -C "$REPO" commit -m "v$v" || die "commit failed"
   git -C "$REPO" push || die "push failed"
@@ -221,7 +237,7 @@ lowpingnews - dev loop and updater
   release <ver>   bump VERSION, install, test, commit, tag, gh release
   clean           delete stale downloads
 
-env: LPN_REPO LPN_DOWNLOADS (space-separated dirs) LPN_RAW
+env: LPN_REPO LPN_DOWNLOADS (space-separated dirs) LPN_RAW LPN_NOFETCH=1
 EOF
 }
 

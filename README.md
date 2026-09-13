@@ -75,6 +75,7 @@ news -q fern            search cached headlines, no network
 news -r 4               read item 4 as text
 news -d 2,3,5           download article bodies for offline reading
 news -d all             download everything in the current list
+news -d all --budget 500  raise the 4 MB ceiling for one run
 news -o 4               open item 4 in a browser
 
 news -u                 hide items you've already read
@@ -182,7 +183,9 @@ handshake and a 304, so a second run the same day is close to free.
 | `news -r N`, neither          | one page fetch, size reported       |
 
 `-d` prints a per-item ledger so you can see what a batch cost before you
-commit to it.
+commit to it, and stops at a 4 MB ceiling per run. Items whose text is already
+free — carried in the feed, or previously downloaded — are never counted
+against the budget and always proceed.
 
 ## Files
 
@@ -231,6 +234,19 @@ lowpingnews release 2.0     bump VERSION, install, test, commit, tag, gh release
 lowpingnews pull            git pull, then install
 lowpingnews clean           delete stale downloads
 ```
+
+`ship` and `release` refuse to commit anything this project doesn't own.
+Downloads is a shared directory and archives get extracted into the working
+tree, so an unrelated project landing in the repo is a real failure that has
+happened; the allowlist is `news`, `README.md`, `install.sh`, `lowpingnews`,
+`LICENSE`, `.gitignore`. Version arguments must be digits and dots, since they
+become both a `sed` replacement and a git tag.
+
+`release` is idempotent: an existing tag pointing at HEAD is a no-op, one
+stranded on an older commit is moved, and `gh release create` falls through to
+`edit` if the release already exists.
+
+Set `LPN_NOFETCH=1` to stop `status` probing the remote.
 
 `sync` picks the newest build in `~/storage/downloads` that actually parses and
 carries a `VERSION`, ignoring the filename entirely. Android saves repeat

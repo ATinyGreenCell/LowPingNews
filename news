@@ -4,7 +4,7 @@ import argparse, datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.0"
+VERSION = "2.1"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
@@ -12,6 +12,7 @@ FEEDCAP = 2 * 1024 * 1024       # refuse oversized feeds and gzip bombs
 PAGECAP = 5 * 1024 * 1024
 STARCAP = 500
 STORECAP = 40                  # items kept per feed; DW ships 136, you read 5
+DLBUDGET = 4 * 1024 * 1024     # ceiling for one -d run; raise with --budget
 ST = DATA + "/state.json"
 CD = os.path.expanduser("~/.cache/news")
 CFD = os.path.expanduser("~/.config/news")
@@ -562,6 +563,8 @@ def main():
     p.add_argument("-r", "--read", type=int, metavar="N", help="read item N as text")
     p.add_argument("-d", "--download", metavar="LIST",
                    help="save article bodies offline: 1,3,5 or all")
+    p.add_argument("--budget", type=int, metavar="KB",
+                   help="ceiling for one -d run (default %d)" % (DLBUDGET // 1024))
     p.add_argument("-S", "--star", type=int, metavar="N", help="save/unsave item N")
     p.add_argument("-u", "--unread", action="store_true", help="hide items already read")
     p.add_argument("-q", "--query", metavar="TERM", help="search cached headlines")
@@ -723,12 +726,17 @@ def main():
                 want = [int(x) for x in a.download.replace(" ", "").split(",") if x]
             except ValueError:
                 sys.exit("news: -d takes 1,3,5 or all")
+        cap_ = (a.budget * 1024) if a.budget else DLBUDGET
         tot, got, free = 0, 0, 0
         for i in want:
             if not 1 <= i <= len(last):
                 print(D("  %2d skipped - out of range" % i))
                 continue
             it = last[i - 1]
+            if tot >= cap_ and not (it.get("c") or have(key(it["ti"]))):
+                print(D("  stopped before %d - budget %s spent (--budget KB to raise)"
+                        % (i, kbs(tot))))
+                break                       # check before spending, so counts stay true
             try:
                 txt, nb, how = fetch_article(it)
             except Exception as e:
