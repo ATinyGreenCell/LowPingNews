@@ -6,7 +6,7 @@ import urllib.error, urllib.parse, urllib.request, zlib
 from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 
-VERSION = "1.7"
+VERSION = "1.8"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
@@ -188,7 +188,7 @@ def extract(raw):
 
 def get(url, t=10, extra=None, cap=FEEDCAP):
     """-> (body, headers, wire_bytes). Raises HTTPError(304) when unchanged."""
-    h = {"Accept-Encoding": "gzip", "User-Agent": UA}
+    h = {"Accept-Encoding": "gzip, deflate", "User-Agent": UA}
     h.update(extra or {})
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         raise ValueError("refusing non-http url")
@@ -198,11 +198,19 @@ def get(url, t=10, extra=None, cap=FEEDCAP):
         if len(b) > cap:
             raise ValueError("response exceeds %s cap" % kb(cap))
         wire = len(b)                     # compressed: what the data plan is billed
-        if f.headers.get("Content-Encoding") == "gzip":
-            z = zlib.decompressobj(16 + zlib.MAX_WBITS)
-            b = z.decompress(b, cap + 1)      # bounded: a gzip bomb stops here
-            if z.unconsumed_tail:
-                raise ValueError("decompressed body exceeds %s cap" % kb(cap))
+        ce = (f.headers.get("Content-Encoding") or "").lower()
+        if ce in ("gzip", "deflate", "x-gzip"):
+            for wbits in ((16 + zlib.MAX_WBITS,) if "gzip" in ce
+                          else (zlib.MAX_WBITS, -zlib.MAX_WBITS)):
+                try:
+                    z = zlib.decompressobj(wbits)
+                    out = z.decompress(b, cap + 1)   # bounded: a bomb stops here
+                    if z.unconsumed_tail:
+                        raise ValueError("decompressed body exceeds %s cap" % kb(cap))
+                    b = out
+                    break
+                except zlib.error:
+                    continue                  # raw deflate vs zlib-wrapped: try both
         return b, f.headers, wire
 
 
