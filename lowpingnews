@@ -154,8 +154,8 @@ cmd_ship() {
   remove them, or add to OWNED if they belong here"
   git -C "$REPO" add -A
   git -C "$REPO" diff --cached --quiet && { say "nothing to commit"; return 0; }
-  git -C "$REPO" commit -m "$*" || die "commit failed"
-  git -C "$REPO" push || die "push failed"
+  git -C "$REPO" commit -q -m "$*" || die "commit failed"
+  git -C "$REPO" push -q 2>/dev/null || die "push failed"
   say "pushed $(git -C "$REPO" rev-parse --short HEAD)"
 }
 
@@ -178,8 +178,8 @@ cmd_release() {
   done
   [ -n "$stray" ] && die "refusing to release with untracked foreign files:$stray"
   git -C "$REPO" add -A
-  git -C "$REPO" diff --cached --quiet || git -C "$REPO" commit -m "v$v" || die "commit failed"
-  git -C "$REPO" push || die "push failed"
+  git -C "$REPO" diff --cached --quiet || git -C "$REPO" commit -q -m "v$v" || die "commit failed"
+  git -C "$REPO" push -q 2>/dev/null || die "push failed"
   # Idempotent: a half-finished release must not wedge the next attempt.
   if git -C "$REPO" rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
     at="$(git -C "$REPO" rev-list -n1 "v$v")"
@@ -190,19 +190,24 @@ cmd_release() {
       say "tag v$v points at an older commit - moving it to HEAD"
       git -C "$REPO" tag -d "v$v" >/dev/null
       git -C "$REPO" tag -a "v$v" -m "LowPingNews v$v" || die "retag failed"
-      git -C "$REPO" push --force origin "v$v" || die "tag push failed"
+      git -C "$REPO" push -q --force origin "v$v" 2>/dev/null || die "tag push failed"
     fi
   else
     git -C "$REPO" tag -a "v$v" -m "LowPingNews v$v" || die "tag failed"
-    git -C "$REPO" push origin "v$v" || die "tag push failed"
+    git -C "$REPO" push -q origin "v$v" 2>/dev/null || die "tag push failed"
   fi
   if command -v gh >/dev/null 2>&1; then
-    gh release create "v$v" --title "LowPingNews v$v" \
-      --notes "Terminal news reader for bad connections. Single file, stdlib only." \
-      --repo "$(git -C "$REPO" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')" \
-      || gh release edit "v$v" --title "LowPingNews v$v" \
-           --notes "Terminal news reader for bad connections. Single file, stdlib only." \
-      || say "WARN: gh release failed (tag is pushed; create it on the web)"
+    gh_repo="$(git -C "$REPO" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')"
+    gh_note="Terminal news reader and weather for bad connections. Single file, stdlib only."
+    if gh release create "v$v" --title "LowPingNews v$v" --notes "$gh_note" \
+         --repo "$gh_repo" >/dev/null 2>&1; then
+      say "release v$v created"
+    elif gh release edit "v$v" --title "LowPingNews v$v" --notes "$gh_note" \
+         --repo "$gh_repo" >/dev/null 2>&1; then
+      say "release v$v updated"          # 422 on create just means it existed
+    else
+      say "WARN: gh release failed (tag is pushed; create it on the web)"
+    fi
   else
     say "gh not installed - tag pushed, create the release on the web"
   fi

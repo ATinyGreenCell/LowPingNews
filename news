@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.0"
+VERSION = "3.1"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
