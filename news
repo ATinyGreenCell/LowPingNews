@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""news - ultra-light terminal headlines. Parallel gzipped fetch, cached for offline."""
+import argparse, datetime as dt, email.utils, gzip, html, json, os, re, sys
+import textwrap, threading, time
+import urllib.error, urllib.parse, urllib.request, zlib
+from html.parser import HTMLParser
+import xml.etree.ElementTree as ET
+
+VERSION = "1.6"
+DATA = os.path.expanduser("~/.local/share/news")
+ADIR = DATA + "/art"
+ARTCAP = 3 * 1024 * 1024        # offline library ceiling
+FEEDCAP = 2 * 1024 * 1024       # refuse oversized feeds and gzip bombs
+PAGECAP = 5 * 1024 * 1024
+STARCAP = 500
+ST = DATA + "/state.json"
+CD = os.path.expanduser("~/.cache/news")
+CFD = os.path.expanduser("~/.config/news")
+CFG = CFD + "/sources.json"
+LAST = CD + "/last.json"
+TTL = 900                      # a feed younger than this is reused, no request
+DEADLINE = 20                  # hard ceiling on the whole fetch round
+UA = "news/1.0 (+termux)"
+
+D_ = lambda i, n, u, c, k="rss": {"id": i, "name": n, "url": u, "cats": c, "kind": k}
+DEFAULTS = [
+    # general - center-rated, wire//institutional rather than opinion-led
+    D_("bbc", "BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml",
+       ["top", "world"]),
+    D_("csm", "CS Monitor", "https://rss.csmonitor.com/feeds/world",
+       ["top", "world"]),
+    D_("dw", "DW", "https://rss.dw.com/rdf/rss-en-all", ["top", "world"]),
+    D_("aje", "Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", ["world"]),
+    D_("f24", "France 24", "https://www.france24.com/en/rss", ["world"]),
+    # science - low political valence, high factual
+    D_("phys", "Phys.org", "https://phys.org/rss-feed/", ["top", "science"]),
+    D_("sd", "ScienceDaily", "https://www.sciencedaily.com/rss/all.xml", ["science"]),
+    D_("quanta", "Quanta", "https://api.quantamagazine.org/feed/", ["science"]),
+    D_("nature", "Nature", "https://www.nature.com/nature.rss", ["science"]),
+    # tech
+    D_("ars", "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index",
+       ["top", "tech"]),
+    D_("reg", "The Register", "https://www.theregister.com/headlines.atom", ["tech"]),
+    D_("hn", "Hacker News", "https://hn.algolia.com/api/v1/search"
+       "?tags=front_page&hitsPerPage=20", ["tech"], "hn"),
+    # bio - preprints, no editorial layer at all
+    D_("brxp", "bioRxiv plant",
+       "https://connect.biorxiv.org/biorxiv_xml.php?subject=plant_biology", ["bio"]),
+    D_("brxs", "bioRxiv synbio",
+       "https://connect.biorxiv.org/biorxiv_xml.php?subject=synthetic_biology", ["bio"]),
+]
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+TAGS = re.compile(r"<[^>]+>")
+WS = re.compile(r"\s+")
+
+
+def clean(s, limit=400):
+    if not s:
+        return ""
+    for _ in range(2):            # content:encoded arrives escaped: unescape, then strip
+        s = TAGS.sub(" ", html.unescape(s))
+    s = WS.sub(" ", s).strip()
+    s = re.sub(r" +([,.;:!?%)\]])", r"\1", s)      # tag-stripping leaves gaps
+    s = re.sub(r"([(\[]) +", r"\1", s)
+    return s[:limit]
+
+
+def when(s):
+    """RSS pubDate or Atom ISO timestamp -> epoch seconds, 0 if unparseable."""
+    if not s:
+        return 0
+    s = s.strip()
+    try:
+        return int(email.utils.parsedate_to_datetime(s).timestamp())
+    except Exception:
+        pass
+    try:
+        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
+    except Exception:
+        return 0
+
+
+def state(w=None):
+    if w is not None:
+        w["read"] = w["read"][-4000:]
+        jwrite(ST, w)
+        return w
+    v = jread(ST, {})
+    if not isinstance(v.get("read"), list):
+        v["read"] = []
+    if not isinstance(v.get("star"), list):
+        v["star"] = []
+    return v
+
+
+def apath(k):
+    return "%s/%s.txt" % (ADIR, k)
+
+
+def have(k):
+    return os.path.exists(apath(k))
+
+
+def store_article(k, txt):
+    try:
+        os.makedirs(ADIR, exist_ok=True)
+        with open(apath(k), "w", encoding="utf-8") as fh:
+            fh.write(txt)
+    except Exception:
+        return
+    try:
+        f = [(os.path.getmtime(ADIR + "/" + x), os.path.getsize(ADIR + "/" + x), x)
+             for x in os.listdir(ADIR)]
+    except OSError:
+        return
+    tot = sum(z[1] for z in f)
+    for mt, sz, name in sorted(f):                  # evict oldest until under cap
+        if tot <= ARTCAP:
+            break
+        try:
+            os.remove(ADIR + "/" + name)
+            tot -= sz
+        except OSError:
+            pass
+
+
+def fetch_article(it):
+    """-> (text, bytes_over_wire, source). Feed body and offline copies are free."""
+    k = key(it["ti"])
+    if it.get("c"):
+        return it["c"], 0, "feed"
+    if have(k):
+        try:
+            return open(apath(k), encoding="utf-8").read(), 0, "offline"
+        except OSError:
+            pass
+    if not it.get("u"):
+        return "", 0, "nolink"
+    raw, _ = get(it["u"], 20, cap=PAGECAP)
+    txt = extract(raw)
+    if txt:
+        store_article(k, txt)
+    return txt, len(raw), "web"
+
+
+class Readable(HTMLParser):
+    """Paragraph text only. No JS, so paywalled/client-rendered pages come back empty."""
+    SKIP = {"script", "style", "nav", "aside", "footer", "header", "form",
+            "noscript", "figure", "svg", "button", "select"}
+    KEEP = {"p", "h1", "h2", "h3", "li", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth, self.cur, self.out = 0, [], []
+
+    def handle_starttag(self, t, a):
+        if t in self.SKIP:
+            self.depth += 1
+        elif t in self.KEEP and not self.depth:
+            self.cur = []
+
+    def handle_endtag(self, t):
+        if t in self.SKIP and self.depth:
+            self.depth -= 1
+        elif t in self.KEEP and not self.depth:
+            x = " ".join("".join(self.cur).split())
+            if len(x) > 40:
+                self.out.append(x)
+            self.cur = []
+
+    def handle_data(self, d):
+        if not self.depth:
+            self.cur.append(d)
+
+
+def extract(raw):
+    p = Readable()
+    try:
+        p.feed(raw.decode("utf-8", "replace"))
+    except Exception:
+        pass
+    return "\n\n".join(p.out[:120])
+
+
+def get(url, t=10, extra=None, cap=FEEDCAP):
+    """-> (body, response_headers). Raises HTTPError(304) when unchanged."""
+    h = {"Accept-Encoding": "gzip", "User-Agent": UA}
+    h.update(extra or {})
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError("refusing non-http url")
+    r = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(r, timeout=t) as f:
+        b = f.read(cap + 1)
+        if len(b) > cap:
+            raise ValueError("response exceeds %s cap" % kb(cap))
+        if f.headers.get("Content-Encoding") == "gzip":
+            z = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            b = z.decompress(b, cap + 1)      # bounded: a gzip bomb stops here
+            if z.unconsumed_tail:
+                raise ValueError("decompressed body exceeds %s cap" % kb(cap))
+        return b, f.headers
+
+
+def parse_feed(raw):
+    """RSS 2.0, RSS 1.0/RDF and Atom, without caring which one showed up."""
+    root = ET.fromstring(raw)
+    for el in root.iter():                       # drop namespaces, then treat alike
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+    out = []
+    for it in list(root.iter("item")) + list(root.iter("entry")):
+        def txt(*names):
+            for n in names:
+                e = it.find(n)
+                if e is not None and e.text and e.text.strip():
+                    return e.text
+            return ""
+        link = ""
+        for l in it.iter("link"):
+            if l.get("href"):                    # Atom: prefer rel=alternate
+                if l.get("rel", "alternate") == "alternate":
+                    link = l.get("href")
+                    break
+                link = link or l.get("href")
+            elif l.text and l.text.strip():
+                link = l.text.strip()
+                break
+        ti = clean(txt("title"), 200)
+        if not ti:
+            continue
+        short = clean(txt("description", "summary", "content"))
+        full = clean(txt("encoded", "content", "description"), 6000)
+        rec = {"ti": ti, "u": link, "s": short,
+               "d": when(txt("pubDate", "published", "date", "updated"))}
+        if len(full) > len(short) + 200:      # feed shipped the body: already paid for
+            rec["c"] = full
+        out.append(rec)
+    return out
+
+
+def parse_hn(raw):
+    j = json.loads(raw)
+    out = []
+    for h in j.get("hits", []):
+        pts, nc = h.get("points") or 0, h.get("num_comments") or 0
+        out.append({
+            "ti": clean(h.get("title") or h.get("story_title") or "", 200),
+            "u": h.get("url") or ("https://news.ycombinator.com/item?id=%s"
+                                  % h.get("objectID", "")),
+            "s": "%d points, %d comments" % (pts, nc),
+            "d": int(h.get("created_at_i") or 0)})
+    return out
+
+
+def load(src, fresh, bag):
+    """Fetch or reuse one source. Never raises - records the failure instead."""
+    cf = "%s/%s.json" % (CD, src["id"])
+    if not fresh and os.path.exists(cf):
+        try:
+            c = json.load(open(cf, encoding="utf-8"))
+            if time.time() - c.get("t", 0) < TTL:
+                bag[src["id"]] = (c["items"], 0, 0, 0)
+                return
+        except Exception:
+            pass
+    c = None
+    try:
+        c = json.load(open(cf, encoding="utf-8"))
+    except Exception:
+        pass
+    val = {}
+    if c:                                  # conditional GET: 304 costs ~0 bytes
+        if c.get("et"):
+            val["If-None-Match"] = c["et"]
+        if c.get("lm"):
+            val["If-Modified-Since"] = c["lm"]
+    try:
+        try:
+            raw, rh = get(src["url"], extra=val)
+        except urllib.error.HTTPError as he:
+            if he.code == 304 and c:
+                c["t"] = int(time.time())
+                json.dump(c, open(cf, "w", encoding="utf-8"), separators=(",", ":"))
+                bag[src["id"]] = (c["items"], 0, 0, 1)
+                return
+            raise
+        items = parse_hn(raw) if src["kind"] == "hn" else parse_feed(raw)
+        items = [i for i in items if i["ti"]]
+        if not items:
+            raise ValueError("no items parsed")
+        rec = {"t": int(time.time()), "items": items}
+        if rh.get("ETag"):
+            rec["et"] = rh["ETag"]
+        if rh.get("Last-Modified"):
+            rec["lm"] = rh["Last-Modified"]
+        json.dump(rec, open(cf, "w", encoding="utf-8"), separators=(",", ":"))
+        bag[src["id"]] = (items, len(raw), 0, 0)
+    except Exception as e:
+        if os.path.exists(cf):                      # offline: stale beats nothing
+            try:
+                c = json.load(open(cf, encoding="utf-8"))
+                bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0)
+                return
+            except Exception:
+                pass
+        bag[src["id"]] = ([], 0, -1, 0)
+        bag.setdefault("_err", {})[src["id"]] = str(e)[:60]
+
+
+def gather(srcs, fresh):
+    os.makedirs(CD, exist_ok=True)
+    bag, ths = {}, []
+    for s in srcs:
+        t = threading.Thread(target=load, args=(s, fresh, bag), daemon=True)
+        t.start()
+        ths.append(t)
+    end = time.time() + DEADLINE       # join() is the real ceiling: socket timeouts
+    for t in ths:                      # do not bound getaddrinfo on a lossy link
+        t.join(max(0.1, end - time.time()))
+    return bag
+
+
+def age(sec):
+    if sec < 60:
+        return "now"
+    if sec < 3600:
+        return "%dm" % (sec // 60)
+    if sec < 86400:
+        return "%dh" % (sec // 3600)
+    return "%dd" % (sec // 86400)
+
+
+def shutil_copy(a, b):
+    import shutil
+    shutil.copy2(a, b)
+
+
+def cols_():
+    try:
+        return min(os.get_terminal_size().columns, 100)
+    except Exception:
+        return 46
+
+
+def jwrite(path, obj):
+    """Never let a full disk or a read-only home take the whole command down."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, separators=(",", ":"))
+        return True
+    except Exception:
+        return False
+
+
+def jread(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, type(default)) else default
+    except Exception:
+        return default
+
+
+def kb(n):
+    return "%dB" % n if n < 1024 else "%.1fKB" % (n / 1024.0)
+
+
+def bul_(a):
+    return "-" if a.ascii else "\u00b7"
+
+
+def key(t):
+    k = re.sub(r"[^a-z0-9]", "", (t or "").lower())[:60]
+    if len(k) < 6:          # CJK, Cyrillic, Greek etc. reduce to nothing
+        import hashlib
+        k = "h" + hashlib.sha1((t or "").encode("utf-8")).hexdigest()[:16]
+    return k
+
+
+def sources(a):
+    os.makedirs(CFD, exist_ok=True)
+    if not os.path.exists(CFG):
+        json.dump(DEFAULTS, open(CFG, "w", encoding="utf-8"), indent=1)
+    try:
+        s = json.load(open(CFG, encoding="utf-8"))
+    except Exception:
+        s = DEFAULTS
+    if not isinstance(s, list):
+        s = DEFAULTS
+    ok, seen = [], set()
+    for x in s:
+        if not isinstance(x, dict) or not x.get("url"):
+            continue
+        if urllib.parse.urlsplit(str(x["url"])).scheme not in ("http", "https"):
+            continue                      # no file://, no ftp:// from a config file
+        i = re.sub(r"[^A-Za-z0-9_-]", "", str(x.get("id") or ""))[:24]
+        if not i or i in seen:            # ids index cache files: no dupes, no ../
+            continue
+        seen.add(i)
+        x["id"] = i
+        x["name"] = str(x.get("name") or i)[:32]
+        x.setdefault("kind", "rss")
+        c = x.get("cats")
+        x["cats"] = [str(z) for z in c] if isinstance(c, list) and c else ["top"]
+        ok.append(x)
+    s = ok or DEFAULTS
+    if a.only:
+        want = {y.strip().lower() for y in a.only.split(",")}
+        s = [x for x in s if x["id"].lower() in want]
+        if not s:
+            sys.exit("news: no source id matches %r (try: news -l)" % a.only)
+        return s
+    c = (a.cat or "top").lower()
+    if c == "all":
+        return s
+    sel = [x for x in s if c in [z.lower() for z in x["cats"]]]
+    if not sel:
+        cats = sorted({z for x in s for z in x["cats"]})
+        sys.exit("news: no category %r. try: %s, all" % (c, ", ".join(cats)))
+    return sel
+
+
+def main():
+    try:
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except Exception:
+        pass
+    p = argparse.ArgumentParser(prog="news", description="ultra-light headlines")
+    p.add_argument("cat", nargs="?", metavar="CATEGORY",
+                   help="top (default), world, science, tech, bio, all")
+    p.add_argument("--check", action="store_true", help="test every feed URL")
+    p.add_argument("-f", "--fresh", action="store_true", help="bypass 15m cache")
+    p.add_argument("-n", type=int, default=5, metavar="N", help="items per source")
+    p.add_argument("-s", "--only", metavar="IDS", help="only these source ids")
+    p.add_argument("-t", "--titles", action="store_true", help="no summaries")
+    p.add_argument("-o", "--open", type=int, metavar="N", help="open item N in browser")
+    p.add_argument("-r", "--read", type=int, metavar="N", help="read item N as text")
+    p.add_argument("-d", "--download", metavar="LIST",
+                   help="save article bodies offline: 1,3,5 or all")
+    p.add_argument("-S", "--star", type=int, metavar="N", help="save/unsave item N")
+    p.add_argument("-u", "--unread", action="store_true", help="hide items already read")
+    p.add_argument("-q", "--query", metavar="TERM", help="search cached headlines")
+    p.add_argument("--mark-all", action="store_true", help="mark everything read")
+    p.add_argument("--update", nargs="?", const="", metavar="URL",
+                   help="replace this script with the latest from URL")
+    p.add_argument("--version", action="version", version="news " + VERSION)
+    p.add_argument("-l", "--list", action="store_true", help="list sources")
+    p.add_argument("--ascii", action="store_true")
+    p.add_argument("--no-color", dest="color", action="store_false")
+    a = p.parse_args()
+    if not sys.stdout.isatty():
+        a.color = False
+    enc = (getattr(sys.stdout, "encoding", None) or "ascii").lower()
+    if "utf" not in enc:
+        a.ascii = True                    # LANG=C: box glyphs would raise mid-line
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+    acts = [x for x in (a.open, a.read, a.star) if x is not None]
+    if len(acts) > 1:
+        sys.exit("news: pick one of -o / -r / -S at a time")
+    D = (lambda s: "\033[2m%s\033[0m" % s) if a.color else (lambda s: s)
+    B = (lambda s: "\033[1m%s\033[0m" % s) if a.color else (lambda s: s)
+    C = (lambda s: "\033[36m%s\033[0m" % s) if a.color else (lambda s: s)
+
+    if a.update is not None:
+        url = a.update or os.environ.get("NEWS_UPDATE_URL", "")
+        uf = CFD + "/update.url"
+        if not url and os.path.exists(uf):
+            url = open(uf, encoding="utf-8").read().strip()
+        if not url:
+            sys.exit("news: no update URL. Set one once:\n"
+                     "  news --update https://.../news")
+        me = os.path.realpath(sys.argv[0])
+        if not os.access(me, os.W_OK):
+            sys.exit("news: %s is not writable" % me)
+        try:
+            raw, _ = get(url, 30, cap=PAGECAP)
+        except Exception as e:
+            sys.exit("news: download failed - %s" % str(e)[:70])
+        txt = raw.decode("utf-8", "replace")
+        # verify before overwriting ourselves: truncated downloads are the
+        # normal failure mode on a lossy link, and a half-file still "installs"
+        if len(raw) < 8000 or "ultra-light headlines" not in txt:
+            sys.exit("news: that does not look like news (%s) - not installing" % kb(len(raw)))
+        try:
+            import ast
+            ast.parse(txt)
+        except SyntaxError as e:
+            sys.exit("news: downloaded file does not parse (line %s) - not installing"
+                     % e.lineno)
+        new = "?"
+        for ln in txt.splitlines()[:40]:
+            if ln.startswith("VERSION = "):
+                new = ln.split("=", 1)[1].strip().strip('"\'')
+        lines = txt.splitlines(True)
+        if lines and lines[0].startswith("#!"):
+            lines[0] = "#!%s\n" % (sys.executable or "/usr/bin/env python3")
+        tmp = me + ".new"
+        open(tmp, "w", encoding="utf-8").write("".join(lines))
+        os.chmod(tmp, 0o755)
+        try:
+            shutil_copy(me, me + ".bak")
+        except Exception:
+            pass
+        os.replace(tmp, me)                      # atomic: never a half-written news
+        print(D("  updated %s -> %s %s %s %s backup at %s.bak"
+                % (VERSION, new, bul_(a), kb(len(raw)), bul_(a),
+                   os.path.basename(me))))
+        if not os.path.exists(uf) or open(uf, encoding="utf-8").read().strip() != url:
+            os.makedirs(CFD, exist_ok=True)
+            open(uf, "w", encoding="utf-8").write(url + "\n")
+        return
+
+    if a.list:
+        allsrc = sources(argparse.Namespace(only=None, cat="all"))
+        print(D("  categories: " +
+                ", ".join(sorted({z for x in allsrc for z in x["cats"]})) + ", all"))
+        for x in allsrc:
+            print("  %-7s %-14s %-22s %s" % (x["id"], x["name"],
+                  ",".join(x["cats"]), D(x["url"][:40])))
+        print(D("\n  edit: %s" % CFG))
+        return
+
+    pick = a.open or a.read or a.star
+    if pick is not None:
+        try:
+            last = json.load(open(LAST, encoding="utf-8"))
+        except Exception:
+            sys.exit("news: nothing listed yet - run `news` first")
+        if not 1 <= pick <= len(last):
+            sys.exit("news: pick 1-%d" % len(last))
+        it = last[pick - 1]
+        st = state()
+        if a.star:
+            k = key(it["ti"])
+            keep = [x for x in st["star"] if key(x["ti"]) != k]
+            on = len(keep) == len(st["star"])
+            st["star"] = (keep + ([it] if on else []))[-STARCAP:]
+            state(st)
+            print(D("  %s %s" % ("saved" if on else "unsaved", it["ti"][:50])))
+            return
+        if key(it["ti"]) not in st["read"]:
+            st["read"].append(key(it["ti"]))
+            state(st)
+        if a.open:
+            import shutil, subprocess
+            if shutil.which("termux-open-url"):
+                subprocess.run(["termux-open-url", it["u"]])
+            else:
+                print(it["u"])
+            return
+        # -r: feed body first (already paid for), network only as fallback
+        try:
+            cols = min(os.get_terminal_size().columns, 100)
+        except Exception:
+            cols = 46
+        try:
+            body, nb, how = fetch_article(it)
+        except Exception as e:
+            sys.exit("news: fetch failed - %s" % str(e)[:60])
+        if how == "nolink":
+            sys.exit("news: no link and no text in feed")
+        print(B(it["ti"]) + "\n" + D("  %s %s %s" % (
+            it.get("src", "?"), bul_(a), age(int(time.time()) - it["d"])
+            if it.get("d") else "?")) + "\n")
+        for para in (body or "").split("\n\n"):
+            print(textwrap.fill(para, max(20, cols - 2), initial_indent="  ",
+                                subsequent_indent="  ") + "\n")
+        if not body:
+            print(D("  no readable paragraphs - likely paywalled or JS-rendered"))
+        print(D("  %s" % ({"feed": "from feed, 0B over the wire",
+                           "offline": "from offline store, 0B over the wire"}
+                          .get(how, "fetched %s, stored offline" % kb(nb)))))
+        return
+
+    if a.download:
+        try:
+            last = json.load(open(LAST, encoding="utf-8"))
+        except Exception:
+            sys.exit("news: nothing listed yet - run `news` first")
+        if a.download.strip().lower() == "all":
+            want = list(range(1, len(last) + 1))
+        else:
+            try:
+                want = [int(x) for x in a.download.replace(" ", "").split(",") if x]
+            except ValueError:
+                sys.exit("news: -d takes 1,3,5 or all")
+        tot, got, free = 0, 0, 0
+        for i in want:
+            if not 1 <= i <= len(last):
+                print(D("  %2d skipped - out of range" % i))
+                continue
+            it = last[i - 1]
+            try:
+                txt, nb, how = fetch_article(it)
+            except Exception as e:
+                print(D("  %2d failed   %s" % (i, str(e)[:40])))
+                continue
+            tot += nb
+            if how in ("feed", "offline"):
+                free += 1
+            if txt:
+                got += 1
+            print("  %2d %-8s %-7s %s" % (i, kb(nb) if nb else "free", how,
+                                          D(it["ti"][:cols_() - 24])))
+        print(D("\n  %d/%d stored %s %s over the wire%s" % (
+            got, len(want), bul_(a), kb(tot),
+            "" if not free else " %s %d already had text" % (bul_(a), free))))
+        return
+
+    if a.mark_all:
+        st = state()
+        try:
+            last = json.load(open(LAST, encoding="utf-8"))
+        except Exception:
+            last = []
+        for it in last:
+            if key(it["ti"]) not in st["read"]:
+                st["read"].append(key(it["ti"]))
+        state(st)
+        print(D("  marked %d read" % len(last)))
+        return
+
+    st = state()
+    rd = set(st["read"])
+
+    if a.query or (a.cat or "").lower() == "saved":
+        rows = []
+        if a.query:
+            q = a.query.lower()
+            for x in sources(argparse.Namespace(only=None, cat="all")):
+                try:
+                    c = json.load(open("%s/%s.json" % (CD, x["id"]), encoding="utf-8"))
+                except Exception:
+                    continue
+                for it in c.get("items", []):
+                    if q in it["ti"].lower() or q in (it.get("s") or "").lower():
+                        rows.append((x["name"], it))
+        else:
+            rows = [(it.get("src", "saved"), it) for it in reversed(st["star"])]
+        show(a, rows, rd, "search: %s" % a.query if a.query else "saved",
+             "%s no network" % bul_(a))
+        return
+
+    srcs = sources(a)
+    if a.check:
+        for x in srcs:
+            t0 = time.time()
+            try:
+                raw, _ = get(x["url"], 12)
+                n = len(parse_hn(raw) if x["kind"] == "hn" else parse_feed(raw))
+                print("  %-7s %s  %4d items  %5.1fKB  %4.1fs" % (
+                    x["id"], B("ok  ") if n else "EMPTY", n,
+                    len(raw) / 1024.0, time.time() - t0))
+            except Exception as e:
+                print("  %-7s %s %s" % (x["id"], "FAIL", D(str(e)[:50])))
+        return
+    bag = gather(srcs, a.fresh)
+    try:
+        cols = os.get_terminal_size().columns
+    except Exception:
+        cols = 46
+    if cols < 24:
+        cols = 46
+    cols = min(cols, 100)
+
+    rows, seen, down, stale, bytes_, nm = [], set(), [], 0, 0, 0
+    for x in srcs:
+        items, nb, sta, unch = bag.get(x["id"], ([], 0, -1, 0))
+        bytes_ += nb
+        nm += unch
+        if sta == -1:
+            down.append(x["name"])
+            continue
+        stale = max(stale, sta)
+        for it in sorted(items, key=lambda z: -(z.get("d") or 0))[:a.n]:
+            k = key(it["ti"])
+            if k in seen:
+                continue
+            seen.add(k)
+            rows.append((x["name"], it))
+    rows.sort(key=lambda r: -(r[1].get("d") or 0))
+    foot = "%s %s" % (bul_(a), kb(bytes_) if bytes_ else "0B, cached")
+    if nm:
+        foot += " %s %d unchanged (304)" % (bul_(a), nm)
+    if stale:
+        foot += " %s stale %s" % (bul_(a), age(stale))
+    if down:
+        foot += " %s down: %s" % (bul_(a), ", ".join(down))
+    show(a, rows, rd, (a.cat or "top").lower() if not a.only else a.only, foot)
+
+
+def show(a, rows, rd, tag, foot):
+    D = (lambda s: "\033[2m%s\033[0m" % s) if a.color else (lambda s: s)
+    B = (lambda s: "\033[1m%s\033[0m" % s) if a.color else (lambda s: s)
+    bul = bul_(a)
+    try:
+        cols = os.get_terminal_size().columns
+    except Exception:
+        cols = 46
+    if cols < 24:
+        cols = 46
+    cols = min(cols, 100)
+    if a.unread:
+        rows = [r for r in rows if key(r[1]["ti"]) not in rd]
+    now = dt.datetime.now()
+    print(B("NEWS") + D(" %s %s" % (bul, tag)) +
+          D("  %s %d %s %s" % (now.strftime("%a"), now.day,
+                               now.strftime("%b"), now.strftime("%H:%M"))))
+    if not rows:
+        print(D("  nothing to show " + foot))
+        return
+    print()
+    keep, wrap = [], textwrap.TextWrapper(
+        width=max(20, cols - 5), initial_indent="    ", subsequent_indent="    ")
+    for i, (src, it) in enumerate(rows, 1):
+        r = dict(it)
+        r["src"] = src
+        keep.append(r)
+        stamp = age(int(time.time()) - it["d"]) if it.get("d") else "?"
+        k = key(it["ti"])
+        dot = "" if k in rd else ("*" if a.ascii else "\u25cf") + " "
+        if it.get("c") or have(k):
+            dot += ("+" if a.ascii else "\u2193") + " "
+        print(" %2d %s" % (i, D("%s %s %s" % (src, bul, stamp))))
+        for ln in textwrap.wrap(dot + it["ti"], max(20, cols - 5)) or [""]:
+            print("    " + B(ln))
+        if not a.titles and it.get("s"):
+            body = wrap.wrap(it["s"])
+            if len(body) > 2:
+                body = body[:2]
+                body[1] = body[1][:max(4, len(body[1]) - 1)].rstrip() + (
+                    "..." if a.ascii else "\u2026")
+            for ln in body:
+                print(D(ln))
+        print()
+    json.dump(keep, open(LAST, "w", encoding="utf-8"), separators=(",", ":"))
+    n = len(keep)
+    print(D("  %d item%s %s %s news -r N to read" % (
+        n, "" if n == 1 else "s", foot, bul)))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            os.close(1)
+        except OSError:
+            pass
+        sys.exit(0)
