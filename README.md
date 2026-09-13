@@ -33,6 +33,13 @@ Most feed readers assume bandwidth. This one assumes you don't have any.
   124 KB Nature refresh into nothing.
 - **One retry on a dropped connection.** A transient failure is retried once
   after 400 ms; a real HTTP error is not, since the server answered.
+- **A hung connection still shows you the news.** Weak signal usually means a
+  socket that is accepted and never answered, not one that is refused. When the
+  20-second deadline expires with workers still blocked, the cached copy is
+  served rather than reporting the feed as down.
+- **Failed fetches count as failures.** A fetch that fell back to cache is still
+  recorded as a failure, so `news signal` cannot report 100% success while the
+  radio is off. If no probed host is reachable the verdict reads `offline`.
 - **Few hosts, deliberately.** TLS handshake is roughly 4 KB per host no matter
   how small the payload. Host count dominates everything else, so the default
   set is small on purpose. Adding a sixth feed costs more than it looks like.

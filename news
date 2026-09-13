@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.3"
+VERSION = "3.4"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -434,6 +434,8 @@ def load(src, fresh, bag):
             try:
                 c = json.load(open(cf, encoding="utf-8"))
                 bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0)
+                bag.setdefault("_net", []).append(      # still a failed request:
+                    (False, (time.time() - t_start) * 1000, 0))   # count it as one
                 return
             except Exception:
                 pass
@@ -619,6 +621,7 @@ def wx_fetch(loc, unit, fresh):
         return d, wire, 0, False
     except Exception as e:
         if c.get("d"):                     # offline: stale beats nothing
+            net_log([(False, 0, 0)])
             return c["d"], 0, int(time.time() - c["t"]), True
         sys.exit("news: no forecast and no cache (%s)" % str(e)[:60])
 
@@ -707,9 +710,9 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     if rest is not None and (rest != (dy["precipitation_probability_max"][0] or 0)
                              or rest_code != int(dy["weather_code"][0] or 0)):
         print(D("  * today = hours remaining"))
-    foot = ("offline, cached %s ago" % age(age_s) if stale
+    foot = ("offline, cached %s" % ago(age_s) if stale
             else kbs(wire) if wire
-            else "0B, cached" if age_s < 60 else "0B, cached %s ago" % age(age_s))
+            else "0B, cached" if age_s < 60 else "0B, cached %s" % ago(age_s))
     print(D("\n  " + foot))
 
 
@@ -732,9 +735,15 @@ def gather(srcs, fresh):
     return bag
 
 
+def ago(sec):
+    """age() plus the right preposition: "just now", or "3m ago"."""
+    a_ = age(sec)
+    return a_ if a_ == "just now" else a_ + " ago"
+
+
 def age(sec):
     if sec < 60:
-        return "now"
+        return "just now"
     if sec < 3600:
         return "%dm" % (sec // 60)
     if sec < 86400:
@@ -1240,7 +1249,8 @@ def run(a):
             hp = hostport(x["url"])
             if hp[0] and hp not in hosts:
                 hosts.append(hp)
-        for r_ in probe(hosts[:2]):
+        probes = probe(hosts[:2])
+        for r_ in probes:
             lc = (P["grn"] if r_["loss"] == 0 else
                   P["yel"] if r_["loss"] < 50 else P["red"])
             if r_["tcp"] is None:
@@ -1260,6 +1270,10 @@ def run(a):
         if ic:
             print("  %-8s %s" % ("icmp", D("%.0f%% loss, %sms avg"
                   % (ic["loss"], ic["avg"] if ic["avg"] else "?"))))
+        if probes and all(r_["tcp"] is None for r_ in probes):
+            print("  %-8s %s %s" % ("measured", P["red"]("offline"),
+                  D("no host reachable")))
+            return
         if not st_:
             print(D("  measured no history - a cached run makes no requests;"
                     " try `news -f`"))
@@ -1348,6 +1362,14 @@ def run(a):
                 bag[x["id"]] = ([], 0, -1, 0)
     else:
         bag = gather(srcs, a.fresh)
+        for x in srcs:                     # deadline hit with the worker stuck:
+            got = bag.get(x["id"])         # a stale copy still beats nothing
+            if got is not None and got[2] != -1:
+                continue
+            c_ = jread("%s/%s.json" % (CD, x["id"]), {})
+            if c_.get("items"):
+                bag[x["id"]] = (c_["items"], 0,
+                                max(1, int(time.time() - (c_.get("t") or 0))), 0)
     try:
         cols = os.get_terminal_size().columns
     except Exception:
@@ -1376,7 +1398,7 @@ def run(a):
     if nm:
         foot += " %s %d unchanged (304)" % (bul_(a), nm)
     if stale:
-        foot += " %s stale %s" % (bul_(a), age(stale))
+        foot += " %s stale %s" % (bul_(a), ago(stale))
     if down:
         foot += " %s down: %s" % (bul_(a), ", ".join(down))
     show(a, rows, rd, (a.cat or "top").lower() if not a.only else a.only, foot)
