@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.1"
+VERSION = "3.2"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -676,16 +676,29 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     hi_a = max(dy["temperature_2m_max"])
     sp, W = (hi_a - lo_a) or 1.0, max(6, min(12, cols - 26))
     fl, gp = ("#", ".") if a.ascii else ("\u2588", "\u00b7")
+    # today's daily max spans midnight-to-midnight, so at 19:00 it reports rain
+    # that already fell. Use only the hours still ahead of us.
+    rest = None
+    today = L(cu["time"]).date()
+    vals = [p or 0 for t, p in zip(h["time"], h["precipitation_probability"])
+            if t >= cu["time"] and L(t).date() == today]
+    if vals:
+        rest = max(vals)
     for i, ts in enumerate(dy["time"]):
         lo, hi = dy["temperature_2m_min"][i], dy["temperature_2m_max"][i]
         b0 = int((lo - lo_a) / sp * W)
         b1 = max(b0 + 1, int(round((hi - lo_a) / sp * W)))
         pp = dy["precipitation_probability_max"][i] or 0
+        mark_ = ""
+        if i == 0 and rest is not None and rest != pp:
+            pp, mark_ = rest, "*"          # remaining hours, not the whole day
         _, g = WMO.get(int(dy["weather_code"][i] or 0), ("", "??"))
-        print("  %s %s %3d\u00b0 %s %3d\u00b0 %s" % (
+        print("  %s %s %3d\u00b0 %s %3d\u00b0 %s%s" % (
             L(ts).strftime("%a"), g, round(lo),
             P["yel"]((gp * b0 + fl * (b1 - b0)).ljust(W, gp)), round(hi),
-            (P["cyn"] if pp >= 10 else D)("%3d%%" % pp)))
+            (P["cyn"] if pp >= 10 else D)("%3d%%" % pp), D(mark_)))
+    if rest is not None and rest != (dy["precipitation_probability_max"][0] or 0):
+        print(D("  * today = hours remaining"))
     foot = ("offline, cached %s ago" % age(age_s) if stale
             else kbs(wire) if wire
             else "0B, cached" if age_s < 60 else "0B, cached %s ago" % age(age_s))

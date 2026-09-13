@@ -333,7 +333,10 @@ lowpingnews weather -C       # celsius
 
 One gzipped Open-Meteo call, cached 30 minutes, sharing the same HTTP layer,
 capped reads and offline fallback as the feeds. Current conditions, a 24-hour
-temperature sparkline and rain bar, then seven days. If the fetch fails it
+temperature sparkline and rain bar, then seven days. Today's rain figure covers
+only the hours still ahead (marked `*`), because the API's daily maximum runs
+midnight to midnight and at 19:00 would otherwise report rain that already
+fell. If the fetch fails it
 shows the last good forecast and says how old it is. Location is pinned in
 `~/.config/news/loc.json`, or taken from `termux-location` once if the
 Termux:API app is installed.
