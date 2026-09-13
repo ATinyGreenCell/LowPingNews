@@ -1,0 +1,241 @@
+#!/usr/bin/env sh
+# lowpingnews - dev loop and updater for LowPingNews.
+# Picks builds by VERSION, never by filename.
+set -u
+
+REPO="${LPN_REPO:-$HOME/LowPingNews}"
+# Termux's share handler writes to ~/downloads; the browser writes to
+# ~/storage/downloads. Scan both or builds silently go missing.
+DLS="${LPN_DOWNLOADS:-$HOME/downloads $HOME/storage/downloads}"
+BIN="${PREFIX:-/usr/local}/bin"
+RAW="${LPN_RAW:-https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/news}"
+PY="$(command -v python3 || command -v python || true)"
+
+die() { printf '%s\n' "lowpingnews: $*" >&2; exit 1; }
+say() { printf '  %s\n' "$*"; }
+[ -n "$PY" ] || die "python3 not found (pkg install python)"
+
+# version of a candidate file, empty if it does not parse as python
+ver() {
+  [ -f "$1" ] || return 1
+  "$PY" - "$1" <<'EOF' 2>/dev/null
+import ast, re, sys
+src = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+ast.parse(src)                       # a truncated download stops here
+m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)', src, re.M)
+print(m.group(1) if m else "")
+EOF
+}
+
+installed_ver() { ver "$BIN/news" 2>/dev/null || true; }
+repo_ver()      { ver "$REPO/news" 2>/dev/null || true; }
+
+# newest *valid* build in Downloads, by mtime, ignoring the filename entirely
+newest_download() {
+  best=""; best_t=0
+  for d in $DLS; do
+   [ -d "$d" ] || continue
+   for f in "$d"/news "$d"/news-* "$d"/news.* ; do
+    [ -f "$f" ] || continue
+    v="$(ver "$f")" || continue
+    [ -n "$v" ] || continue
+    t="$("$PY" -c "import os,sys;print(int(os.path.getmtime(sys.argv[1])))" "$f")"
+    [ "$t" -gt "$best_t" ] && { best="$f"; best_t="$t"; }
+   done
+  done
+  [ -n "$best" ] && printf '%s\n' "$best"
+}
+
+cmd_status() {
+  iv="$(installed_ver)"; rv="$(repo_ver)"
+  say "installed  ${iv:-none}   $BIN/news"
+  say "repo       ${rv:-none}   $REPO/news"
+  d="$(newest_download || true)"
+  if [ -n "$d" ]; then say "download   $(ver "$d")   $d"; else say "download   none"; fi
+  if [ -d "$REPO/.git" ]; then
+    git -C "$REPO" fetch -q origin 2>/dev/null || true
+    local_h="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo ?)"
+    remote_h="$(git -C "$REPO" rev-parse --short '@{u}' 2>/dev/null || echo ?)"
+    dirty=""; [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ] && dirty=" (uncommitted changes)"
+    say "git        $local_h local / $remote_h remote$dirty"
+  fi
+  [ -n "$iv" ] && [ -n "$rv" ] && [ "$iv" != "$rv" ] && \
+    say "MISMATCH   installed $iv != repo $rv - run: lowpingnews install"
+  return 0
+}
+
+cmd_sync() {
+  src="$(newest_download || true)"
+  [ -n "$src" ] || die "no valid build found in: $DLS"
+  v="$(ver "$src")"
+  say "using $src (v$v)"
+  # Only extract an archive whose every member is a file this project owns.
+  # Downloads is a shared junk drawer: unrelated tarballs must never land here.
+  newest_tar=""; nt=0
+  for d in $DLS; do
+    for t in "$d"/*.tar.gz; do
+      [ -f "$t" ] || continue
+      bad=0
+      for m in $(tar tzf "$t" 2>/dev/null); do
+        case "$m" in
+          news|README.md|install.sh|lowpingnews|LICENSE|.gitignore) ;;
+          */) ;;
+          *) bad=1; break ;;
+        esac
+      done
+      [ "$bad" -eq 1 ] && continue
+      mt="$("$PY" -c "import os,sys;print(int(os.path.getmtime(sys.argv[1])))" "$t")"
+      [ "$mt" -gt "$nt" ] && { newest_tar="$t"; nt="$mt"; }
+    done
+  done
+  if [ -n "$newest_tar" ]; then
+    tar xzf "$newest_tar" -C "$REPO" && say "extracted $(basename "$newest_tar")"
+  fi
+  cp "$src" "$REPO/news" || die "copy into $REPO failed"
+  cmd_install
+}
+
+cmd_install() {
+  v="$(repo_ver)"
+  [ -n "$v" ] || die "$REPO/news is missing, does not parse, or has no VERSION"
+  mkdir -p "$BIN"
+  cp "$REPO/news" "$BIN/news.new" || die "cannot write $BIN"
+  chmod +x "$BIN/news.new"
+  sed -i "1s|.*|#!$PY|" "$BIN/news.new"
+  mv "$BIN/news.new" "$BIN/news"
+  got="$(installed_ver)"
+  [ "$got" = "$v" ] || die "installed $got but repo says $v"
+  say "installed v$v"
+}
+
+cmd_test() {
+  v="$(installed_ver)"; [ -n "$v" ] || die "news is not installed"
+  say "v$v"
+  news --version >/dev/null || die "--version failed"
+  news -t -n 2 >/dev/null 2>&1 || say "WARN: listing failed (offline is fine)"
+  news -l >/dev/null || die "-l failed"
+  news -q zzzznomatch >/dev/null || die "-q failed"
+  news --ascii -t -n 1 >/dev/null || die "--ascii failed"
+  LANG=C LC_ALL=C PYTHONIOENCODING=ascii news -t -n 1 >/dev/null 2>&1 \
+    || die "non-UTF8 terminal path failed"
+  say "smoke test passed"
+}
+
+cmd_ship() {
+  [ -d "$REPO/.git" ] || die "$REPO is not a git repo"
+  [ $# -ge 1 ] || die "usage: lowpingnews ship \"commit message\""
+  cmd_install
+  git -C "$REPO" add -A
+  git -C "$REPO" diff --cached --quiet && { say "nothing to commit"; return 0; }
+  git -C "$REPO" commit -m "$*" || die "commit failed"
+  git -C "$REPO" push || die "push failed"
+  say "pushed $(git -C "$REPO" rev-parse --short HEAD)"
+}
+
+cmd_release() {
+  [ $# -ge 1 ] || die "usage: lowpingnews release <version>"
+  v="$1"
+  cur="$(repo_ver)"
+  [ "$cur" = "$v" ] || {
+    sed -i "s|^VERSION = .*|VERSION = \"$v\"|" "$REPO/news" || die "version bump failed"
+    say "bumped $cur -> $v"
+  }
+  cmd_install
+  cmd_test
+  git -C "$REPO" add -A
+  git -C "$REPO" diff --cached --quiet || git -C "$REPO" commit -m "v$v" || die "commit failed"
+  git -C "$REPO" push || die "push failed"
+  # Idempotent: a half-finished release must not wedge the next attempt.
+  if git -C "$REPO" rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+    at="$(git -C "$REPO" rev-list -n1 "v$v")"
+    head="$(git -C "$REPO" rev-parse HEAD)"
+    if [ "$at" = "$head" ]; then
+      say "tag v$v already points at HEAD"
+    else
+      say "tag v$v points at an older commit - moving it to HEAD"
+      git -C "$REPO" tag -d "v$v" >/dev/null
+      git -C "$REPO" tag -a "v$v" -m "LowPingNews v$v" || die "retag failed"
+      git -C "$REPO" push --force origin "v$v" || die "tag push failed"
+    fi
+  else
+    git -C "$REPO" tag -a "v$v" -m "LowPingNews v$v" || die "tag failed"
+    git -C "$REPO" push origin "v$v" || die "tag push failed"
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    gh release create "v$v" --title "LowPingNews v$v" \
+      --notes "Terminal news reader for bad connections. Single file, stdlib only." \
+      --repo "$(git -C "$REPO" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')" \
+      || gh release edit "v$v" --title "LowPingNews v$v" \
+           --notes "Terminal news reader for bad connections. Single file, stdlib only." \
+      || say "WARN: gh release failed (tag is pushed; create it on the web)"
+  else
+    say "gh not installed - tag pushed, create the release on the web"
+  fi
+  say "released v$v"
+}
+
+cmd_update() {
+  if command -v news >/dev/null 2>&1 && news --help 2>&1 | grep -q -- --update; then
+    news --update "$RAW"
+  else                                  # bootstrap: no news yet, or too old to self-update
+    tmp="$(mktemp)"
+    "$PY" - "$RAW" "$tmp" <<'EOF' || die "download failed"
+import sys, urllib.request
+r = urllib.request.Request(sys.argv[1], headers={"User-Agent": "lowpingnews"})
+open(sys.argv[2], "wb").write(urllib.request.urlopen(r, timeout=30).read())
+EOF
+    v="$(ver "$tmp")" || { rm -f "$tmp"; die "downloaded file does not parse"; }
+    mkdir -p "$BIN"; cp "$tmp" "$BIN/news"; chmod +x "$BIN/news"
+    sed -i "1s|.*|#!$PY|" "$BIN/news"; rm -f "$tmp"
+    say "installed v$v from $RAW"
+  fi
+}
+
+cmd_pull() {
+  [ -d "$REPO/.git" ] || die "$REPO is not a git repo"
+  git -C "$REPO" pull --ff-only || die "pull failed"
+  cmd_install
+}
+
+cmd_clean() {
+  n=0
+  for d in $DLS; do
+    for f in "$d"/news "$d"/news-* "$d"/news.* "$d"/lowpingnews-*.tar.gz; do
+      [ -f "$f" ] && { rm -f "$f"; n=$((n + 1)); }
+    done
+  done
+  say "removed $n stale download(s)"
+}
+
+usage() {
+  cat <<'EOF'
+lowpingnews - dev loop and updater
+
+  update          install the latest release from GitHub
+  status          installed / repo / newest download / git, and flag mismatches
+  sync            newest VALID download -> repo -> install  (never picks by filename)
+  install         repo -> PATH, verifying the version actually landed
+  test            smoke test the installed build
+  pull            git pull, then install
+  ship "msg"      install, commit, push
+  release <ver>   bump VERSION, install, test, commit, tag, gh release
+  clean           delete stale downloads
+
+env: LPN_REPO LPN_DOWNLOADS (space-separated dirs) LPN_RAW
+EOF
+}
+
+c="${1:-status}"; [ $# -gt 0 ] && shift
+case "$c" in
+  update)  cmd_update ;;
+  status)  cmd_status ;;
+  sync)    cmd_sync ;;
+  install) cmd_install ;;
+  test)    cmd_test ;;
+  pull)    cmd_pull ;;
+  ship)    cmd_ship "$@" ;;
+  release) cmd_release "$@" ;;
+  clean)   cmd_clean ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
