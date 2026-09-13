@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.6"
+VERSION = "2.7"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -1074,7 +1074,8 @@ def run(a):
             print("  %-8s %s" % ("icmp", D("%.0f%% loss, %sms avg"
                   % (ic["loss"], ic["avg"] if ic["avg"] else "?"))))
         if not st_:
-            print(D("  measured no fetch history yet - run `news` once"))
+            print(D("  measured no history - a cached run makes no requests;"
+                    " try `news -f`"))
             return
         v = (P["grn"] if st_["rate"] >= 90 and st_["bps"] > 20000 else
              P["yel"] if st_["rate"] >= 60 else P["red"])
