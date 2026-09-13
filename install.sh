@@ -18,5 +18,5 @@ if [ -f "$LPN_SRC" ]; then
   mv "$DEST/lowpingnews.new" "$DEST/lowpingnews"   # rename: safe while running
   ln -sf "$DEST/lowpingnews" "$DEST/lpn"
 fi
-echo "installed $("$DEST/news" --version) -> $DEST/news"
-echo "next: news --check    (dev loop: lowpingnews help)"
+echo "installed $("$DEST/news" --version) -> $DEST/lowpingnews"
+echo "next: lowpingnews --check     (lpn is a short alias)"

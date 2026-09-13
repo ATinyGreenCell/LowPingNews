@@ -4,10 +4,22 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.7"
+VERSION = "3.0"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
+WMO = {0: ("Clear", "CL"), 1: ("Mostly clear", "MC"), 2: ("Partly cloudy", "PC"),
+       3: ("Overcast", "OV"), 45: ("Fog", "FG"), 48: ("Rime fog", "FG"),
+       51: ("Light drizzle", "dz"), 53: ("Drizzle", "dz"), 55: ("Drizzle", "DZ"),
+       56: ("Frz drizzle", "FZ"), 57: ("Frz drizzle", "FZ"), 61: ("Light rain", "rn"),
+       63: ("Rain", "RN"), 65: ("Heavy rain", "RN"), 66: ("Frz rain", "FZ"),
+       67: ("Frz rain", "FZ"), 71: ("Light snow", "sn"), 73: ("Snow", "SN"),
+       75: ("Heavy snow", "SN"), 77: ("Snow grains", "sn"), 80: ("Showers", "sh"),
+       81: ("Showers", "sh"), 82: ("Hvy showers", "SH"), 85: ("Snow showers", "SS"),
+       86: ("Snow showers", "SS"), 95: ("Thunderstorm", "TS"),
+       96: ("Thunderstorm", "TS"), 99: ("Thunderstorm", "TS")}
+BLK = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+ABLK = "._-~=+*#"
 NETCAP = 200
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
 FEEDCAP = 2 * 1024 * 1024       # refuse oversized feeds and gzip bombs
@@ -18,6 +30,9 @@ DLBUDGET = 4 * 1024 * 1024     # ceiling for one -d run; raise with --budget
 ST = DATA + "/state.json"
 CD = os.path.expanduser("~/.cache/news")
 CFD = os.path.expanduser("~/.config/news")
+WXLOC = CFD + "/loc.json"
+WXC = CD + "/weather.json"
+WXTTL = 1800
 CFG = CFD + "/sources.json"
 LAST = CD + "/last.json"
 TTL = 900                      # a feed younger than this is reused, no request
@@ -544,6 +559,139 @@ def radio():
     return out
 
 
+def wx_locate(a):
+    if getattr(a, "coords", None):
+        try:
+            la, lo = [float(x) for x in a.coords.replace(" ", "").split(",")]
+        except Exception:
+            sys.exit("news: coords look like 40.900,-73.412")
+        d = {"lat": round(la, 3), "lon": round(lo, 3),
+             "label": getattr(a, "label", None)}
+        jwrite(WXLOC, d)
+        return d
+    d = jread(WXLOC, {})
+    if d.get("lat") is not None:
+        return d
+    try:                                   # Termux GPS if the API app is present
+        import shutil, subprocess
+        if shutil.which("termux-location"):
+            o = subprocess.run(["termux-location", "-p", "network"],
+                               capture_output=True, timeout=25, text=True)
+            j = json.loads(o.stdout or "null")
+            if j and j.get("latitude") is not None:
+                d = {"lat": round(float(j["latitude"]), 3),
+                     "lon": round(float(j["longitude"]), 3), "label": None}
+                jwrite(WXLOC, d)
+                return d
+    except Exception:
+        pass
+    sys.exit("news: no location. Pin it once:\n"
+             "  lowpingnews weather -c 40.900,-73.412 --label 'Fleets Cove'")
+
+
+def wx_fetch(loc, unit, fresh):
+    """One gzipped Open-Meteo call, cached like any feed."""
+    c = jread(WXC, {})
+    fresh_enough = (not fresh and c.get("t")
+                    and time.time() - c["t"] < WXTTL
+                    and c.get("u") == unit
+                    and abs((c.get("lat") or 999) - loc["lat"]) < .05
+                    and abs((c.get("lon") or 999) - loc["lon"]) < .05)
+    if fresh_enough:
+        return c["d"], 0, int(time.time() - c["t"]), False
+    q = ("latitude=%s&longitude=%s&current=temperature_2m,apparent_temperature,"
+         "weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m,is_day"
+         "&hourly=temperature_2m,precipitation_probability,weather_code"
+         "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+         "precipitation_probability_max&forecast_hours=24&forecast_days=7"
+         "&timeformat=unixtime&timezone=auto&temperature_unit=%s&wind_speed_unit=%s"
+         "&cell_selection=land"
+         % (loc["lat"], loc["lon"], unit,
+            "mph" if unit == "fahrenheit" else "kmh"))
+    try:
+        raw, _, wire = get("https://api.open-meteo.com/v1/forecast?" + q, 15)
+        d = json.loads(raw)
+        if d.get("error"):
+            raise ValueError(d.get("reason", "api error"))
+        jwrite(WXC, {"t": int(time.time()), "u": unit, "lat": loc["lat"],
+                     "lon": loc["lon"], "d": d})
+        net_log([(True, 0, wire)])
+        return d, wire, 0, False
+    except Exception as e:
+        if c.get("d"):                     # offline: stale beats nothing
+            return c["d"], 0, int(time.time() - c["t"]), True
+        sys.exit("news: no forecast and no cache (%s)" % str(e)[:60])
+
+
+def spark(v, asc):
+    ch = ABLK if asc else BLK
+    lo, hi = min(v), max(v)
+    sp = (hi - lo) or 1.0
+    return "".join(ch[min(7, int((x - lo) / sp * 7.999))] for x in v)
+
+
+def rainbar(p, asc):
+    ch = ABLK if asc else BLK
+    dry = "." if asc else "\u00b7"     # parenthesised: the unbracketed form made
+    return "".join(dry if (x or 0) < 10  # ascii mode draw a flat line of dots
+                   else ch[min(7, int((x or 0) / 100 * 7.999))] for x in p)
+
+
+def wx_show(a, P, loc, d, wire, age_s, stale):
+    D, B = P["d"], P["b"]
+    cols = cols_()
+    cu, h, dy = d["current"], d["hourly"], d["daily"]
+    off = d.get("utc_offset_seconds", 0)
+    L = lambda t: dt.datetime.fromtimestamp(t + off, dt.timezone.utc)
+    U = "\u00b0F" if a.unit == "fahrenheit" else "\u00b0C"
+    t0 = L(cu["time"])
+    name, mark = WMO.get(int(cu.get("weather_code") or 0), ("Unknown", "??"))
+    if not cu.get("is_day", 1) and mark in ("CL", "MC"):
+        mark = "cl"
+    print(P["hdr"](loc.get("label") or "%.2f,%.2f" % (loc["lat"], loc["lon"])) +
+          D("  %s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"),
+                               t0.strftime("%H:%M"))))
+    temp = round(cu["temperature_2m"])
+    tc = (P["cyn"] if temp <= 32 else P["grn"] if temp <= 80 else P["yel"])
+    print("  " + B(tc("%d%s" % (temp, U))) +
+          D(" feels %d\u00b0" % round(cu["apparent_temperature"])) +
+          "  %s %s" % (mark, name))
+    wd = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][
+        int((cu.get("wind_direction_10m", 0) + 22.5) % 360 // 45)]
+    print(D("  %s %d%s   RH %d%%" % (wd, round(cu.get("wind_speed_10m") or 0),
+          "mph" if a.unit == "fahrenheit" else "km/h",
+          round(cu.get("relative_humidity_2m") or 0))))
+    n = min(24, len(h["time"]), max(1, cols - 4))
+    tp = h["temperature_2m"][:n]
+    pr = [x or 0 for x in h["precipitation_probability"][:n]]
+    print("\n" + D("  NEXT %dH" % n) +
+          D("   %d\u2013%d%s" % (round(min(tp)), round(max(tp)), U)))
+    print("  " + P["yel"](spark(tp, a.ascii)))
+    k = max(range(n), key=lambda i: pr[i])
+    print("  " + P["cyn"](rainbar(pr, a.ascii)) +
+          (D("  wet %d%% @%sh" % (pr[k], L(h["time"][k]).strftime("%H")))
+           if pr[k] >= 10 else D("  dry")))
+    print("\n" + D("  7 DAY"))
+    lo_a = min(dy["temperature_2m_min"])
+    hi_a = max(dy["temperature_2m_max"])
+    sp, W = (hi_a - lo_a) or 1.0, max(6, min(12, cols - 26))
+    fl, gp = ("#", ".") if a.ascii else ("\u2588", "\u00b7")
+    for i, ts in enumerate(dy["time"]):
+        lo, hi = dy["temperature_2m_min"][i], dy["temperature_2m_max"][i]
+        b0 = int((lo - lo_a) / sp * W)
+        b1 = max(b0 + 1, int(round((hi - lo_a) / sp * W)))
+        pp = dy["precipitation_probability_max"][i] or 0
+        _, g = WMO.get(int(dy["weather_code"][i] or 0), ("", "??"))
+        print("  %s %s %3d\u00b0 %s %3d\u00b0 %s" % (
+            L(ts).strftime("%a"), g, round(lo),
+            P["yel"]((gp * b0 + fl * (b1 - b0)).ljust(W, gp)), round(hi),
+            (P["cyn"] if pp >= 10 else D)("%3d%%" % pp)))
+    foot = ("offline, cached %s ago" % age(age_s) if stale
+            else kbs(wire) if wire
+            else "0B, cached" if age_s < 60 else "0B, cached %s ago" % age(age_s))
+    print(D("\n  " + foot))
+
+
 def gather(srcs, fresh):
     import threading
     os.makedirs(CD, exist_ok=True)
@@ -720,17 +868,20 @@ def sources(a):
 
 
 BOOLF = {"-f": "fresh", "--fresh": "fresh", "--offline": "offline",
+         "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
          "-u": "unread", "--unread": "unread", "--ascii": "ascii",
          "--check": "check", "-l": "list", "--list": "list",
          "--mark-all": "mark_all"}
-VALF = {"-n": ("n", int), "-s": ("only", str), "--only": ("only", str),
+VALF = {"-c": ("coords", str), "--coords": ("coords", str),
+        "--label": ("label", str), "-n": ("n", int), "-s": ("only", str), "--only": ("only", str),
         "-o": ("open", int), "--open": ("open", int), "-r": ("read", int),
         "--read": ("read", int), "-S": ("star", int), "--star": ("star", int),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"offline": False, "light": False, "cost": False,
+DEFAULTS_NS = {"coords": None, "label": None, "celsius": False,
+               "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
                "unread": False, "query": None, "download": None, "budget": None,
@@ -758,8 +909,11 @@ def fastparse(argv):
             except ValueError:
                 return None
             i += 1
+        elif t in ("--version", "-V"):
+            sys.stdout.write("lowpingnews %s\n" % VERSION)
+            raise SystemExit(0)
         elif t.startswith("-") and t != "-":
-            return None                   # --help, --version, --update, typos
+            return None                   # --help, --update, typos
         elif ns["cat"] is None:
             ns["cat"] = t
         else:
@@ -788,10 +942,14 @@ def main():
     if a is not None:
         return run(a)
     import argparse
-    p = argparse.ArgumentParser(prog="news", description="ultra-light headlines")
+    p = argparse.ArgumentParser(prog="lowpingnews",
+                                description="ultra-light headlines and weather")
     p.add_argument("cat", nargs="?", metavar="CATEGORY",
-                   help="top (default), world, science, tech, bio, all, signal")
+                   help="top, world, science, tech, bio, all, signal, weather")
     p.add_argument("--check", action="store_true", help="test every feed URL")
+    p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
+    p.add_argument("--label", help="name for the pinned location")
+    p.add_argument("-C", "--celsius", action="store_true", help="weather in celsius")
     p.add_argument("--offline", action="store_true", help="cache only, open no sockets")
     p.add_argument("--light", action="store_true",
                    help="skip feeds that last cost over 30KB")
@@ -813,7 +971,8 @@ def main():
     p.add_argument("--mark-all", action="store_true", help="mark everything read")
     p.add_argument("--update", nargs="?", const="", metavar="URL",
                    help="replace this script with the latest from URL")
-    p.add_argument("--version", action="version", version="news " + VERSION)
+    p.add_argument("--version", action="version",
+                   version="lowpingnews " + VERSION)
     p.add_argument("-l", "--list", action="store_true", help="list sources")
     p.add_argument("--ascii", action="store_true")
     p.add_argument("--no-color", dest="color", action="store_false")
@@ -822,6 +981,7 @@ def main():
 
 
 def run(a):
+    a.unit = "celsius" if getattr(a, "celsius", False) else "fahrenheit"
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
         a.color = False
     enc = (getattr(sys.stdout, "encoding", None) or "ascii").lower()
@@ -1038,6 +1198,12 @@ def run(a):
             rows = [(it.get("src", "saved"), it) for it in reversed(st["star"])]
         show(a, rows, rd, "search: %s" % a.query if a.query else "saved",
              "%s no network" % bul_(a))
+        return
+
+    if (a.cat or "").lower() == "weather":
+        loc = wx_locate(a)
+        d, wire, age_s, stale = wx_fetch(loc, a.unit, a.fresh)
+        wx_show(a, P, loc, d, wire, age_s, stale)
         return
 
     if (a.cat or "").lower() == "signal":

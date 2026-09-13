@@ -244,8 +244,15 @@ cmd_clean() {
 
 usage() {
   cat <<'EOF'
-lowpingnews - dev loop and updater
+lowpingnews - the reader, plus its dev loop
 
+  lowpingnews              headlines (top)
+  lowpingnews science      a category: top world science tech bio all
+  lowpingnews weather      ultra-light forecast
+  lowpingnews signal       connection quality
+  lowpingnews --help       all reader flags
+
+dev:
   update          install the latest release from GitHub
   status          installed / repo / newest download / git, and flag mismatches
   sync            newest VALID download -> repo -> install  (never picks by filename)
@@ -260,7 +267,14 @@ env: LPN_REPO LPN_DOWNLOADS (space-separated dirs) LPN_RAW LPN_NOFETCH=1
 EOF
 }
 
-c="${1:-status}"; [ $# -gt 0 ] && shift
+# Dev subcommands are handled here; anything else is the reader. The two name
+# spaces do not overlap (categories: top world science tech bio all signal
+# weather), so dispatch is unambiguous.
+c="${1:-}"
+case "$c" in
+  update|status|sync|install|test|pull|ship|release|clean|-h|--help|help) shift ;;
+  *) exec "$BIN/news" "$@" ;;
+esac
 case "$c" in
   update)  cmd_update ;;
   status)  cmd_status ;;

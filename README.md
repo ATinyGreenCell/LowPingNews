@@ -1,6 +1,6 @@
 # LowPingNews
 
-A terminal news reader for bad connections.
+A terminal news reader and weather forecast for bad connections.
 
 One file, Python standard library only, no pip install. Built for Termux on a
 phone with one bar of signal, where every kilobyte and every TLS handshake
@@ -72,7 +72,9 @@ this tells you which ones have.
 ## Usage
 
 ```
-news                    latest across the default category
+lowpingnews             latest across the default category
+lowpingnews weather     ultra-light forecast (24h + 7 day)
+lowpingnews signal      connection quality and data used
 news science            a category: top world science tech bio all
 news saved              your starred items
 news -q fern            search cached headlines, no network
@@ -320,6 +322,21 @@ Any `.tar.gz` in Downloads is extracted over the repo first, so README updates
 ride along.
 
 Override paths with `LPN_REPO`, `LPN_DOWNLOADS` and `LPN_RAW`.
+
+## Weather
+
+```
+lowpingnews weather -c 40.900,-73.412 --label "Fleets Cove"   # pin once
+lowpingnews weather          # thereafter
+lowpingnews weather -C       # celsius
+```
+
+One gzipped Open-Meteo call, cached 30 minutes, sharing the same HTTP layer,
+capped reads and offline fallback as the feeds. Current conditions, a 24-hour
+temperature sparkline and rain bar, then seven days. If the fetch fails it
+shows the last good forecast and says how old it is. Location is pinned in
+`~/.config/news/loc.json`, or taken from `termux-location` once if the
+Termux:API app is installed.
 
 ## Limitations
 
