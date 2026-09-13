@@ -92,6 +92,10 @@ news -n 3               fewer items per source
 news -s hn,bbc          only these source ids
 news -t                 headlines only, no summaries
 news -l                 list sources and categories
+news signal             connection quality, throughput and data used
+news --cost             estimate a refresh from known sizes, fetch nothing
+news --light            skip feeds that last cost over 30KB
+news --offline          cache only, open no sockets
 news --check            test every feed URL
 news --update URL       replace this script with the latest
 news --version          print version
@@ -199,6 +203,42 @@ commit to it, and stops at a 4 MB ceiling per run. Items whose text is already
 free — carried in the feed, or previously downloaded — are never counted
 against the budget and always proceed.
 
+## Knowing before you spend
+
+```
+$ news signal
+SIGNAL
+  wifi     -58 dBm  130 Mbps
+  measured good    18 recent fetches
+           100% ok  142ms median  84.1K/s
+           a light feed ~ 0.1s
+           Nature ~ 1.5s
+  data     1.2M over 7 days
+           today 269K
+```
+
+The `probe` lines do a DNS lookup and TCP connect to the hosts your feeds
+actually live on, at the port the feed URL specifies. No ICMP and no TLS: a
+SYN/ACK per attempt, no payload. ICMP is only shown as a supplement when `ping`
+is installed, because carriers drop or deprioritise it independently of TCP and
+it skips DNS entirely — and DNS is the usual thing that dies on a weak link.
+
+A TCP connect proves the path to *something*, not necessarily to the origin. A
+captive portal or transparent proxy answers for every address, so a connect
+under 2 ms to a remote host is flagged `proxied?` — treat those numbers as
+measuring your local gateway, not the feed.
+
+The radio line needs `termux-api` and is best-effort. It is deliberately not
+the headline, because dBm predicts throughput badly — a strong bar on congested
+backhaul is slower than a weak clear one. The verdict comes from the last 30
+real fetches: success rate, median latency and median throughput. That is the
+number that predicts whether a download finishes.
+
+`news --cost` estimates a refresh from each feed's last known size and TTL,
+opening no sockets. `news --light` drops feeds that last cost over 30 KB.
+`news --offline` reads only the cache. Together: check the cost, check the
+signal, then choose.
+
 ## Files
 
 ```
@@ -207,6 +247,7 @@ against the budget and always proceed.
 ~/.cache/news/*.json            feed cache + ETag validators
 ~/.local/share/news/state.json  read and starred items
 ~/.local/share/news/art/        offline article text, 3 MB cap, oldest evicted
+~/.local/share/news/net.json    last 200 fetch outcomes, 14 days of daily totals
 ```
 
 Config is deliberately outside the cache, so clearing the cache never eats

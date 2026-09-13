@@ -4,9 +4,11 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.3"
+VERSION = "2.5"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
+NET = DATA + "/net.json"
+NETCAP = 200
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
 FEEDCAP = 2 * 1024 * 1024       # refuse oversized feeds and gzip bombs
 PAGECAP = 5 * 1024 * 1024
@@ -380,6 +382,7 @@ def load(src, fresh, bag):
         elif c.get("t"):                   # no server validator: ask with our own
             import email.utils
             val["If-Modified-Since"] = email.utils.formatdate(c["t"], usegmt=True)
+    t_start = time.time()
     try:
         try:
             try:
@@ -394,6 +397,8 @@ def load(src, fresh, bag):
                 c["t"] = int(time.time())
                 jwrite(cf, c)
                 bag[src["id"]] = (c["items"], 0, 0, 1)
+                bag.setdefault("_net", []).append(
+                    (True, (time.time() - t_start) * 1000, 0))
                 return
             raise
         items = parse_hn(raw) if src["kind"] == "hn" else parse_feed(raw)
@@ -401,13 +406,14 @@ def load(src, fresh, bag):
         items = sorted(items, key=lambda z: -(z.get("d") or 0))[:STORECAP]
         if not items:
             raise ValueError("no items parsed")
-        rec = {"t": int(time.time()), "items": items}
+        rec = {"t": int(time.time()), "items": items, "w": wire}
         if rh.get("ETag"):
             rec["et"] = rh["ETag"]
         if rh.get("Last-Modified"):
             rec["lm"] = rh["Last-Modified"]
         jwrite(cf, rec)
         bag[src["id"]] = (items, wire, 0, 0)
+        bag.setdefault("_net", []).append((True, (time.time() - t_start) * 1000, wire))
     except Exception as e:
         if os.path.exists(cf):                      # offline: stale beats nothing
             try:
@@ -417,7 +423,125 @@ def load(src, fresh, bag):
             except Exception:
                 pass
         bag[src["id"]] = ([], 0, -1, 0)
+        bag.setdefault("_net", []).append((False, (time.time() - t_start) * 1000, 0))
         bag.setdefault("_err", {})[src["id"]] = str(e)[:60]
+
+
+def net_log(entries):
+    if not entries:
+        return
+    d = jread(NET, {})
+    log = d.get("log") or []
+    day = d.get("day") or {}
+    today = dt.date.today().isoformat()
+    for ok, ms, wire in entries:
+        log.append([int(time.time()), 1 if ok else 0, int(ms), int(wire)])
+        day[today] = day.get(today, 0) + int(wire)
+    d["log"] = log[-NETCAP:]
+    for k in list(day):                    # keep a fortnight of daily totals
+        if k < (dt.date.today() - dt.timedelta(days=14)).isoformat():
+            day.pop(k, None)
+    d["day"] = day
+    jwrite(NET, d)
+
+
+def net_stats():
+    d = jread(NET, {})
+    log = d.get("log") or []
+    recent = log[-30:]
+    if not recent:
+        return None
+    ok = [r for r in recent if r[1]]
+    rate = 100.0 * len(ok) / len(recent)
+    lat = sorted(r[2] for r in ok) or [0]
+    med = lat[len(lat) // 2]
+    tp = sorted((r[3] * 1000.0 / r[2]) for r in ok if r[2] > 0 and r[3] > 0)
+    return {"n": len(recent), "rate": rate, "ms": med,
+            "bps": (tp[len(tp) // 2] if tp else 0), "day": d.get("day") or {}}
+
+
+def hostport(url):
+    """(host, port) from a feed URL. Probing a hardcoded 443 reports a plain-http
+    or non-standard-port feed as unreachable, which is worse than not probing."""
+    rest = url.split("//", 1)[-1].split("/", 1)[0]
+    default = 443 if url.lower().startswith("https") else 80
+    if rest.startswith("["):                      # IPv6 literal
+        h, _, tail = rest.partition("]")
+        return h[1:], int(tail[1:]) if tail.startswith(":") and tail[1:].isdigit() else default
+    if ":" in rest:
+        h, _, p = rest.rpartition(":")
+        if p.isdigit():
+            return h, int(p)
+    return rest, default
+
+
+def probe(targets, n=3):
+    """DNS + TCP connect to the hosts we actually fetch from. No ICMP: carriers
+    drop it independently of TCP, and it skips DNS, which is the usual killer
+    on a lossy link. Costs a SYN/ACK per attempt, no TLS, no payload."""
+    import socket
+    res = []
+    for h, port in targets:
+        dns, tcp, fails, cold = [], [], 0, None
+        for i in range(n):
+            t0 = time.time()
+            try:
+                socket.getaddrinfo(h, port, 0, socket.SOCK_STREAM)
+                t1 = time.time()
+                if cold is None:
+                    cold = (t1 - t0) * 1000     # first lookup only: rest are cached
+                dns.append((t1 - t0) * 1000)
+                c = socket.create_connection((h, port), timeout=6)
+                tcp.append((time.time() - t1) * 1000)
+                c.close()
+            except Exception:
+                fails += 1
+        med = lambda v: sorted(v)[len(v) // 2] if v else None
+        res.append({"host": h, "port": port, "dns_cold": cold, "dns": med(dns),
+                    "tcp": med(tcp), "loss": 100.0 * fails / n})
+    return res
+
+
+def icmp(host, n=3):
+    """Supplementary only, and absent on most Termux installs."""
+    import shutil, subprocess
+    if not shutil.which("ping"):
+        return None
+    try:
+        r = subprocess.run(["ping", "-c", str(n), "-W", "2", host],
+                           capture_output=True, timeout=12, text=True)
+    except Exception:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)% packet loss", r.stdout)
+    t = re.search(r"=\s*[\d.]+/([\d.]+)/", r.stdout)
+    if not m:
+        return None
+    return {"loss": float(m.group(1)), "avg": float(t.group(1)) if t else None}
+
+
+def radio():
+    """Best-effort. termux-api is optional and these calls are slow-ish, so this
+    is only invoked by `news signal`, never on a normal run."""
+    import shutil, subprocess
+    out = []
+    for cmd, want in (("termux-wifi-connectioninfo", "wifi"),
+                      ("termux-telephony-cellinfo", "cell")):
+        if not shutil.which(cmd):
+            continue
+        try:
+            r = subprocess.run([cmd], capture_output=True, timeout=6, text=True)
+            j = json.loads(r.stdout or "null")
+        except Exception:
+            continue
+        if want == "wifi" and isinstance(j, dict) and j.get("rssi") is not None:
+            if j.get("supplicant_state") in (None, "COMPLETED"):
+                out.append(("wifi", j.get("rssi"), "%s Mbps" % j.get("link_speed_mbps", "?")))
+        elif want == "cell" and isinstance(j, list):
+            for c in j:
+                dbm = c.get("dbm")
+                if dbm is not None:
+                    out.append((c.get("type", "cell"), dbm, c.get("level", "")))
+    return out
 
 
 def gather(srcs, fresh):
@@ -435,6 +559,7 @@ def gather(srcs, fresh):
             ths.append(t)
         for t in ths:                  # join() is the real ceiling: socket timeouts
             t.join(max(0.1, end - time.time()))   # don't bound getaddrinfo on a lossy link
+    net_log(bag.pop("_net", []))
     return bag
 
 
@@ -594,7 +719,8 @@ def sources(a):
     return sel
 
 
-BOOLF = {"-f": "fresh", "--fresh": "fresh", "-t": "titles", "--titles": "titles",
+BOOLF = {"-f": "fresh", "--fresh": "fresh", "--offline": "offline",
+         "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
          "-u": "unread", "--unread": "unread", "--ascii": "ascii",
          "--check": "check", "-l": "list", "--list": "list",
          "--mark-all": "mark_all"}
@@ -604,7 +730,8 @@ VALF = {"-n": ("n", int), "-s": ("only", str), "--only": ("only", str),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"cat": None, "check": False, "fresh": False, "n": 5, "only": None,
+DEFAULTS_NS = {"offline": False, "light": False, "cost": False,
+               "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
                "unread": False, "query": None, "download": None, "budget": None,
                "mark_all": False, "update": None, "list": False, "ascii": False,
@@ -663,8 +790,13 @@ def main():
     import argparse
     p = argparse.ArgumentParser(prog="news", description="ultra-light headlines")
     p.add_argument("cat", nargs="?", metavar="CATEGORY",
-                   help="top (default), world, science, tech, bio, all")
+                   help="top (default), world, science, tech, bio, all, signal")
     p.add_argument("--check", action="store_true", help="test every feed URL")
+    p.add_argument("--offline", action="store_true", help="cache only, open no sockets")
+    p.add_argument("--light", action="store_true",
+                   help="skip feeds that last cost over 30KB")
+    p.add_argument("--cost", action="store_true",
+                   help="estimate a refresh from known sizes, fetch nothing")
     p.add_argument("-f", "--fresh", action="store_true", help="bypass 15m cache")
     p.add_argument("-n", type=int, default=5, metavar="N", help="items per source")
     p.add_argument("-s", "--only", metavar="IDS", help="only these source ids")
@@ -908,7 +1040,97 @@ def run(a):
              "%s no network" % bul_(a))
         return
 
+    if (a.cat or "").lower() == "signal":
+        st_ = net_stats()
+        print(P["hdr"]("SIGNAL"))
+        for kind, dbm, extra in radio():
+            c = (P["grn"] if (isinstance(dbm, int) and dbm > -75)
+                 else P["yel"] if (isinstance(dbm, int) and dbm > -95) else P["red"])
+            print("  %-8s %s %s" % (kind, c("%s dBm" % dbm), D(str(extra))))
+        if not st_:
+            print(D("  no fetch history yet - run `news` once"))
+            return
+        v = (P["grn"] if st_["rate"] >= 90 and st_["bps"] > 20000 else
+             P["yel"] if st_["rate"] >= 60 else P["red"])
+        verdict = ("good" if st_["rate"] >= 90 and st_["bps"] > 20000 else
+                   "usable" if st_["rate"] >= 60 else "poor")
+        print("  %-8s %s  %s" % ("measured", v(verdict),
+              D("%d recent fetches" % st_["n"])))
+        print("  %-8s %s ok  %s median  %s" % (
+            "", v("%.0f%%" % st_["rate"]), D("%dms" % st_["ms"]),
+            D("%s/s" % kbs(int(st_["bps"])) if st_["bps"] else "")))
+        hosts = []
+        for x in sources(argparse_ns({"only": None, "cat": "all"})):
+            hp = hostport(x["url"])
+            if hp[0] and hp not in hosts:
+                hosts.append(hp)
+        for r_ in probe(hosts[:2]):
+            lc = (P["grn"] if r_["loss"] == 0 else
+                  P["yel"] if r_["loss"] < 50 else P["red"])
+            if r_["tcp"] is None:
+                print("  %-8s %s %s" % ("probe", lc("unreachable"), D(r_["host"][:22])))
+                continue
+            tc = (P["grn"] if r_["tcp"] < 150 else
+                  P["yel"] if r_["tcp"] < 500 else P["red"])
+            note = ""
+            if r_["tcp"] < 2 and not r_["host"].startswith(("127.", "10.", "192.168.")):
+                note = " proxied?"   # a remote SYN/ACK cannot return in under 2ms
+            print("  %-8s %s %s %s%s" % (
+                "probe", tc("%4dms tcp" % r_["tcp"]),
+                D("%4dms dns" % (r_["dns_cold"] or 0)),
+                lc("%.0f%% loss" % r_["loss"]) if r_["loss"] else D(r_["host"][:16]),
+                P["yel"](note)))
+        ic = icmp(hosts[0][0]) if hosts else None
+        if ic:
+            print("  %-8s %s" % ("icmp", D("%.0f%% loss, %sms avg"
+                  % (ic["loss"], ic["avg"] if ic["avg"] else "?"))))
+        if st_["bps"] > 1000:
+            for label, size in (("a light feed", 8 * 1024), ("Nature", 124 * 1024)):
+                print(D("           %s ~ %.1fs" % (label, size / st_["bps"])))
+        days = sorted(st_["day"].items())[-7:]
+        if days:
+            tot = sum(v_ for _, v_ in days)
+            print("  %-8s %s %s" % ("data", kbs(tot),
+                  D("over %d day%s" % (len(days), "" if len(days) == 1 else "s"))))
+            print(D("           today %s" % kbs(st_["day"].get(
+                dt.date.today().isoformat(), 0))))
+        if verdict == "poor":
+            print(D("  tip: news --light skips the heavy feeds"))
+        return
+
     srcs = sources(a)
+    if a.light:
+        keep_ = []
+        for x in srcs:
+            w_ = jread("%s/%s.json" % (CD, x["id"]), {}).get("w")
+            if w_ is None or w_ <= 30 * 1024:
+                keep_.append(x)
+        if keep_:
+            skipped = len(srcs) - len(keep_)
+            srcs = keep_
+            if skipped:
+                print(D("  --light: skipped %d heavy feed%s"
+                        % (skipped, "" if skipped == 1 else "s")))
+    if a.cost:
+        print(P["hdr"]("COST") + D("  estimate from last known sizes, nothing fetched"))
+        tot, unknown = 0, 0
+        for x in srcs:
+            c_ = jread("%s/%s.json" % (CD, x["id"]), {})
+            w_, age_ = c_.get("w"), time.time() - (c_.get("t") or 0)
+            fresh_ = age_ < (x.get("ttl") or TTL)
+            if w_ is None:
+                unknown += 1
+                print("  %-7s %s" % (x["id"], D("unknown")))
+                continue
+            due = 0 if fresh_ else w_
+            tot += due
+            print("  %-7s %s %s" % (x["id"],
+                  (P["grn"] if not due else P["yel"] if due < 40960 else P["red"])(
+                      "%7s" % (kbs(due) if due else "cached")),
+                  D("last %s%s" % (kbs(w_), "" if due else ", within ttl"))))
+        print(D("  ~%s if refreshed now%s"
+                % (kbs(tot), ", %d unknown" % unknown if unknown else "")))
+        return
     if a.check:
         for x in srcs:
             t0 = time.time()
@@ -926,7 +1148,16 @@ def run(a):
                 print("  %-6s %s %s" % (x["id"][:6], P["red"]("err"),
                                         P["d"](str(e)[:max(10, cols_() - 14)])))
         return
-    bag = gather(srcs, a.fresh)
+    if a.offline:
+        bag = {}
+        for x in srcs:
+            c_ = jread("%s/%s.json" % (CD, x["id"]), {})
+            if c_.get("items"):
+                bag[x["id"]] = (c_["items"], 0, int(time.time() - (c_.get("t") or 0)), 0)
+            else:
+                bag[x["id"]] = ([], 0, -1, 0)
+    else:
+        bag = gather(srcs, a.fresh)
     try:
         cols = os.get_terminal_size().columns
     except Exception:
