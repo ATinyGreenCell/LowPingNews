@@ -108,6 +108,17 @@ cmd_install() {
   got="$(installed_ver)"
   [ "$got" = "$v" ] || die "installed $got but repo says $v"
   say "installed v$v"
+  # Install the dev tool too. rename() is safe even while this very script is
+  # executing: the kernel keeps the old inode open until we exit. Copying onto
+  # the live path instead would corrupt the remaining lines mid-run.
+  if [ -f "$REPO/lowpingnews" ] && ! cmp -s "$REPO/lowpingnews" "$BIN/lowpingnews"; then
+    sh -n "$REPO/lowpingnews" || die "repo lowpingnews has a syntax error - not installing"
+    cp "$REPO/lowpingnews" "$BIN/lowpingnews.new" || die "cannot write $BIN"
+    chmod +x "$BIN/lowpingnews.new"
+    mv "$BIN/lowpingnews.new" "$BIN/lowpingnews"
+    ln -sf "$BIN/lowpingnews" "$BIN/lpn"
+    say "installed lowpingnews (takes effect next invocation)"
+  fi
 }
 
 cmd_test() {

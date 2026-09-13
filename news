@@ -4,7 +4,7 @@ import argparse, datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.1"
+VERSION = "2.2"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
@@ -24,7 +24,14 @@ MAXPAR = 6                     # concurrent fetches; a phone radio is not a data
 ARTMAX = 200000                # per-article text ceiling
 UA = "news/1.0 (+termux)"
 
-D_ = lambda i, n, u, c, k="rss": {"id": i, "name": n, "url": u, "cats": c, "kind": k}
+def D_(i, n, u, c, k="rss", ttl=None):
+    d = {"id": i, "name": n, "url": u, "cats": c, "kind": k}
+    if ttl:
+        d["ttl"] = ttl
+    return d
+
+
+HEAVY = 6 * 3600               # slow-publishing feeds that send no validators
 DEFAULTS = [
     # general - center-rated, wire//institutional rather than opinion-led
     D_("bbc", "BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -38,7 +45,8 @@ DEFAULTS = [
     D_("phys", "Phys.org", "https://phys.org/rss-feed/", ["top", "science"]),
     D_("sd", "ScienceDaily", "https://www.sciencedaily.com/rss/all.xml", ["science"]),
     D_("quanta", "Quanta", "https://api.quantamagazine.org/feed/", ["science"]),
-    D_("nature", "Nature", "https://www.nature.com/nature.rss", ["science"]),
+    D_("nature", "Nature", "https://www.nature.com/nature.rss", ["science"],
+       ttl=HEAVY),
     # tech
     D_("ars", "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index",
        ["top", "tech"]),
@@ -47,9 +55,11 @@ DEFAULTS = [
        "?tags=front_page&hitsPerPage=20", ["tech"], "hn"),
     # bio - preprints, no editorial layer at all
     D_("brxp", "bioRxiv plant",
-       "https://connect.biorxiv.org/biorxiv_xml.php?subject=plant_biology", ["bio"]),
+       "https://connect.biorxiv.org/biorxiv_xml.php?subject=plant_biology", ["bio"],
+       ttl=HEAVY),
     D_("brxs", "bioRxiv synbio",
-       "https://connect.biorxiv.org/biorxiv_xml.php?subject=synthetic_biology", ["bio"]),
+       "https://connect.biorxiv.org/biorxiv_xml.php?subject=synthetic_biology", ["bio"],
+       ttl=HEAVY),
 ]
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -194,13 +204,38 @@ def _readable():
     return _RD[0]
 
 
+def _meta_fallback(txt):
+    """Most sites embed the body in JSON-LD or a description tag. Already paid for."""
+    import html as _h
+    m = re.search(r'"articleBody"\s*:\s*"((?:[^"\\]|\\.)*)"', txt)
+    if m:
+        try:
+            body = json.loads('"%s"' % m.group(1))
+        except Exception:
+            body = m.group(1)
+        body = " ".join(body.split())
+        if len(body) > 200:
+            return body
+    for pat in (r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']{80,})',
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{80,})'):
+        m = re.search(pat, txt, re.I)
+        if m:
+            return " ".join(_h.unescape(m.group(1)).split())
+    return ""
+
+
 def extract(raw):
     p = _readable()()
     try:
         p.feed(raw.decode("utf-8", "replace"))
     except Exception:
         pass
-    return "\n\n".join(p.out[:120])
+    out = "\n\n".join(p.out[:120])
+    if len(out) < 200:            # paywalled or JS-rendered: try the embedded copy
+        alt = _meta_fallback(raw.decode("utf-8", "replace"))
+        if len(alt) > len(out):
+            return alt
+    return out
 
 
 def get(url, t=10, extra=None, cap=FEEDCAP):
@@ -321,10 +356,11 @@ def parse_hn(raw):
 def load(src, fresh, bag):
     """Fetch or reuse one source. Never raises - records the failure instead."""
     cf = "%s/%s.json" % (CD, src["id"])
+    ttl = src.get("ttl") or TTL
     if not fresh and os.path.exists(cf):
         try:
             c = json.load(open(cf, encoding="utf-8"))
-            if time.time() - c.get("t", 0) < TTL:
+            if time.time() - c.get("t", 0) < ttl:
                 bag[src["id"]] = (c["items"], 0, 0, 0)
                 return
         except Exception:
@@ -525,6 +561,10 @@ def sources(a):
         x["id"] = i
         x["name"] = str(x.get("name") or i)[:32]
         x.setdefault("kind", "rss")
+        try:
+            x["ttl"] = max(0, min(int(x.get("ttl") or TTL), 604800))
+        except Exception:
+            x["ttl"] = TTL
         c = x.get("cats")
         x["cats"] = [str(z) for z in c] if isinstance(c, list) and c else ["top"]
         ok.append(x)
@@ -799,12 +839,14 @@ def main():
         for x in srcs:
             t0 = time.time()
             try:
-                raw, _, wire = get(x["url"], 12)
+                raw, rh_, wire = get(x["url"], 12)
                 n = len(parse_hn(raw) if x["kind"] == "hn" else parse_feed(raw))
+                val = "v" if (rh_.get("ETag") or rh_.get("Last-Modified")) else "-"
                 cost = P["grn"] if wire < 20480 else P["yel"] if wire < 81920 else P["red"]
-                print("  %-6s %s %3di %s %s %4.1fs" % (
+                print("  %-6s %s %3di %s %s %s %4.1fs" % (
                     x["id"][:6], P["grn"]("ok ") if n else P["yel"]("nil"), n,
                     cost("%6s" % kbs(wire)), P["d"]("%6s" % kbs(len(raw))),
+                    (P["grn"] if val == "v" else P["yel"])(val),
                     time.time() - t0))
             except Exception as e:
                 print("  %-6s %s %s" % (x["id"][:6], P["red"]("err"),

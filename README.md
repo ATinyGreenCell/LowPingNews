@@ -130,6 +130,13 @@ $EDITOR ~/.config/news/sources.json
 `kind` is `rss` (RSS 2.0, RSS 1.0/RDF and Atom are all handled) or `hn` for the
 Hacker News Algolia API. Only `http`/`https` URLs are accepted.
 
+Optional `"ttl"` (seconds) sets how long that feed is reused before refetching;
+the default is 900. It matters for feeds that send no `ETag` or `Last-Modified`,
+because those can't answer with a cheap 304 and must resend in full. `news
+--check` marks validator support per feed: `v` means conditional GET works,
+`-` means every refresh costs the full payload. Nature and both bioRxiv feeds
+ship with a 6-hour TTL for that reason.
+
 ## Measured
 
 Every feed in the default set, fetched from a phone on 2026-09-13:
@@ -248,7 +255,12 @@ stranded on an older commit is moved, and `gh release create` falls through to
 
 Set `LPN_NOFETCH=1` to stop `status` probing the remote.
 
-`sync` picks the newest build in `~/storage/downloads` that actually parses and
+Installing also installs `lowpingnews` itself, by rename rather than copy — the
+kernel keeps the running script's inode open, so it can safely replace itself
+mid-execution and the new version takes effect on the next invocation. Copying
+onto the live path instead corrupts the remaining lines of the running script.
+
+`sync` picks the newest build in `~/storage/downloads` or `~/downloads` that parses and
 carries a `VERSION`, ignoring the filename entirely. Android saves repeat
 downloads as `news-1`, `news-2` and so on, and picking by name silently
 installs a stale build — which is a real failure this tool exists to prevent.
@@ -259,8 +271,11 @@ Override paths with `LPN_REPO`, `LPN_DOWNLOADS` and `LPN_RAW`.
 
 ## Limitations
 
-- Article extraction is a paragraph heuristic with no JavaScript. Paywalled or
-  client-rendered pages return "no readable paragraphs" rather than text.
+- Article extraction is a paragraph heuristic with no JavaScript. When a page
+  yields no paragraphs it falls back to the `articleBody` publishers embed as
+  JSON-LD for search indexing, then to `og:description`. This is not a paywall
+  bypass: it reads only what the page already returned, so a publisher who
+  sends no body text still yields nothing.
 - `-d all` on a full list can mean several hundred KB. The ledger tells you
   after the fact, not before.
 - Feeds must be public. No authentication, no OPML import.
