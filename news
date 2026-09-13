@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.5"
+VERSION = "2.6"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -1047,18 +1047,7 @@ def run(a):
             c = (P["grn"] if (isinstance(dbm, int) and dbm > -75)
                  else P["yel"] if (isinstance(dbm, int) and dbm > -95) else P["red"])
             print("  %-8s %s %s" % (kind, c("%s dBm" % dbm), D(str(extra))))
-        if not st_:
-            print(D("  no fetch history yet - run `news` once"))
-            return
-        v = (P["grn"] if st_["rate"] >= 90 and st_["bps"] > 20000 else
-             P["yel"] if st_["rate"] >= 60 else P["red"])
-        verdict = ("good" if st_["rate"] >= 90 and st_["bps"] > 20000 else
-                   "usable" if st_["rate"] >= 60 else "poor")
-        print("  %-8s %s  %s" % ("measured", v(verdict),
-              D("%d recent fetches" % st_["n"])))
-        print("  %-8s %s ok  %s median  %s" % (
-            "", v("%.0f%%" % st_["rate"]), D("%dms" % st_["ms"]),
-            D("%s/s" % kbs(int(st_["bps"])) if st_["bps"] else "")))
+        # the probe needs no history: on a fresh install it is all we have
         hosts = []
         for x in sources(argparse_ns({"only": None, "cat": "all"})):
             hp = hostport(x["url"])
@@ -1084,6 +1073,18 @@ def run(a):
         if ic:
             print("  %-8s %s" % ("icmp", D("%.0f%% loss, %sms avg"
                   % (ic["loss"], ic["avg"] if ic["avg"] else "?"))))
+        if not st_:
+            print(D("  measured no fetch history yet - run `news` once"))
+            return
+        v = (P["grn"] if st_["rate"] >= 90 and st_["bps"] > 20000 else
+             P["yel"] if st_["rate"] >= 60 else P["red"])
+        verdict = ("good" if st_["rate"] >= 90 and st_["bps"] > 20000 else
+                   "usable" if st_["rate"] >= 60 else "poor")
+        print("  %-8s %s  %s" % ("measured", v(verdict),
+              D("%d recent fetches" % st_["n"])))
+        print("  %-8s %s ok  %s median  %s" % (
+            "", v("%.0f%%" % st_["rate"]), D("%dms" % st_["ms"]),
+            D("%s/s" % kbs(int(st_["bps"])) if st_["bps"] else "")))
         if st_["bps"] > 1000:
             for label, size in (("a light feed", 8 * 1024), ("Nature", 124 * 1024)):
                 print(D("           %s ~ %.1fs" % (label, size / st_["bps"])))
@@ -1120,7 +1121,8 @@ def run(a):
             fresh_ = age_ < (x.get("ttl") or TTL)
             if w_ is None:
                 unknown += 1
-                print("  %-7s %s" % (x["id"], D("unknown")))
+                print("  %-7s %s" % (x["id"],
+                      D("unknown - not fetched since v2.4")))
                 continue
             due = 0 if fresh_ else w_
             tot += due

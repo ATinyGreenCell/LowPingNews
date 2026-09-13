@@ -228,7 +228,13 @@ captive portal or transparent proxy answers for every address, so a connect
 under 2 ms to a remote host is flagged `proxied?` — treat those numbers as
 measuring your local gateway, not the feed.
 
-The radio line needs `termux-api` and is best-effort. It is deliberately not
+The probe and the radio line run without any fetch history, so `news signal`
+is useful on a fresh install before you have spent a single byte.
+
+The radio line needs both the `termux-api` package and the separate Termux:API
+app, which is only on F-Droid — it is not on Google Play. Without the app the
+CLI prints a notice and the radio line is simply omitted; everything else in
+`news signal` still works. It is deliberately not
 the headline, because dBm predicts throughput badly — a strong bar on congested
 backhaul is slower than a weak clear one. The verdict comes from the last 30
 real fetches: success rate, median latency and median throughput. That is the
