@@ -67,12 +67,8 @@ cmd_status() {
 }
 
 cmd_sync() {
-  src="$(newest_download || true)"
-  [ -n "$src" ] || die "no valid build found in: $DLS"
-  v="$(ver "$src")"
-  say "using $src (v$v)"
-  # Only extract an archive whose every member is a file this project owns.
-  # Downloads is a shared junk drawer: unrelated tarballs must never land here.
+  # Extract FIRST: an archive alone is a complete delivery. Requiring a loose
+  # build before extracting meant a tarball-only drop could never sync.
   newest_tar=""; nt=0
   for d in $DLS; do
     for t in "$d"/*.tar.gz; do
@@ -85,15 +81,27 @@ cmd_sync() {
           *) bad=1; break ;;
         esac
       done
-      [ "$bad" -eq 1 ] && continue
+      [ "$bad" -eq 1 ] && continue        # unrelated archive: never touch the repo
       mt="$("$PY" -c "import os,sys;print(int(os.path.getmtime(sys.argv[1])))" "$t")"
       [ "$mt" -gt "$nt" ] && { newest_tar="$t"; nt="$mt"; }
     done
   done
   if [ -n "$newest_tar" ]; then
-    tar xzf "$newest_tar" -C "$REPO" && say "extracted $(basename "$newest_tar")"
+    tar xzf "$newest_tar" -C "$REPO" || die "extract failed: $newest_tar"
+    say "extracted $(basename "$newest_tar")"
   fi
-  cp "$src" "$REPO/news" || die "copy into $REPO failed"
+
+  src="$(newest_download || true)"        # a loose build wins only if it is newer
+  if [ -n "$src" ]; then
+    st="$("$PY" -c "import os,sys;print(int(os.path.getmtime(sys.argv[1])))" "$src")"
+    if [ "$st" -gt "$nt" ]; then
+      say "using $src (v$(ver "$src"))"
+      cp "$src" "$REPO/news" || die "copy into $REPO failed"
+    else
+      say "archive is newer than $src - keeping the archive build"
+    fi
+  fi
+  [ -n "$newest_tar" ] || [ -n "$src" ] || die "no valid build or archive found in: $DLS"
   cmd_install
 }
 

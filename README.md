@@ -27,7 +27,12 @@ NEWS · science  Sun 13 Sep 09:12
 Most feed readers assume bandwidth. This one assumes you don't have any.
 
 - **Conditional GET.** Feeds are re-requested with `ETag` / `If-Modified-Since`.
-  An unchanged feed returns `304 Not Modified` with no body at all.
+  An unchanged feed returns `304 Not Modified` with no body at all. Servers that
+  advertise no validator are still sent `If-Modified-Since` derived from the
+  cache timestamp — it costs ~40 bytes to ask and many honour it, which turns a
+  124 KB Nature refresh into nothing.
+- **One retry on a dropped connection.** A transient failure is retried once
+  after 400 ms; a real HTTP error is not, since the server answered.
 - **Few hosts, deliberately.** TLS handshake is roughly 4 KB per host no matter
   how small the payload. Host count dominates everything else, so the default
   set is small on purpose. Adding a sixth feed costs more than it looks like.

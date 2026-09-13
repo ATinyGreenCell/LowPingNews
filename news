@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """news - ultra-light terminal headlines. Parallel gzipped fetch, cached for offline."""
-import argparse, datetime as dt, json, os, re, sys, time
+import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "2.2"
+VERSION = "2.3"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
@@ -377,9 +377,18 @@ def load(src, fresh, bag):
             val["If-None-Match"] = c["et"]
         if c.get("lm"):
             val["If-Modified-Since"] = c["lm"]
+        elif c.get("t"):                   # no server validator: ask with our own
+            import email.utils
+            val["If-Modified-Since"] = email.utils.formatdate(c["t"], usegmt=True)
     try:
         try:
-            raw, rh, wire = get(src["url"], extra=val)
+            try:
+                raw, rh, wire = get(src["url"], extra=val)
+            except urllib.error.HTTPError:
+                raise                      # a real HTTP answer: do not retry
+            except Exception:
+                time.sleep(0.4)            # transient drop on a weak signal
+                raw, rh, wire = get(src["url"], extra=val)
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
@@ -551,8 +560,8 @@ def sources(a):
     for x in s:
         if not isinstance(x, dict) or not x.get("url"):
             continue
-        import urllib.parse
-        if urllib.parse.urlsplit(str(x["url"])).scheme not in ("http", "https"):
+        u_ = str(x["url"]).strip().lower()
+        if not (u_.startswith("http://") or u_.startswith("https://")):
             continue                      # no file://, no ftp:// from a config file
         i = re.sub(r"[^A-Za-z0-9_-]", "", str(x.get("id") or ""))[:24]
         if not i or i in seen:            # ids index cache files: no dupes, no ../
@@ -585,12 +594,73 @@ def sources(a):
     return sel
 
 
+BOOLF = {"-f": "fresh", "--fresh": "fresh", "-t": "titles", "--titles": "titles",
+         "-u": "unread", "--unread": "unread", "--ascii": "ascii",
+         "--check": "check", "-l": "list", "--list": "list",
+         "--mark-all": "mark_all"}
+VALF = {"-n": ("n", int), "-s": ("only", str), "--only": ("only", str),
+        "-o": ("open", int), "--open": ("open", int), "-r": ("read", int),
+        "--read": ("read", int), "-S": ("star", int), "--star": ("star", int),
+        "-q": ("query", str), "--query": ("query", str),
+        "-d": ("download", str), "--download": ("download", str),
+        "--budget": ("budget", int)}
+DEFAULTS_NS = {"cat": None, "check": False, "fresh": False, "n": 5, "only": None,
+               "titles": False, "open": None, "read": None, "star": None,
+               "unread": False, "query": None, "download": None, "budget": None,
+               "mark_all": False, "update": None, "list": False, "ascii": False,
+               "color": True}
+
+
+def fastparse(argv):
+    """argparse costs ~7.6ms of a ~34ms run. Handle the common shapes without it
+    and defer to argparse for anything unfamiliar, so behaviour cannot diverge."""
+    ns = dict(DEFAULTS_NS)
+    i, n = 0, len(argv)
+    while i < n:
+        t = argv[i]
+        if t in BOOLF:
+            ns[BOOLF[t]] = True
+        elif t == "--no-color":
+            ns["color"] = False
+        elif t in VALF:
+            if i + 1 >= n:
+                return None
+            key, cast = VALF[t]
+            try:
+                ns[key] = cast(argv[i + 1])
+            except ValueError:
+                return None
+            i += 1
+        elif t.startswith("-") and t != "-":
+            return None                   # --help, --version, --update, typos
+        elif ns["cat"] is None:
+            ns["cat"] = t
+        else:
+            return None                   # two positionals: let argparse complain
+        i += 1
+    return argparse_ns(ns)
+
+
+class argparse_ns(object):
+    def __init__(self, d):
+        self.__dict__.update(d)
+
+    def __getattr__(self, k):             # tolerate keys the caller did not set
+        if k in DEFAULTS_NS:
+            return DEFAULTS_NS[k]
+        raise AttributeError(k)
+
+
 def main():
     try:
         import signal
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     except Exception:
         pass
+    a = fastparse(sys.argv[1:])
+    if a is not None:
+        return run(a)
+    import argparse
     p = argparse.ArgumentParser(prog="news", description="ultra-light headlines")
     p.add_argument("cat", nargs="?", metavar="CATEGORY",
                    help="top (default), world, science, tech, bio, all")
@@ -616,6 +686,10 @@ def main():
     p.add_argument("--ascii", action="store_true")
     p.add_argument("--no-color", dest="color", action="store_false")
     a = p.parse_args()
+    return run(a)
+
+
+def run(a):
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
         a.color = False
     enc = (getattr(sys.stdout, "encoding", None) or "ascii").lower()
@@ -682,7 +756,7 @@ def main():
         return
 
     if a.list:
-        allsrc = sources(argparse.Namespace(only=None, cat="all"))
+        allsrc = sources(argparse_ns({"only": None, "cat": "all"}))
         print(D("  categories: " +
                 ", ".join(sorted({z for x in allsrc for z in x["cats"]})) + ", all"))
         w = cols_()
@@ -820,7 +894,7 @@ def main():
         rows = []
         if a.query:
             q = a.query.lower()
-            for x in sources(argparse.Namespace(only=None, cat="all")):
+            for x in sources(argparse_ns({"only": None, "cat": "all"})):
                 try:
                     c = json.load(open("%s/%s.json" % (CD, x["id"]), encoding="utf-8"))
                 except Exception:
