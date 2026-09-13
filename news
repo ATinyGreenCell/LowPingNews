@@ -6,7 +6,7 @@ import urllib.error, urllib.parse, urllib.request, zlib
 from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 
-VERSION = "1.8"
+VERSION = "1.9"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 ARTCAP = 3 * 1024 * 1024        # offline library ceiling
@@ -20,6 +20,8 @@ CFG = CFD + "/sources.json"
 LAST = CD + "/last.json"
 TTL = 900                      # a feed younger than this is reused, no request
 DEADLINE = 20                  # hard ceiling on the whole fetch round
+MAXPAR = 6                     # concurrent fetches; a phone radio is not a datacentre
+ARTMAX = 200000                # per-article text ceiling
 UA = "news/1.0 (+termux)"
 
 D_ = lambda i, n, u, c, k="rss": {"id": i, "name": n, "url": u, "cats": c, "kind": k}
@@ -72,7 +74,10 @@ def when(s):
         return 0
     s = s.strip()
     try:
-        return int(email.utils.parsedate_to_datetime(s).timestamp())
+        d = email.utils.parsedate_to_datetime(s)
+        if d.tzinfo is None:           # legal in RSS; .timestamp() would assume local
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
     except Exception:
         pass
     try:
@@ -142,6 +147,7 @@ def fetch_article(it):
         return "", 0, "nolink"
     raw, _, wire = get(it["u"], 20, cap=PAGECAP)
     txt = extract(raw)
+    txt = txt[:ARTMAX]
     if txt:
         store_article(k, txt)
     return txt, wire, "web"
@@ -327,7 +333,7 @@ def load(src, fresh, bag):
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
-                json.dump(c, open(cf, "w", encoding="utf-8"), separators=(",", ":"))
+                jwrite(cf, c)
                 bag[src["id"]] = (c["items"], 0, 0, 1)
                 return
             raise
@@ -340,7 +346,7 @@ def load(src, fresh, bag):
             rec["et"] = rh["ETag"]
         if rh.get("Last-Modified"):
             rec["lm"] = rh["Last-Modified"]
-        json.dump(rec, open(cf, "w", encoding="utf-8"), separators=(",", ":"))
+        jwrite(cf, rec)
         bag[src["id"]] = (items, wire, 0, 0)
     except Exception as e:
         if os.path.exists(cf):                      # offline: stale beats nothing
@@ -356,14 +362,18 @@ def load(src, fresh, bag):
 
 def gather(srcs, fresh):
     os.makedirs(CD, exist_ok=True)
-    bag, ths = {}, []
-    for s in srcs:
-        t = threading.Thread(target=load, args=(s, fresh, bag), daemon=True)
-        t.start()
-        ths.append(t)
-    end = time.time() + DEADLINE       # join() is the real ceiling: socket timeouts
-    for t in ths:                      # do not bound getaddrinfo on a lossy link
-        t.join(max(0.1, end - time.time()))
+    bag = {}
+    end = time.time() + DEADLINE
+    for i in range(0, len(srcs), MAXPAR):       # batches: 40 feeds != 40 sockets
+        if time.time() >= end:
+            break
+        ths = []
+        for s in srcs[i:i + MAXPAR]:
+            t = threading.Thread(target=load, args=(s, fresh, bag), daemon=True)
+            t.start()
+            ths.append(t)
+        for t in ths:                  # join() is the real ceiling: socket timeouts
+            t.join(max(0.1, end - time.time()))   # don't bound getaddrinfo on a lossy link
     return bag
 
 
@@ -391,12 +401,18 @@ def cols_():
 
 def jwrite(path, obj):
     """Never let a full disk or a read-only home take the whole command down."""
+    tmp = "%s.tmp%d" % (path, os.getpid())
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, separators=(",", ":"))
+        os.replace(tmp, path)          # atomic: a second terminal sees old or new
         return True
     except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 
@@ -428,7 +444,7 @@ def key(t):
 def sources(a):
     os.makedirs(CFD, exist_ok=True)
     if not os.path.exists(CFG):
-        json.dump(DEFAULTS, open(CFG, "w", encoding="utf-8"), indent=1)
+        jwrite(CFG, DEFAULTS)
     try:
         s = json.load(open(CFG, encoding="utf-8"))
     except Exception:
@@ -506,6 +522,7 @@ def main():
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
+    a.n = max(1, min(50, a.n))
     acts = [x for x in (a.open, a.read, a.star) if x is not None]
     if len(acts) > 1:
         sys.exit("news: pick one of -o / -r / -S at a time")
@@ -785,7 +802,7 @@ def show(a, rows, rd, tag, foot):
             for ln in body:
                 print(D(ln))
         print()
-    json.dump(keep, open(LAST, "w", encoding="utf-8"), separators=(",", ":"))
+    jwrite(LAST, keep)
     n = len(keep)
     print(D("  %d item%s %s %s news -r N to read" % (
         n, "" if n == 1 else "s", foot, bul)))
