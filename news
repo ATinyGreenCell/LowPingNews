@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.7"
+VERSION = "3.8"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -1344,20 +1344,28 @@ def run(a):
                 rc("%.0f%% ok" % st_["rate"]) + D(" of %d" % st_["n"])))
 
         # the actionable part: what a refresh costs, and how long it would take
+        allsrc = sources(argparse_ns({"only": None, "cat": "all"}))
+        unmeasured = sum(1 for x in allsrc
+                         if jread("%s/%s.json" % (CD, x["id"]), {}).get("w") is None)
         shown = 0
         for cat in ("top", "science", "tech", "bio", "world"):
-            due, unk = cat_cost(cat)
-            if due is None or (not due and not unk):
+            due, _unk = cat_cost(cat)
+            if not due:                    # within ttl: nothing to decide about
                 continue
-            eta = (" ~%.0fs" % (due / st_["bps"])) if (st_ and st_["bps"] > 500
-                                                       and due) else ""
+            eta = (" ~%.0fs" % (due / st_["bps"])) if (st_ and st_["bps"] > 500) else ""
             cc = (P["grn"] if due < 20480 else
                   P["yel"] if due < 81920 else P["red"])
-            print("  %-7s %s%s%s" % (cat if shown or True else "", cc("%8s" % kbs(due)),
-                  D(eta), D("  %d unknown" % unk) if unk else ""))
+            print("  %-7s %s%s" % (cat, cc("%8s" % kbs(due)), D(eta)))
             shown += 1
         if not shown:
-            print("  %-7s %s" % ("fresh", D("everything within ttl, 0B to refresh")))
+            if unmeasured >= len(allsrc):   # never fetched is not the same as fresh
+                print("  %-7s %s" % ("cold", D("nothing cached yet, first pull "
+                                               "fetches everything")))
+            else:
+                print("  %-7s %s" % ("fresh", D("all feeds within ttl, 0B to refresh")))
+        if unmeasured:
+            print("  %-7s %s" % ("", D("%d feed%s not measured yet" % (
+                unmeasured, "" if unmeasured == 1 else "s"))))
 
         days = sorted((st_ or {}).get("day", {}).items())[-7:]
         if days:

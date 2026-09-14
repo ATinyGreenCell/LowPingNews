@@ -237,8 +237,10 @@ SIGNAL  good
 The verdict is on the first line, because the question is "should I pull now".
 Then the link itself, then measured throughput, then **what a refresh of each
 category would actually cost and how long it would take at the rate you are
-currently getting**. Categories already within their TTL are omitted; if
-everything is fresh it says so and there is nothing to spend.
+currently getting**. Categories already within their TTL are omitted, because there is nothing to
+decide about them. An all-fresh cache says so; a cold install says `nothing
+cached yet` instead, since never-fetched and up-to-date are not the same state
+even though both cost 0B to skip.
 
 Throughput and success rate come from the last 30 minutes of real fetches, not
 a fixed count — an outage from an hour ago should not colour the connection you
