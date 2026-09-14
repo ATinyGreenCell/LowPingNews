@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "5.0"
+VERSION = "5.1"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -770,24 +770,43 @@ def gps_fix(want_gps, timeout=50):
         return None, ("termux-location not found - install the termux-api "
                       "package AND the Termux:API app (F-Droid)")
     order = ["gps", "network"] if want_gps else ["network", "gps"]
-    last = "no fix"
+    last, noapp, nofix = "no fix", False, False
     for p in order:
         try:
             o = subprocess.run(["termux-location", "-p", p],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                timeout=timeout)
-            j = json.loads(o.stdout.decode("utf-8", "replace") or "null")
         except subprocess.TimeoutExpired:
             last = "%s timed out after %ds" % (p, timeout)
             continue
         except Exception as e:
-            last = "%s failed (%s)" % (p, str(e)[:40])
+            last = "%s could not run (%s)" % (p, str(e)[:40])
+            continue
+        txt = (o.stdout.decode("utf-8", "replace") +
+               o.stderr.decode("utf-8", "replace")).strip()
+        # the CLI prints a human notice, not JSON, when the companion app is
+        # missing. Blaming the sky for that sent people outdoors for nothing.
+        if "termux:api" in txt.lower() or "not yet available" in txt.lower():
+            noapp = True
+            continue
+        try:
+            j = json.loads(txt or "null")
+        except Exception:
+            last = "%s returned %s" % (p, ("no output" if not txt
+                                           else repr(txt[:60])))
             continue
         if j and j.get("latitude") is not None:
             j["_provider"] = p
             return j, None
+        nofix = True                   # answered properly, just had no position
         last = "%s returned no fix" % p
-    return None, last + " - GPS needs open sky; try outdoors"
+    if noapp:
+        return None, ("the Termux:API app is not installed. The termux-api "
+                      "package alone is not enough - install Termux:API from "
+                      "F-Droid, or pin a location:\n"
+                      "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
+    # only suggest the sky when a provider actually answered without a position
+    return None, last + (" - GPS needs open sky; try outdoors" if nofix else "")
 
 
 def _store_fix(j, label=None):
@@ -817,7 +836,7 @@ def wx_locate(a):
         sys.stderr.write("  locating (GPS can take ~30s outdoors)...\r")
         sys.stderr.flush()
         j, err = gps_fix(True)
-        sys.stderr.write(" " * 46 + "\r")
+        sys.stderr.write("\r" + " " * 48 + "\r")
         sys.stderr.flush()
         if not j:
             sys.exit("news: %s" % err)
