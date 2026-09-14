@@ -1,68 +1,33 @@
 # LowPingNews
 
-A terminal news reader and weather forecast for bad connections.
+**A terminal news reader and weather forecast for bad connections.**
 
-One file, Python standard library only, no pip install. Built for Termux on a
-phone with one bar of signal, where every kilobyte and every TLS handshake
-costs you.
+One Python file. No dependencies, no pip install, no API keys. Built for a phone
+on one bar of signal, where every kilobyte and every handshake costs you.
 
 ```
-$ news science
-NEWS · science  Sun 13 Sep 09:12
+$ lowpingnews
 
-  1 Phys.org · 12m
-    ● ↓ Ancient fern genome sequenced
-    The fifty-gigabase assembly took years of compute and a
-    rethink of how repeats are scaffolded…
+NEWS top   Sun 13 Sep 19:35
 
-  2 Quanta · 1h
-    ● A new proof settles an old question about primes
-    …
+  1 DW · 32m
+    ● Sweden election 'very close' as left bloc claims tight lead
+    The left-wing opposition is narrowly ahead, but it will be…
 
-  12 items · 4.1KB · 3 unchanged (304) · news -r N to read
+  2 Phys.org · 1h
+    ● JWST ruled out finding tiny moons around an exoplanet
+    The James Webb Space Telescope has opened many wonders…
+
+  3 BBC World · 1h
+    ● ↓ Swedish party blocs tied after Sunday vote, projections say
+    A partial count by Sweden's election authority projected…
+
+  25 items · 16.5KB · 2 unchanged (304) · news -r N to read
 ```
 
-## Why
+`●` unread  `↓` article text already downloaded, readable offline at zero cost
 
-Most feed readers assume bandwidth. This one assumes you don't have any.
-
-- **Conditional GET.** Feeds are re-requested with `ETag` / `If-Modified-Since`.
-  An unchanged feed returns `304 Not Modified` with no body at all. Servers that
-  advertise no validator are still sent `If-Modified-Since` derived from the
-  cache timestamp — it costs ~40 bytes to ask and many honour it, which turns a
-  124 KB Nature refresh into nothing.
-- **One retry on a dropped connection.** A transient failure is retried once
-  after 400 ms; a real HTTP error is not, since the server answered.
-- **A truncated download is still worth reading.** If the connection dies
-  mid-transfer the bytes that arrived are kept, not discarded: gzip is a stream
-  so every complete block still decompresses, and every `<item>` that closed is
-  a complete record. Measured against a feed cut mid-stream: 85% of the bytes
-  yields 10 of 12 stories, 60% yields 6, 35% yields 3. A partial feed is flagged
-  in the cache, stored without validators (a later 304 must never confirm a copy
-  you never fully received) and expires in two minutes instead of fifteen.
-- **Nothing fails silently.** The fetch budget scales with the number of feeds
-  rather than being a fixed 20 seconds, and any feed that is never reached is
-  counted in the footer as `N not reached (deadline)`. A partial pull that looks
-  complete is worse than an error, because you cannot tell.
-- **A hung connection still shows you the news.** Weak signal usually means a
-  socket that is accepted and never answered, not one that is refused. When the
-  20-second deadline expires with workers still blocked, the cached copy is
-  served rather than reporting the feed as down.
-- **Failed fetches count as failures.** A fetch that fell back to cache is still
-  recorded as a failure, so `news signal` cannot report 100% success while the
-  radio is off. If no probed host is reachable the verdict reads `offline`.
-- **Few hosts, deliberately.** TLS handshake is roughly 4 KB per host no matter
-  how small the payload. Host count dominates everything else, so the default
-  set is small on purpose. Adding a sixth feed costs more than it looks like.
-- **No background polling.** Nothing refreshes unless you ask it to. A timer
-  that silently re-handshakes five hosts is the fastest way to make this worse
-  than doing nothing.
-- **Full text from the feed when possible.** Many feeds ship the whole article
-  in `content:encoded`. That's already paid for, so reading it costs zero.
-- **Offline library.** Download articles while you have signal, read them in
-  the dead zone.
-- **Everything caches.** A dead feed falls back to its last good copy rather
-  than failing the run.
+---
 
 ## Install
 
@@ -70,203 +35,77 @@ Most feed readers assume bandwidth. This one assumes you don't have any.
 git clone https://github.com/ATinyGreenCell/LowPingNews
 cd LowPingNews
 sh install.sh
-news --check
+lowpingnews --check
 ```
 
-Or by hand:
+Needs Python 3.5 or newer. That is the only requirement.
+
+On Termux: `pkg install python git` first. `lpn` is installed as a short alias.
+
+`--check` fetches every feed once and reports which work, what they cost and how
+fast they answered. Feed URLs rot; this is how you find out.
+
+## Everyday use
 
 ```sh
-cp news $PREFIX/bin/ && chmod +x $PREFIX/bin/news
-sed -i "1s|.*|#!$(command -v python3)|" $PREFIX/bin/news
+lowpingnews                 headlines
+lowpingnews science         a category: top world science tech bio all
+lowpingnews weather         forecast for your location
+lowpingnews signal          is this connection worth using?
+
+lowpingnews -r 4            read item 4 as text
+lowpingnews -d all          download every article for offline reading
+lowpingnews -o 4            open item 4 in a browser
 ```
 
-Requires Python 3.5 or newer. Nothing else — no pip, no compiler, no
-dependencies.
-
-Run `news --check` first — it fetches every configured feed and reports
-ok / empty / fail with item count, latency, and two sizes: `wire` (compressed,
-what your data plan is billed) and `raw` (after decompression). Feed URLs rot;
-this tells you which ones have.
-
-## Usage
-
-```
-lowpingnews             latest across the default category
-lowpingnews weather     ultra-light forecast (24h + 7 day)
-lowpingnews signal      connection quality and data used
-news science            a category: top world science tech bio all
-news saved              your starred items
-news -q fern            search cached headlines, no network
-
-news -r 4               read item 4 as text
-news -d 2,3,5           download article bodies for offline reading
-news -d all             download everything in the current list
-news -d all --budget 500  raise the 4 MB ceiling for one run
-news -o 4               open item 4 in a browser
-
-news -u                 hide items you've already read
-news --mark-all         mark the current list read
-news -S 4               star / unstar item 4
-
-news -f                 bypass the 15-minute cache
-news -n 3               fewer items per source
-news -s hn,bbc          only these source ids
-news -t                 headlines only, no summaries
-news -l                 list sources and categories
-news signal             connection quality, throughput and data used
-news --cost             estimate a refresh from known sizes, fetch nothing
-news --light            skip feeds that last cost over 30KB
-news --offline          cache only, open no sockets
-news --check            test every feed URL
-news --update URL       replace this script with the latest
-news --version          print version
-```
-
-Item numbers refer to the last list you printed.
-
-Markers: `●` unread, `↓` article text available offline.
-
-Output is coloured: each source keeps a stable hue so you can scan by outlet,
-ages shade from green (under an hour) to dim (over a day), read items recede to
-dim, and `--check` shades each feed's cost green/yellow/red. Colour is dropped
-automatically when piped, when `NO_COLOR` is set, or with `--no-color`; non-UTF-8
-terminals fall back to ASCII markers. Every view fits 40 columns.
-
-## Sources
-
-Defaults lean on center-rated and specialist outlets, and put the
-politically-charged material in categories you have to ask for:
-
-| category  | sources                                        |
-|-----------|------------------------------------------------|
-| `top`     | BBC World, CS Monitor, DW, Phys.org, Ars Technica |
-| `world`   | the above plus Al Jazeera, France 24           |
-| `science` | Phys.org, ScienceDaily, Quanta, Nature         |
-| `tech`    | Ars Technica, The Register, Hacker News        |
-| `bio`     | bioRxiv plant biology, bioRxiv synthetic biology |
-
-No outlet is unbiased, and an aggregator's real bias is in which feeds it
-picks. That choice is a plain JSON file — edit it:
+The pattern it is built for — pull while you have signal, read where you don't:
 
 ```sh
-$EDITOR ~/.config/news/sources.json
+lowpingnews bio -d all      # at the trailhead
+lowpingnews -r 3            # later, no signal, zero bytes
 ```
 
-```json
-{"id": "eos", "name": "Eos", "kind": "rss",
- "url": "https://eos.org/feed", "cats": ["science"]}
+## Weather
+
+```sh
+lowpingnews weather -g       # fresh GPS fix, then remembered
+lowpingnews weather          # last known location
+lowpingnews weather -c 40.900,-73.412 --label "Fleets Cove"
+lowpingnews weather -C       # celsius
 ```
 
-`kind` is `rss` (RSS 2.0, RSS 1.0/RDF and Atom are all handled), `hn` for the
-Hacker News Algolia API, or `epmc` for a Europe PMC REST search — one JSON
-request, no key, covering PubMed records and preprints. Edit the `query=` part
-of the Europe PMC URL to change what it tracks. Only `http`/`https` URLs are accepted.
-
-Optional `"timeout"` (seconds, default 10, max 60) sets how long to wait for a
-feed. Some endpoints build their output on demand — `connect.biorxiv.org` does,
-and the larger subjects can take twenty seconds — so those ship with
-`"timeout": 25`. The overall fetch deadline grows to fit the slowest source plus
-its retry, rather than capping everything at twenty seconds.
-
-Optional `"ttl"` (seconds) sets how long that feed is reused before refetching;
-the default is 900. It matters for feeds that send no `ETag` or `Last-Modified`,
-because those can't answer with a cheap 304 and must resend in full. `news
---check` marks validator support per feed: `v` means conditional GET works,
-`-` means every refresh costs the full payload. Nature and both bioRxiv feeds
-ship with a 6-hour TTL for that reason.
-
-## Measured
-
-Every feed in the default set, fetched from a phone on 2026-09-13:
-
-| feed | items | wire | raw | compressed |
-|------|------:|-----:|----:|:----------:|
-| bbc | 23 | 4.3 KB | 17.7 KB | yes |
-| csm | 20 | 4.4 KB | 11.8 KB | yes |
-| aje | 25 | 4.1 KB | 16.8 KB | yes |
-| quanta | 5 | 3.1 KB | 11.0 KB | yes |
-| phys | 30 | 7.8 KB | 30.8 KB | yes |
-| f24 | 24 | 8.5 KB | 27.8 KB | yes |
-| sd | 60 | 12.1 KB | 43.0 KB | yes |
-| ars | 20 | 18.6 KB | 75.7 KB | yes |
-| hn | 20 | 20.7 KB | 20.7 KB | **no** |
-| dw | 136 | 26.3 KB | 115.9 KB | yes |
-| brxs | 30 | 71.9 KB | 71.9 KB | **no** |
-| brxp | 30 | 77.6 KB | 77.6 KB | **no** |
-| reg | 50 | 86.6 KB | 246.7 KB | yes |
-| nature | 75 | 124.3 KB | 124.3 KB | **no** |
-
-Per category, worst case (every feed changed since last run):
-
-| category | wire | dominated by |
-|---|---:|---|
-| `top` | ~61 KB | dw (43%) |
-| `tech` | ~126 KB | reg (69%) |
-| `science` | ~147 KB | nature (84%) |
-| `bio` | ~150 KB | both bioRxiv feeds, neither compressed |
-
-Four servers ignore `Accept-Encoding` entirely and send plain text. Advertising
-`deflate` alongside `gzip` was tried and changed nothing for them, so that
-avenue is closed — the only remaining lever on those feeds is to drop them.
-
-`nature` and `reg` account for most of the total. If you want a leaner default,
-retag them in `sources.json` so they're only pulled deliberately: that takes
-`science` to ~23 KB and `tech` to ~39 KB.
-
-These are worst-case figures. Conditional GET means an unchanged feed costs a
-handshake and a 304, so a second run the same day is close to free.
-
-## Data behaviour
-
-| action                        | over the wire                       |
-|-------------------------------|-------------------------------------|
-| within the 15-minute cache    | nothing, no socket opened           |
-| refresh, feed unchanged       | handshake + 304, no body            |
-| refresh, feed changed         | handshake + gzipped feed            |
-| `news -r N`, text in feed     | nothing                             |
-| `news -r N`, already downloaded | nothing                           |
-| `news -r N`, neither          | one page fetch, size reported       |
-
-`-d` prints a per-item ledger so you can see what a batch cost before you
-commit to it, and stops at a 4 MB ceiling per run. Items whose text is already
-free — carried in the feed, or previously downloaded — are never counted
-against the budget and always proceed.
-
-## While it fetches
-
-`--stream` prints each feed the moment it arrives instead of waiting for all of
-them, so on a bad link you read the early ones while the slow ones are still in
-flight, and a connection that dies partway still leaves you whatever landed.
-Output is flushed per feed, so nothing is lost in a buffer.
-
-Ordering becomes arrival order rather than newest-first, which is the trade:
-without `--stream` everything is sorted chronologically across all feeds, but
-nothing appears until the slowest one finishes.
-
-Resuming is automatic either way. Each feed writes its own cache entry as it
-completes, so if signal dies after nine of fourteen, the next run finds those
-nine within their TTL and only refetches the five that are missing. There is no
-resume state to manage — the cache *is* the resume point.
-
-## Progress
-
 ```
-  [████████······] 3/5 24.1K/~61.4K dw,ars
+Fleets Cove  Sun 13 Sep 15:00
+  71°F feels 75°  CL Clear
+  S 5mph g14   RH 87%   sets 19:12
+
+  NEXT 24H   59–73°F
+  ▄▆▆▇█████▇▆▆▄▃▂▂▁▁▁▁▁▂▂▃
+  ···▁▃▆▇▅▃▁······▁▂▁·····  85% @21h, 0.79in
+  15    21    03    09
+
+  7 DAY
+  Sun CL  66° ·····█████··  76°  85%*
+  Mon OV  59° ··██████····  71°   5%
+  * today = hours remaining
 ```
 
-The bar is shown when not streaming. Feeds are pulled in parallel and a weak
-link can take twenty seconds, so the
-fetch reports live instead of leaving a blank terminal: how many feeds are done,
-bytes so far, which ones are still in flight. When the cache knows what those
-feeds usually cost, the bar is a real percentage against that estimate (`~`);
-on a cold cache it falls back to counting completed feeds. Feeds that answer
-`304` cost nothing, so a run where most are unchanged finishes well under the
-estimate.
+Probability alone does not support a decision — 60% at 0.1 in and 60% at 0.8 in
+are different afternoons — so the rain line carries the expected total as well
+as the peak hour. The axis under the sparkline exists because a sparkline you
+cannot time-index is a picture, not a forecast. Gust speed appears only when it
+meaningfully exceeds the mean wind, and the next sun event is whichever comes
+first chronologically, with a countdown once it is under three hours away.
 
-It writes to stderr and only when stderr is a terminal, so piping stays clean.
-`LPN_NO_PROGRESS=1` turns it off.
+One gzipped Open-Meteo call, cached 30 minutes, about 660 bytes. Today's rain
+figure and icon cover only the hours still ahead — the API's daily values run
+midnight to midnight and would otherwise report rain that already fell.
 
-## Knowing before you spend
+`-g` asks Termux for a fix, GPS first and network as fallback, and reports which
+it used with its accuracy. Needs the `termux-api` package **and** the Termux:API
+app from F-Droid.
+
+## Signal
 
 ```
 $ lowpingnews signal
@@ -277,186 +116,241 @@ SIGNAL  good
   rate    31.9K/s  167ms  100% ok of 12
   top        61.4K ~2s
   science   147.1K ~5s
-  bio       149.5K ~5s
-  data       191.8K today  1.2M over 7d
+  data      191.8K today  1.2M over 7d
 ```
 
-The verdict is on the first line, because the question is "should I pull now".
-Then the link itself, then measured throughput, then **what a refresh of each
-category would actually cost and how long it would take at the rate you are
-currently getting**. Categories already within their TTL are omitted, because there is nothing to
-decide about them. An all-fresh cache says so; a cold install says `nothing
-cached yet` instead, since never-fetched and up-to-date are not the same state
-even though both cost 0B to skip.
+The verdict comes first, because the question is "should I pull now". Then the
+link, then measured throughput, then what each category would cost and how long
+it would take at the rate you are actually getting. Categories within their TTL
+are omitted.
 
-Throughput and success rate come from the last 30 minutes of real fetches, not
-a fixed count — an outage from an hour ago should not colour the connection you
-have now. Below five samples in that window it falls back to the last twelve.
+Throughput comes from the last 30 minutes of real fetches, not a fixed count.
+The `link` lines are DNS plus TCP connect to the hosts your feeds live on. No
+ICMP by default: carriers drop it independently of TCP and it skips DNS, which
+is what usually dies first on a weak link. A connect under 2 ms to a remote host
+is flagged `proxied?`, since captive portals answer for everything.
 
-The `link` lines do a DNS lookup and TCP connect to the hosts your feeds
-actually live on, at the port the feed URL specifies. No ICMP and no TLS: a
-SYN/ACK per attempt, no payload. ICMP appears only as a supplement when `ping`
-is installed, because carriers drop or deprioritise it independently of TCP and
-it skips DNS entirely — and DNS is the usual thing that dies on a weak link.
+## Why it survives a connection that barely works
 
-A TCP connect proves the path to *something*, not necessarily to the origin. A
-captive portal or transparent proxy answers for every address, so a connect
-under 2 ms to a remote host is flagged `proxied?` — treat those numbers as
-measuring your local gateway, not the feed.
+- **Conditional GET.** Unchanged feeds return `304 Not Modified` with no body.
+  Servers advertising no validator are still sent `If-Modified-Since` from the
+  cache timestamp — about 40 bytes to ask, and many honour it. On the default
+  set this measured **437 KB → 269 KB** on a repeat pull.
+- **Few hosts, deliberately.** A TLS handshake is roughly 4 KB regardless of
+  payload, so host count dominates. The default set is small on purpose.
+- **Nothing polls in the background.** Nothing is fetched unless you ask.
+- **Truncated downloads still count.** If the connection dies mid-transfer the
+  bytes that arrived are kept: gzip is a stream, and every `<item>` that closed
+  is a complete record. 85% of a feed yields 10 of 12 stories; 60% yields 6.
+- **A hung connection still shows you the news.** Weak signal usually means a
+  socket accepted and never answered. When the deadline expires the cached copy
+  is served rather than reporting the feed as down.
+- **Nothing fails silently.** Feeds never reached are counted in the footer,
+  because a partial pull that looks complete is worse than an error.
+- **Resume is automatic.** Each feed caches as it completes, so a run that dies
+  after nine of fourteen refetches only the five still missing.
 
-The radio line needs both the `termux-api` package and the separate Termux:API
-app, which is only on F-Droid — it is not on Google Play. Without the app the
-CLI prints a notice and the radio line is simply omitted; everything else in
-`lowpingnews signal` still works.
+## All commands
+
+```
+lowpingnews [CATEGORY] [flags]
+
+  CATEGORY   top world science tech bio all signal weather saved
+
+  -r N       read item N as text          -d 1,3,5   download those articles
+  -o N       open item N in a browser     -d all     download everything listed
+  -S N       star / unstar item N         --budget N raise the 4MB ceiling
+  -u         hide items already read      --mark-all mark the list read
+  -q TERM    search cached headlines
+
+  -f         bypass the cache             --offline  cache only, no sockets
+  -n N       items per source             --light    skip feeds over 30KB
+  -s IDS     only these sources           --cost     estimate a refresh, fetch nothing
+  -t         headlines only               --stream   print feeds as they arrive
+  --check    test every feed URL          --ascii    no unicode
+  -l         list sources                 --no-color no colour
+
+  weather    -g GPS fix   -c LAT,LON   --label NAME   -C celsius
+```
+
+Item numbers refer to the last list you printed.
+
+`--stream` prints each feed the moment it arrives instead of waiting for the
+slowest, so a dying connection still leaves you whatever landed. The trade is
+arrival order instead of newest-first. Without it, a progress bar reports bytes,
+completed feeds and elapsed time on stderr, so a slow fetch is visibly a wait
+rather than a hang.
+
+## Sources
+
+| category | feeds |
+|---|---|
+| `top` | BBC World, CS Monitor, DW, Phys.org, Ars Technica |
+| `world` | the above plus Al Jazeera, France 24 |
+| `science` | Phys.org, ScienceDaily, Quanta, Nature |
+| `tech` | Ars Technica, The Register, Hacker News |
+| `bio` | bioRxiv plant biology, bioRxiv synthetic biology, Europe PMC |
+
+No outlet is unbiased, and an aggregator's real bias is which feeds it picks.
+That choice is a plain JSON file:
+
+```sh
+$EDITOR ~/.config/news/sources.json
+```
+
+```json
+{"id": "eos", "name": "Eos", "kind": "rss", "cats": ["science"],
+ "url": "https://eos.org/feed", "ttl": 3600, "timeout": 10}
+```
+
+`kind` is `rss` (RSS 2.0, RSS 1.0/RDF and Atom all handled), `hn` for the Hacker
+News Algolia API, or `epmc` for a Europe PMC REST search covering PubMed records
+and preprints. Only `http`/`https` URLs are accepted.
+
+`ttl` (default 900s) is how long a feed is reused before refetching — it matters
+most for feeds sending no `ETag`/`Last-Modified`, since those cannot answer with
+a cheap 304. `timeout` (default 10s, max 60) matters for endpoints that build
+output on demand; `connect.biorxiv.org` does, and ships at 25.
+
+Your edits survive upgrades. The flip side: new default feeds will not appear
+automatically. Delete the file to regenerate it.
+
+## Measured
+
+Every default feed, from a phone on 2026-09-13:
+
+| feed | items | wire | raw | gzip | validator |
+|------|------:|-----:|----:|:----:|:---------:|
+| bbc | 23 | 4.3 KB | 17.7 KB | yes | – |
+| csm | 20 | 4.4 KB | 11.8 KB | yes | – |
+| aje | 25 | 4.1 KB | 16.8 KB | yes | v |
+| quanta | 5 | 3.1 KB | 11.0 KB | yes | v |
+| phys | 30 | 7.8 KB | 30.8 KB | yes | – |
+| f24 | 24 | 8.5 KB | 27.8 KB | yes | – |
+| sd | 60 | 12.1 KB | 43.0 KB | yes | v |
+| ars | 20 | 18.6 KB | 75.7 KB | yes | v |
+| hn | 20 | 20.7 KB | 20.7 KB | **no** | – |
+| dw | 136 | 26.3 KB | 115.9 KB | yes | – |
+| brxs | 30 | 71.9 KB | 71.9 KB | **no** | – |
+| brxp | 30 | 77.6 KB | 77.6 KB | **no** | – |
+| reg | 50 | 86.6 KB | 246.7 KB | yes | – |
+| nature | 75 | 124.3 KB | 124.3 KB | **no** | – |
+
+Four servers ignore `Accept-Encoding` entirely. Advertising `deflate` alongside
+`gzip` was tried and changed nothing, so that avenue is closed. `nature` and
+`reg` dominate their categories; retag them in `sources.json` for a leaner
+default. These are worst-case figures — conditional GET makes a second run the
+same day close to free.
+
+| action | over the wire |
+|---|---|
+| within the cache TTL | nothing, no socket opened |
+| refresh, feed unchanged | handshake + 304, no body |
+| refresh, feed changed | handshake + gzipped feed |
+| `-r N`, text already in the feed | nothing |
+| `-r N`, already downloaded | nothing |
+| `-r N`, neither | one page fetch, size reported |
 
 ## Files
 
 ```
 ~/.config/news/sources.json     feeds and categories (edit this)
-~/.config/news/update.url       remembered --update source
+~/.config/news/loc.json         weather location
+~/.config/news/update.url       remembered update source
 ~/.cache/news/*.json            feed cache + ETag validators
 ~/.local/share/news/state.json  read and starred items
+~/.local/share/news/net.json    last 200 fetch outcomes, 14 days of totals
 ~/.local/share/news/art/        offline article text, 3 MB cap, oldest evicted
-~/.local/share/news/net.json    last 200 fetch outcomes, 14 days of daily totals
 ```
 
-Config is deliberately outside the cache, so clearing the cache never eats
-your source list.
+Config lives outside the cache, so clearing the cache never eats your feed list.
+`XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME` are honoured where set,
+`%APPDATA%`/`%LOCALAPPDATA%` on Windows.
 
 ## Updating
 
 ```sh
-lowpingnews update     # installs the latest from GitHub
+lowpingnews update
 ```
 
-Or directly, which remembers the URL after the first run:
-
-```sh
-news --update https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/news
-news --update
-```
-
-The download is verified before anything is overwritten — size floor, a
-content marker, and a full `ast.parse()` — because a truncated download is the
-normal failure on a lossy link and a half-written file still installs cleanly
-enough to break the command. The replace is atomic and the previous version is
-kept at `news.bak`.
+Downloads the latest release and verifies it before overwriting anything — size
+floor, content marker and a full `ast.parse()` — because a truncated download is
+the normal failure on a lossy link, and a half-written file still installs
+cleanly enough to break the command. The replace is atomic; the previous version
+is kept at `news.bak`.
 
 ## Portability
 
 Pure standard library, Python 3.5+, verified with `vermin`. No f-strings, no
-`fromisoformat`, no `subprocess(capture_output=)` — the newest thing it needs is
-from 2015.
+`fromisoformat`. The newest thing it needs is from 2015.
 
-- **Paths** honour `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_DATA_HOME` where
-  set, `%APPDATA%` / `%LOCALAPPDATA%` on Windows, and `~/.config` style
-  otherwise.
-- **Colour** is enabled on Windows by turning on VT processing, and dropped
-  automatically if that fails, if output is piped, or if `NO_COLOR` is set.
-- **`ping`** flags differ per platform: `-W` is seconds on Linux/BSD,
-  milliseconds on macOS, and Windows uses `-n`/`-w`. ICMP is optional anyway.
-- **Opening a link** tries `termux-open-url`, then the stdlib `webbrowser`,
-  then prints the URL.
-- **The installer** avoids `sed -i`, which is mutually incompatible between GNU
-  and BSD, and rewrites the shebang in Python instead. It picks the first
-  writable directory among `$PREFIX/bin`, `~/.local/bin`, `/usr/local/bin` and
-  `~/bin`, and tells you if it is not on your `PATH`.
+- Colour is enabled on Windows via VT processing and dropped if that fails, if
+  output is piped, or if `NO_COLOR` is set.
+- `ping` flags differ per platform and are handled; ICMP is optional anyway.
+- Opening a link tries `termux-open-url`, then stdlib `webbrowser`, then prints
+  the URL.
+- The installer avoids `sed -i`, which is mutually incompatible between GNU and
+  BSD, and picks the first writable directory among `$PREFIX/bin`,
+  `~/.local/bin`, `/usr/local/bin`, `~/bin`.
+- Source ids colliding with Windows device names (`con`, `nul`, `com1`) are
+  suffixed, since those cannot be opened as files.
 
 Not supported: Python 2, and Windows without a VT-capable console.
-
-## Development
-
-`lowpingnews` (aliased `lpn`) wraps the build loop. Every command that installs
-verifies afterwards that the version it meant to install is the version now on
-`PATH`.
-
-```sh
-lowpingnews status          installed / repo / newest download / git, flags mismatches
-lowpingnews sync            newest VALID download -> repo -> install
-lowpingnews test            smoke test the installed build
-lowpingnews ship "msg"      install, commit, push
-lowpingnews release 2.0     bump VERSION, install, test, commit, tag, gh release
-lowpingnews pull            git pull, then install
-lowpingnews clean           delete stale downloads
-```
-
-`ship` and `release` refuse to commit anything this project doesn't own.
-Downloads is a shared directory and archives get extracted into the working
-tree, so an unrelated project landing in the repo is a real failure that has
-happened; the allowlist is `news`, `README.md`, `install.sh`, `lowpingnews`,
-`LICENSE`, `.gitignore`. Version arguments must be digits and dots, since they
-become both a `sed` replacement and a git tag.
-
-`release` is idempotent: an existing tag pointing at HEAD is a no-op, one
-stranded on an older commit is moved, and `gh release create` falls through to
-`edit` if the release already exists.
-
-Set `LPN_NOFETCH=1` to stop `status` probing the remote.
-
-Installing also installs `lowpingnews` itself, by rename rather than copy — the
-kernel keeps the running script's inode open, so it can safely replace itself
-mid-execution and the new version takes effect on the next invocation. Copying
-onto the live path instead corrupts the remaining lines of the running script.
-
-`sync` picks the newest build in `~/storage/downloads` or `~/downloads` that parses and
-carries a `VERSION`, ignoring the filename entirely. Android saves repeat
-downloads as `news-1`, `news-2` and so on, and picking by name silently
-installs a stale build — which is a real failure this tool exists to prevent.
-Any `.tar.gz` in Downloads is extracted over the repo first, so README updates
-ride along.
-
-Override paths with `LPN_REPO`, `LPN_DOWNLOADS` and `LPN_RAW`.
-
-## Weather
-
-```
-lowpingnews weather -c 40.900,-73.412 --label "Fleets Cove"   # pin once
-lowpingnews weather          # thereafter
-lowpingnews weather -C       # celsius
-```
-
-One gzipped Open-Meteo call, cached 30 minutes, sharing the same HTTP layer,
-capped reads and offline fallback as the feeds. Current conditions, a 24-hour
-temperature sparkline and rain bar, then seven days. Today's rain figure covers
-only the hours still ahead (marked `*`), because the API's daily maximum runs
-midnight to midnight and at 19:00 would otherwise report rain that already
-fell. If the fetch fails it
-shows the last good forecast and says how old it is. Location is pinned in
-`~/.config/news/loc.json`, or taken from `termux-location` once if the
-Termux:API app is installed.
 
 ## Limitations
 
 - Article extraction is a paragraph heuristic with no JavaScript. When a page
   yields no paragraphs it falls back to the `articleBody` publishers embed as
-  JSON-LD for search indexing, then to `og:description`. This is not a paywall
-  bypass: it reads only what the page already returned, so a publisher who
-  sends no body text still yields nothing.
-- `-d all` on a full list can mean several hundred KB. The ledger tells you
-  after the fact, not before.
+  JSON-LD for search indexing, then `og:description`. This is not a paywall
+  bypass: it reads only what the page already returned.
+- `-d all` on a long list can mean hundreds of KB. There is a 4 MB ceiling and a
+  per-item ledger, but cost is reported as it goes, not before.
 - Feeds must be public. No authentication, no OPML import.
-- `-o` uses `termux-open-url` when present, otherwise it just prints the URL.
+- Europe PMC reflects PubMed indexing, which lags publication by weeks. bioRxiv
+  is the live wire; Europe PMC is the record.
 
 ## Hardening
 
 Tested against a hostile `sources.json` (path-traversal ids, duplicate ids,
-`file://` URLs, non-dict entries), a 40 MB gzip bomb, oversized and malformed
-feeds, corrupt cache and state files, non-UTF-8 terminals (`LANG=C`), and
-titles in scripts with no Latin characters.
+`file://` URLs, non-dict entries, Windows device names), a 40 MB gzip bomb,
+oversized and malformed feeds, truncated transfers, black-holed connections,
+corrupt cache and state files, non-UTF-8 terminals, out-of-range coordinates,
+and titles in scripts with no Latin characters.
 
-- Downloads capped at 2 MB per feed and 5 MB per page, with bounded
-  decompression, so a compression bomb stops at the cap instead of in RAM.
-- All state writes go to a temp file and `os.replace`, so two terminals running
-  at once can never leave a half-written cache or read-state file.
-- At most 6 concurrent fetches regardless of how many feeds you configure. A
-  phone radio is not a datacentre; verified at 6 with 24 sources.
-- Timestamps without a timezone are read as UTC. RSS permits them, and
-  Python's default would silently interpret them as local time.
-- Source ids are sanitised before they become filenames.
-- Malformed XML falls back to a loose extractor rather than discarding the
-  feed. France 24's feed is invalid XML and is carried entirely by this path.
-- `Ctrl-C` exits 130 without a traceback; `SIGPIPE` and broken pipes exit
-  cleanly so `news | head` behaves.
+- Downloads capped at 2 MB per feed and 5 MB per page, decompression bounded.
+- All state writes go to a temp file then `os.replace`, so two terminals running
+  at once cannot leave a half-written file.
+- At most 6 concurrent fetches regardless of how many feeds are configured.
+- Timestamps without a timezone are read as UTC, which RSS permits and Python
+  would otherwise interpret as local time.
+- Malformed XML falls back to a loose extractor rather than discarding the feed.
+  France 24's feed is invalid XML and is carried entirely by that path.
+- A failed fetch counts as a failure even when the cache saves the render, so
+  `signal` cannot report 100% success while the radio is off.
+- A date more than an hour in the future is neither displayed nor sorted by, so
+  one feed with a bad clock cannot pin itself to the top of the list. Minor skew
+  reads as "just now"; anything further shows `?` alongside genuinely undated
+  items.
+- Weather codes are ranked by an explicit severity table, not by numeric value:
+  WMO puts rain showers (80) above heavy snow (75), so `max()` would have
+  reported the wrong condition for a snowy day.
+- `Ctrl-C` exits cleanly; `SIGPIPE` and broken pipes make `| head` behave.
+
+## Development
+
+`lowpingnews` doubles as its own dev tool:
+
+```sh
+lpn status          installed / repo / newest download / git, flags mismatches
+lpn sync            newest valid build -> repo -> install
+lpn test            smoke test the installed build
+lpn ship "msg"      install, commit, push
+lpn release 4.5     bump, install, test, commit, tag, gh release
+```
+
+`sync` picks builds by parsed `VERSION`, never by filename, and refuses archives
+containing files this project does not own. `ship` and `release` refuse to
+commit anything outside the files this project owns. `release` is idempotent.
 
 ## License
 

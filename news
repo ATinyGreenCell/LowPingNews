@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "4.5"
+VERSION = "4.9"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -31,6 +31,25 @@ WMO = {0: ("Clear", "CL"), 1: ("Mostly clear", "MC"), 2: ("Partly cloudy", "PC")
        81: ("Showers", "sh"), 82: ("Hvy showers", "SH"), 85: ("Snow showers", "SS"),
        86: ("Snow showers", "SS"), 95: ("Thunderstorm", "TS"),
        96: ("Thunderstorm", "TS"), 99: ("Thunderstorm", "TS")}
+SEV = {0: 0, 1: 1, 2: 2, 3: 3, 45: 4, 48: 4,
+       51: 5, 53: 6, 55: 7, 56: 8, 57: 8,          # drizzle / freezing drizzle
+       61: 6, 63: 8, 65: 10, 66: 11, 67: 11,       # rain / freezing rain
+       71: 7, 73: 9, 75: 11, 77: 6,                # snow
+       80: 7, 81: 9, 82: 11,                       # rain showers
+       85: 9, 86: 11,                              # snow showers
+       95: 13, 96: 14, 99: 14}                     # thunderstorm
+
+
+def worst(codes):
+    """Highest severity, not highest number: 80 (showers) < 75 (heavy snow)."""
+    best, rank = None, -1
+    for c in codes:
+        r = SEV.get(int(c or 0), int(c or 0) // 10)
+        if r > rank:
+            best, rank = int(c or 0), r
+    return best
+
+
 BLK = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
 ABLK = "._-~=+*#"
 NETCAP = 200
@@ -103,9 +122,15 @@ DEFAULTS = [
        ttl=HEAVY, timeout=25),
 ]
 
-ATOM = "{http://www.w3.org/2005/Atom}"
 TAGS = re.compile(r"<[^>]+>")
 WS = re.compile(r"\s+")
+CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def safe_url(u):
+    """Item links end up in a browser. Same rule as feed URLs: http(s) only."""
+    u = (u or "").strip()
+    return u if u[:7].lower() == "http://" or u[:8].lower() == "https://" else ""
 
 
 def clean(s, limit=400):
@@ -114,6 +139,7 @@ def clean(s, limit=400):
     import html
     for _ in range(2):            # content:encoded arrives escaped: unescape, then strip
         s = TAGS.sub(" ", html.unescape(s))
+    s = CTRL.sub(" ", s)               # a feed must not emit escapes or NULs
     s = WS.sub(" ", s).strip()
     s = re.sub(r" +([,.;:!?%)\]])", r"\1", s)      # tag-stripping leaves gaps
     s = re.sub(r"([(\[]) +", r"\1", s)
@@ -322,7 +348,7 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
                 if tap:
                     tap(len(buf))         # live byte count for the progress bar
                 if len(buf) > cap:
-                    raise ValueError("response exceeds %s cap" % kb(cap))
+                    raise ValueError("response exceeds %s cap" % kbs(cap))
             if getattr(f, "length", None):       # server promised more than it sent
                 partial = True
         except ValueError:
@@ -344,7 +370,7 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
                     z = zlib.decompressobj(wbits)
                     out = z.decompress(b, cap + 1)   # bounded: a bomb stops here
                     if z.unconsumed_tail:
-                        raise ValueError("decompressed body exceeds %s cap" % kb(cap))
+                        raise ValueError("decompressed body exceeds %s cap" % kbs(cap))
                     b = out                          # truncated gzip still yields
                     break                            # every complete block so far
                 except zlib.error:
@@ -388,7 +414,7 @@ def parse_feed(raw):
             continue
         short = clean(txt("description", "summary", "content"))
         full = clean(txt("encoded", "content", "description"), 6000)
-        rec = {"ti": ti, "u": link, "s": short,
+        rec = {"ti": ti, "u": safe_url(link), "s": short,
                "d": when(txt("pubDate", "published", "date", "updated",
                              "publicationDate", "issued", "created", "modified"))}
         if len(full) > len(short) + 200:      # feed shipped the body: already paid for
@@ -417,7 +443,7 @@ def parse_loose(raw):
         if not link:
             mm = re.search(r'<link[^>]*href=["\']([^"\']+)', blk, re.I)
             link = mm.group(1) if mm else ""
-        out.append({"ti": ti, "u": link,
+        out.append({"ti": ti, "u": safe_url(link),
                     "s": clean(g("description", "summary")),
                     "d": when(g("pubDate", "published", "date", "updated",
                                 "publicationDate", "issued"))})
@@ -440,7 +466,7 @@ def parse_epmc(raw):
                "https://europepmc.org/article/%s/%s" % (r.get("source", "MED"),
                                                         r.get("id", "")))
         bits = [b for b in (r.get("journalTitle"), r.get("authorString")) if b]
-        out.append({"ti": ti, "u": url,
+        out.append({"ti": ti, "u": safe_url(url),
                     "s": clean(" - ".join(bits), 300),
                     "d": when(r.get("firstPublicationDate")
                               or r.get("pubYear") or "")})
@@ -454,8 +480,8 @@ def parse_hn(raw):
         pts, nc = h.get("points") or 0, h.get("num_comments") or 0
         out.append({
             "ti": clean(h.get("title") or h.get("story_title") or "", 200),
-            "u": h.get("url") or ("https://news.ycombinator.com/item?id=%s"
-                                  % h.get("objectID", "")),
+            "u": safe_url(h.get("url")) or ("https://news.ycombinator.com/item?id=%s"
+                                            % h.get("objectID", "")),
             "s": "%d points, %d comments" % (pts, nc),
             "d": int(h.get("created_at_i") or 0)})
     return out
@@ -521,7 +547,7 @@ def load(src, fresh, bag):
                 raise
             items = parse_loose(raw)      # truncated: keep the items that closed
         items = [i for i in items if i["ti"]]
-        items = sorted(items, key=lambda z: -(z.get("d") or 0))[:STORECAP]
+        items = sorted(items, key=lambda z: -when_sort(z))[:STORECAP]
         if not items:
             raise ValueError("no items parsed")
         rec = {"t": int(time.time()), "items": items, "w": wire}
@@ -826,14 +852,17 @@ def wx_fetch(loc, unit, fresh):
     if fresh_enough:
         return c["d"], 0, int(time.time() - c["t"]), False
     q = ("latitude=%s&longitude=%s&current=temperature_2m,apparent_temperature,"
-         "weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m,is_day"
-         "&hourly=temperature_2m,precipitation_probability,weather_code"
+         "weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m,"
+         "relative_humidity_2m,is_day"
+         "&hourly=temperature_2m,precipitation_probability,precipitation,weather_code"
          "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-         "precipitation_probability_max&forecast_hours=24&forecast_days=7"
+         "precipitation_probability_max,precipitation_sum,sunrise,sunset"
+         "&forecast_hours=24&forecast_days=7"
          "&timeformat=unixtime&timezone=auto&temperature_unit=%s&wind_speed_unit=%s"
-         "&cell_selection=land"
+         "&precipitation_unit=%s&cell_selection=land"
          % (loc["lat"], loc["lon"], unit,
-            "mph" if unit == "fahrenheit" else "kmh"))
+            "mph" if unit == "fahrenheit" else "kmh",
+            "inch" if unit == "fahrenheit" else "mm"))
     try:
         raw, _, wire, _p = get("https://api.open-meteo.com/v1/forecast?" + q, 15)
         d = json.loads(raw)
@@ -853,8 +882,9 @@ def wx_fetch(loc, unit, fresh):
 def spark(v, asc):
     ch = ABLK if asc else BLK
     lo, hi = min(v), max(v)
-    sp = (hi - lo) or 1.0
-    return "".join(ch[min(7, int((x - lo) / sp * 7.999))] for x in v)
+    if hi - lo < 1e-9:                 # flat: the floor would imply a low, not a level
+        return ch[len(ch) // 2] * len(v)
+    return "".join(ch[min(7, int((x - lo) / (hi - lo) * 7.999))] for x in v)
 
 
 def rainbar(p, asc):
@@ -891,19 +921,50 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
           "  %s %s" % (mark, name))
     wd = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][
         int((cu.get("wind_direction_10m", 0) + 22.5) % 360 // 45)]
-    print(D("  %s %d%s   RH %d%%" % (wd, round(cu.get("wind_speed_10m") or 0),
-          "mph" if a.unit == "fahrenheit" else "km/h",
-          round(cu.get("relative_humidity_2m") or 0))))
+    gust = cu.get("wind_gusts_10m")
+    spd = round(cu.get("wind_speed_10m") or 0)
+    gtxt = ""
+    if gust and round(gust) > spd + 3:      # only worth saying when it is gusty
+        gtxt = P["yel"](" g%d" % round(gust))
+    # the next event chronologically, not sunrise-first: at 15:00 the useful
+    # number is tonight's sunset, not tomorrow's sunrise
+    cand = [(ts, lbl) for lbl, key_ in (("rises", "sunrise"), ("sets", "sunset"))
+            for ts in (dy.get(key_) or [])[:3] if ts and ts > cu["time"]]
+    sun = ""
+    if cand:
+        ts, lbl = min(cand)
+        mins = int((ts - cu["time"]) / 60)
+        if mins < 180:                      # imminent: say how long is left
+            sun = P["yel"]("   %s %s in %dh%02dm" % (
+                lbl, L(ts).strftime("%H:%M"), mins // 60, mins % 60))
+        else:
+            sun = D("   %s %s" % (lbl, L(ts).strftime("%H:%M")))
+    print(D("  %s %d%s" % (wd, spd, "mph" if a.unit == "fahrenheit" else "km/h"))
+          + gtxt + D("   RH %d%%" % round(cu.get("relative_humidity_2m") or 0)) + sun)
     n = min(24, len(h["time"]), max(1, cols - 4))
     tp = h["temperature_2m"][:n]
     pr = [x or 0 for x in h["precipitation_probability"][:n]]
     print("\n" + D("  NEXT %dH" % n) +
           D("   %d\u2013%d%s" % (round(min(tp)), round(max(tp)), U)))
     print("  " + P["yel"](spark(tp, a.ascii)))
+    amt = [x or 0 for x in (h.get("precipitation") or [0] * n)][:n]
     k = max(range(n), key=lambda i: pr[i])
-    print("  " + P["cyn"](rainbar(pr, a.ascii)) +
-          (D("  wet %d%% @%sh" % (pr[k], L(h["time"][k]).strftime("%H")))
-           if pr[k] >= 10 else D("  dry")))
+    tot = sum(amt)
+    unit_p = "in" if a.unit == "fahrenheit" else "mm"
+    if pr[k] >= 10:
+        # probability alone does not support a decision; amount does
+        note = "  %d%% @%sh" % (pr[k], L(h["time"][k]).strftime("%H"))
+        note += (", %.2f%s" % (tot, unit_p)) if tot >= 0.005 else ", trace"
+    else:
+        note = "  dry"
+    print("  " + P["cyn"](rainbar(pr, a.ascii)) + D(note))
+    ax = [" "] * n
+    for i in range(0, n, 6):               # a sparkline you cannot time-index is
+        lab = L(h["time"][i]).strftime("%H")    # a picture, not a forecast
+        for j, ch in enumerate(lab):
+            if i + j < n:
+                ax[i + j] = ch
+    print("  " + D("".join(ax).rstrip()))
     print("\n" + D("  7 DAY"))
     lo_a = min(dy["temperature_2m_min"])
     hi_a = max(dy["temperature_2m_max"])
@@ -920,12 +981,13 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     if ahead:
         rest = max(p for p, _ in ahead)
         # the daily code summarises the whole day too: take the worst hour left
-        rest_code = max(c for _, c in ahead)
+        rest_code = worst(c for _, c in ahead)
     for i, ts in enumerate(dy["time"]):
         lo, hi = dy["temperature_2m_min"][i], dy["temperature_2m_max"][i]
         b0 = int((lo - lo_a) / sp * W)
         b1 = max(b0 + 1, int(round((hi - lo_a) / sp * W)))
         pp = dy["precipitation_probability_max"][i] or 0
+        amt_d = (dy.get("precipitation_sum") or [0] * 7)[i] or 0
         code = int(dy["weather_code"][i] or 0)
         mark_ = ""
         if i == 0 and rest is not None and (rest != pp or rest_code != code):
@@ -933,10 +995,14 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
             if rest_code is not None:
                 code = rest_code
         _, g = WMO.get(code, ("", "??"))
+        # probability without amount is not decidable; show both when it matters
+        wet = "%3d%%" % pp
+        if pp >= 10 and amt_d >= 0.005 and cols >= 44:
+            wet += " %.2f" % amt_d
         print("  %s %s %3d\u00b0 %s %3d\u00b0 %s%s" % (
             L(ts).strftime("%a"), g, round(lo),
             P["yel"]((gp * b0 + fl * (b1 - b0)).ljust(W, gp)), round(hi),
-            (P["cyn"] if pp >= 10 else D)("%3d%%" % pp), D(mark_)))
+            (P["cyn"] if pp >= 10 else D)(wet), D(mark_)))
     if rest is not None and (rest != (dy["precipitation_probability_max"][0] or 0)
                              or rest_code != int(dy["weather_code"][0] or 0)):
         print(D("  * today = hours remaining"))
@@ -1093,12 +1159,18 @@ def jread(path, default):
         return default
 
 
-def kb(n):
-    return "%dB" % n if n < 1024 else "%.1fKB" % (n / 1024.0)
+
 
 
 def bul_(a):
     return "-" if a.ascii else "\u00b7"
+
+
+def when_sort(it):
+    """A date we will not display is a date we will not rank by. Minor skew is
+    tolerated; anything beyond an hour ahead sorts as undated."""
+    d = it.get("d") or 0
+    return 0 if d > int(time.time()) + 3600 else d
 
 
 def key(t):
@@ -1326,7 +1398,7 @@ def run(a):
         # verify before overwriting ourselves: truncated downloads are the
         # normal failure mode on a lossy link, and a half-file still "installs"
         if len(raw) < 8000 or "ultra-light headlines" not in txt:
-            sys.exit("news: that does not look like news (%s) - not installing" % kb(len(raw)))
+            sys.exit("news: that does not look like news (%s) - not installing" % kbs(len(raw)))
         try:
             import ast
             ast.parse(txt)
@@ -1349,7 +1421,7 @@ def run(a):
             pass
         os.replace(tmp, me)                      # atomic: never a half-written news
         print(D("  updated %s -> %s %s %s %s backup at %s.bak"
-                % (VERSION, new, bul_(a), kb(wire), bul_(a),
+                % (VERSION, new, bul_(a), kbs(wire), bul_(a),
                    os.path.basename(me))))
         if not os.path.exists(uf) or open(uf, encoding="utf-8").read().strip() != url:
             os.makedirs(CFD, exist_ok=True)
@@ -1431,7 +1503,7 @@ def run(a):
             print(D("  no readable paragraphs - likely paywalled or JS-rendered"))
         print(D("  %s" % ({"feed": "from feed, 0B over the wire",
                            "offline": "from offline store, 0B over the wire"}
-                          .get(how, "fetched %s, stored offline" % kb(nb)))))
+                          .get(how, "fetched %s, stored offline" % kbs(nb)))))
         return
 
     if a.download:
@@ -1608,77 +1680,6 @@ def run(a):
             print(D("  tip: lowpingnews --light skips the heavy feeds"))
         return
 
-    if (a.cat or "").lower() == "weather":
-        loc = wx_locate(a)
-        d, wire, age_s, stale = wx_fetch(loc, a.unit, a.fresh)
-        wx_show(a, P, loc, d, wire, age_s, stale)
-        return
-
-    if (a.cat or "").lower() == "signal":
-        st_ = net_stats()
-        print(P["hdr"]("SIGNAL"))
-        for kind, dbm, extra in radio():
-            c = (P["grn"] if (isinstance(dbm, int) and dbm > -75)
-                 else P["yel"] if (isinstance(dbm, int) and dbm > -95) else P["red"])
-            print("  %-8s %s %s" % (kind, c("%s dBm" % dbm), D(str(extra))))
-        # the probe needs no history: on a fresh install it is all we have
-        hosts = []
-        for x in sources(argparse_ns({"only": None, "cat": "all"})):
-            hp = hostport(x["url"])
-            if hp[0] and hp not in hosts:
-                hosts.append(hp)
-        probes = probe(hosts[:2])
-        for r_ in probes:
-            lc = (P["grn"] if r_["loss"] == 0 else
-                  P["yel"] if r_["loss"] < 50 else P["red"])
-            if r_["tcp"] is None:
-                print("  %-8s %s %s" % ("probe", lc("unreachable"), D(r_["host"][:22])))
-                continue
-            tc = (P["grn"] if r_["tcp"] < 150 else
-                  P["yel"] if r_["tcp"] < 500 else P["red"])
-            note = ""
-            if r_["tcp"] < 2 and not r_["host"].startswith(("127.", "10.", "192.168.")):
-                note = " proxied?"   # a remote SYN/ACK cannot return in under 2ms
-            print("  %-8s %s %s %s%s" % (
-                "probe", tc("%4dms tcp" % r_["tcp"]),
-                D("%4dms dns" % (r_["dns_cold"] or 0)),
-                lc("%.0f%% loss" % r_["loss"]) if r_["loss"] else D(r_["host"][:16]),
-                P["yel"](note)))
-        ic = icmp(hosts[0][0]) if hosts else None
-        if ic:
-            print("  %-8s %s" % ("icmp", D("%.0f%% loss, %sms avg"
-                  % (ic["loss"], ic["avg"] if ic["avg"] else "?"))))
-        if probes and all(r_["tcp"] is None for r_ in probes):
-            print("  %-8s %s %s" % ("measured", P["red"]("offline"),
-                  D("no host reachable")))
-            return
-        if not st_:
-            print(D("  measured no history - a cached run makes no requests;"
-                    " try `news -f`"))
-            return
-        v = (P["grn"] if st_["rate"] >= 90 and st_["bps"] > 20000 else
-             P["yel"] if st_["rate"] >= 60 else P["red"])
-        verdict = ("good" if st_["rate"] >= 90 and st_["bps"] > 20000 else
-                   "usable" if st_["rate"] >= 60 else "poor")
-        print("  %-8s %s  %s" % ("measured", v(verdict),
-              D("%d recent fetches" % st_["n"])))
-        print("  %-8s %s ok  %s median  %s" % (
-            "", v("%.0f%%" % st_["rate"]), D("%dms" % st_["ms"]),
-            D("%s/s" % kbs(int(st_["bps"])) if st_["bps"] else "")))
-        if st_["bps"] > 1000:
-            for label, size in (("a light feed", 8 * 1024), ("Nature", 124 * 1024)):
-                print(D("           %s ~ %.1fs" % (label, size / st_["bps"])))
-        days = sorted(st_["day"].items())[-7:]
-        if days:
-            tot = sum(v_ for _, v_ in days)
-            print("  %-8s %s %s" % ("data", kbs(tot),
-                  D("over %d day%s" % (len(days), "" if len(days) == 1 else "s"))))
-            print(D("           today %s" % kbs(st_["day"].get(
-                dt.date.today().isoformat(), 0))))
-        if verdict == "poor":
-            print(D("  tip: news --light skips the heavy feeds"))
-        return
-
     srcs = sources(a)
     if a.light:
         keep_ = []
@@ -1756,7 +1757,7 @@ def run(a):
             if sta == -1:
                 print(D("  %s unreachable" % x["name"]))
                 return
-            for it in sorted(items, key=lambda z: -(z.get("d") or 0))[:a.n]:
+            for it in sorted(items, key=lambda z: -when_sort(z))[:a.n]:
                 k_ = key(it["ti"])
                 if k_ in st_seen:
                     continue
@@ -1813,14 +1814,14 @@ def run(a):
             down.append(x["name"])
             continue
         stale = max(stale, sta)
-        for it in sorted(items, key=lambda z: -(z.get("d") or 0))[:a.n]:
+        for it in sorted(items, key=lambda z: -when_sort(z))[:a.n]:
             k = key(it["ti"])
             if k in seen:
                 continue
             seen.add(k)
             rows.append((x["name"], it))
-    rows.sort(key=lambda r: -(r[1].get("d") or 0))
-    foot = "%s %s" % (bul_(a), kb(bytes_) if bytes_ else "0B, cached")
+    rows.sort(key=lambda r: -when_sort(r[1]))
+    foot = "%s %s" % (bul_(a), kbs(bytes_) if bytes_ else "0B, cached")
     if partial_n:
         foot += " %s %d truncated, salvaged" % (bul_(a), partial_n)
     if nm:
@@ -1840,7 +1841,15 @@ def render_row(a, P, i, src, it, rd, cols, wrap):
     import textwrap
     D, B = P["d"], P["b"]
     bul = bul_(a)
-    secs = int(time.time()) - it["d"] if it.get("d") else -1
+    d0 = it.get("d") or 0
+    if not d0:
+        secs = -1                      # no date at all: distinct from any offset
+    else:
+        secs = int(time.time()) - d0
+        if -3600 <= secs < 0:          # minor clock skew reads as now
+            secs = 0
+        elif secs < 0:                 # dated well ahead: the date is not usable
+            secs = -1
     stamp = age(secs) if secs >= 0 else "?"
     k = key(it["ti"])
     unread = k not in rd
