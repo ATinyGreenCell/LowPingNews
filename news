@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "4.9"
+VERSION = "5.0"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -68,6 +68,7 @@ CFD = _base("XDG_CONFIG_HOME", "APPDATA", "~/.config/news")
 WXLOC = CFD + "/loc.json"
 WXC = CD + "/weather.json"
 WXTTL = 1800
+LOCTTL = 1800                  # refresh a followed location after this
 CFG = CFD + "/sources.json"
 LAST = CD + "/last.json"
 TTL = 900                      # a feed younger than this is reused, no request
@@ -789,7 +790,29 @@ def gps_fix(want_gps, timeout=50):
     return None, last + " - GPS needs open sky; try outdoors"
 
 
+def _store_fix(j, label=None):
+    return {"lat": round(float(j["latitude"]), 4),
+            "lon": round(float(j["longitude"]), 4),
+            "label": label, "acc": j.get("accuracy"),
+            "via": j.get("_provider"), "t": int(time.time())}
+
+
 def wx_locate(a):
+    """Follow the device by default. A location is only sticky if you pinned it
+    on purpose with -c; otherwise a stale fix is refreshed quietly."""
+    if getattr(a, "coords", None):
+        try:
+            la, lo = [float(x) for x in a.coords.replace(" ", "").split(",")]
+        except Exception:
+            sys.exit("news: coords look like 40.900,-73.412")
+        if not (-90 <= la <= 90 and -180 <= lo <= 180):
+            sys.exit("news: latitude must be -90..90 and longitude -180..180")
+        d = {"lat": round(la, 4), "lon": round(lo, 4),
+             "label": getattr(a, "label", None), "via": "pinned",
+             "t": int(time.time())}
+        jwrite(WXLOC, d)
+        return d
+
     if getattr(a, "gps", False):
         sys.stderr.write("  locating (GPS can take ~30s outdoors)...\r")
         sys.stderr.flush()
@@ -798,46 +821,34 @@ def wx_locate(a):
         sys.stderr.flush()
         if not j:
             sys.exit("news: %s" % err)
-        d = {"lat": round(float(j["latitude"]), 4),
-             "lon": round(float(j["longitude"]), 4),
-             "label": getattr(a, "label", None),
-             "acc": j.get("accuracy"), "via": j.get("_provider")}
+        d = _store_fix(j, getattr(a, "label", None))   # a fresh fix clears the pin
         jwrite(WXLOC, d)
         return d
-    if getattr(a, "coords", None):
-        try:
-            la, lo = [float(x) for x in a.coords.replace(" ", "").split(",")]
-        except Exception:
-            sys.exit("news: coords look like 40.900,-73.412")
-        if not (-90 <= la <= 90 and -180 <= lo <= 180):
-            sys.exit("news: latitude must be -90..90 and longitude -180..180")
-        d = {"lat": round(la, 3), "lon": round(lo, 3),
-             "label": getattr(a, "label", None)}
-        jwrite(WXLOC, d)
-        return d
+
     d = jread(WXLOC, {})
     try:
         la, lo = float(d["lat"]), float(d["lon"])
-        if -90 <= la <= 90 and -180 <= lo <= 180:
-            d["lat"], d["lon"] = la, lo
-            return d
+        if not (-90 <= la <= 90 and -180 <= lo <= 180):
+            raise ValueError
+        d["lat"], d["lon"] = la, lo
     except Exception:
-        pass
-    try:                                   # Termux GPS if the API app is present
-        import shutil, subprocess
-        if shutil.which("termux-location"):
-            o = subprocess.run(["termux-location", "-p", "network"],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=25)
-            j = json.loads(o.stdout.decode("utf-8", "replace") or "null")
-            if j and j.get("latitude") is not None:
-                d = {"lat": round(float(j["latitude"]), 3),
-                     "lon": round(float(j["longitude"]), 3), "label": None}
-                jwrite(WXLOC, d)
-                return d
-    except Exception:
-        pass
-    sys.exit("news: no location. Pin it once:\n"
+        d = {}
+
+    pinned = d.get("via") == "pinned"
+    stale = (time.time() - (d.get("t") or 0)) > LOCTTL
+    if d and (pinned or not stale):
+        return d                                       # good enough, spend nothing
+
+    # followed and stale, or nothing stored at all: ask the device quietly.
+    # network provider, not GPS: instant, works indoors, accurate to a city block
+    j, err = gps_fix(False, timeout=15)
+    if j:
+        fix = _store_fix(j)
+        jwrite(WXLOC, fix)
+        return fix
+    if d:
+        return d                                       # no fix: last known is fine
+    sys.exit("news: no location. Pin one, or install Termux:API for a fix:\n"
              "  lowpingnews weather -c 40.900,-73.412 --label 'Fleets Cove'")
 
 
@@ -908,12 +919,18 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     print(P["hdr"](loc.get("label") or "%.3f,%.3f" % (loc["lat"], loc["lon"])) +
           D("  %s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"),
                                t0.strftime("%H:%M"))))
-    if loc.get("via"):
-        print(D("  %.4f,%.4f via %s%s" % (
-            loc["lat"], loc["lon"], loc["via"],
-            ", +/-%dm" % loc["acc"] if loc.get("acc") else "")))
-    elif loc.get("label"):
-        print(D("  %.3f,%.3f pinned" % (loc["lat"], loc["lon"])))
+    via = loc.get("via")
+    if via and via != "pinned":
+        t_fix = loc.get("t") or 0
+        fixage = int(time.time() - t_fix)
+        # an implausible timestamp is unknown age, not a 20000-day-old fix
+        when_ = ("" if not t_fix or fixage > 30 * 86400 else
+                 ", " + ago(fixage) if fixage > 120 else "")
+        print(D("  %.4f,%.4f via %s%s%s" % (
+            loc["lat"], loc["lon"], via,
+            ", +/-%dm" % loc["acc"] if loc.get("acc") else "", when_)))
+    elif via == "pinned" or loc.get("label"):
+        print(D("  %.4f,%.4f pinned" % (loc["lat"], loc["lon"])))
     temp = round(cu["temperature_2m"])
     tc = (P["cyn"] if temp <= 32 else P["grn"] if temp <= 80 else P["yel"])
     print("  " + B(tc("%d%s" % (temp, U))) +

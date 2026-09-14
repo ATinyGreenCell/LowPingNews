@@ -101,9 +101,18 @@ One gzipped Open-Meteo call, cached 30 minutes, about 660 bytes. Today's rain
 figure and icon cover only the hours still ahead — the API's daily values run
 midnight to midnight and would otherwise report rain that already fell.
 
-`-g` asks Termux for a fix, GPS first and network as fallback, and reports which
-it used with its accuracy. Needs the `termux-api` package **and** the Termux:API
-app from F-Droid.
+By default the location **follows the device**: if the stored fix is over 30
+minutes old it is quietly refreshed using the network provider, which is instant
+and works indoors. If no fix is available the last known location is used
+rather than failing.
+
+`-c` is different — it pins deliberately and stays put however stale it gets,
+which is what you want for a fixed site. `-g` takes a GPS fix and clears any
+pin, so it is also how you stop following one place and start following
+yourself. The header says which you are on: `via network, +/-40m` or `pinned`.
+
+Needs the `termux-api` package **and** the Termux:API app from F-Droid; without
+them the stored or pinned location is used.
 
 ## Signal
 
