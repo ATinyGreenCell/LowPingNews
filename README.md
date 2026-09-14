@@ -220,6 +220,21 @@ commit to it, and stops at a 4 MB ceiling per run. Items whose text is already
 free — carried in the feed, or previously downloaded — are never counted
 against the budget and always proceed.
 
+## While it fetches
+
+```
+  [████████······] 3/5 24.1K/~61.4K dw,ars
+```
+
+Feeds are pulled in parallel and a weak link can take twenty seconds, so the
+fetch reports live instead of leaving a blank terminal: how many feeds are done,
+bytes so far, which ones are still in flight. When the cache knows what those
+feeds usually cost, the bar is a real percentage against that estimate (`~`);
+on a cold cache it falls back to counting completed feeds.
+
+It writes to stderr and only when stderr is a terminal, so piping stays clean.
+`LPN_NO_PROGRESS=1` turns it off.
+
 ## Knowing before you spend
 
 ```

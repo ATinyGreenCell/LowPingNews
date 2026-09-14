@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.9"
+VERSION = "4.0"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -277,7 +277,7 @@ def extract(raw):
     return out
 
 
-def get(url, t=10, extra=None, cap=FEEDCAP):
+def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
     """-> (body, headers, wire_bytes, partial). Raises HTTPError(304) when unchanged."""
     h = {"Accept-Encoding": "gzip, deflate", "User-Agent": UA}
     h.update(extra or {})
@@ -296,6 +296,8 @@ def get(url, t=10, extra=None, cap=FEEDCAP):
                 if not chunk:
                     break
                 buf += chunk
+                if tap:
+                    tap(len(buf))         # live byte count for the progress bar
                 if len(buf) > cap:
                     raise ValueError("response exceeds %s cap" % kb(cap))
             if getattr(f, "length", None):       # server promised more than it sent
@@ -441,19 +443,22 @@ def load(src, fresh, bag):
             import email.utils
             val["If-Modified-Since"] = email.utils.formatdate(c["t"], usegmt=True)
     t_start = time.time()
+    tapper = lambda n: PROG.__setitem__(src["id"], n)
+    PROG.setdefault(src["id"], 0)
     try:
         try:
             try:
-                raw, rh, wire, part = get(src["url"], extra=val)
+                raw, rh, wire, part = get(src["url"], extra=val, tap=tapper)
             except urllib.error.HTTPError:
                 raise                      # a real HTTP answer: do not retry
             except Exception:
                 time.sleep(0.4)            # transient drop on a weak signal
-                raw, rh, wire, part = get(src["url"], extra=val)
+                raw, rh, wire, part = get(src["url"], extra=val, tap=tapper)
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
                 jwrite(cf, c)
+                DONE.add(src["id"])
                 bag[src["id"]] = (c["items"], 0, 0, 1, 0)
                 bag.setdefault("_net", []).append(
                     (True, (time.time() - t_start) * 1000, 0))
@@ -481,21 +486,55 @@ def load(src, fresh, bag):
             if rh.get("Last-Modified"):
                 rec["lm"] = rh["Last-Modified"]
         jwrite(cf, rec)
+        PROG[src["id"]] = wire
+        DONE.add(src["id"])
         bag[src["id"]] = (items, wire, 0, 0, 1 if part else 0)
         bag.setdefault("_net", []).append((True, (time.time() - t_start) * 1000, wire))
     except Exception as e:
         if os.path.exists(cf):                      # offline: stale beats nothing
             try:
                 c = json.load(open(cf, encoding="utf-8"))
+                DONE.add(src["id"])
                 bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0, 0)
                 bag.setdefault("_net", []).append(      # still a failed request:
                     (False, (time.time() - t_start) * 1000, 0))   # count it as one
                 return
             except Exception:
                 pass
+        DONE.add(src["id"])
         bag[src["id"]] = ([], 0, -1, 0, 0)
         bag.setdefault("_net", []).append((False, (time.time() - t_start) * 1000, 0))
         bag.setdefault("_err", {})[src["id"]] = str(e)[:60]
+
+
+PROG = {}          # src id -> bytes so far; dict writes are atomic under the GIL
+DONE = set()       # ids that finished, however they finished
+
+
+def expected(srcs):
+    """Snapshot once: these cache files get rewritten while the fetch runs."""
+    tot = 0
+    for x in srcs:
+        w = jread("%s/%s.json" % (CD, x["id"]), {}).get("w")
+        tot += w if w else 0
+    return tot
+
+
+def progress_line(srcs, cols, want):
+    """One-line status: real percentage when we know what the feeds usually cost."""
+    got = sum(PROG.get(x["id"], 0) for x in srcs)
+    done = [x for x in srcs if x["id"] in DONE]
+    live = [x["id"] for x in srcs if x["id"] not in DONE and PROG.get(x["id"])]
+    frac = (min(1.0, got / float(want)) if want else
+            len(done) / float(len(srcs) or 1))
+    w_bar = max(6, min(14, cols - 30))
+    fill = int(frac * w_bar)
+    bar = "\u2588" * fill + "\u00b7" * (w_bar - fill)
+    txt = "  [%s] %d/%d %s%s" % (bar, len(done), len(srcs), kbs(got),
+                                 ("/~" + kbs(want)) if want else "")
+    if live:
+        txt += " " + ",".join(live[:2])
+    return txt[:cols - 1]
 
 
 def net_log(entries):
@@ -803,6 +842,7 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
 
 def gather(srcs, fresh):
     import threading
+    want_total = expected(srcs)            # before any cache file is rewritten
     os.makedirs(CD, exist_ok=True)
     bag = {}
     end = time.time() + DEADLINE
@@ -814,8 +854,19 @@ def gather(srcs, fresh):
             t = threading.Thread(target=load, args=(s, fresh, bag), daemon=True)
             t.start()
             ths.append(t)
-        for t in ths:                  # join() is the real ceiling: socket timeouts
-            t.join(max(0.1, end - time.time()))   # don't bound getaddrinfo on a lossy link
+        show_prog = sys.stderr.isatty() and not os.environ.get("LPN_NO_PROGRESS")
+        cols = cols_()
+        while time.time() < end and any(t.is_alive() for t in ths):
+            if show_prog:                  # stderr: never pollutes piped output
+                sys.stderr.write("\r" + progress_line(srcs, cols,
+                                                      want_total).ljust(cols - 1))
+                sys.stderr.flush()
+            time.sleep(0.12)
+        for t in ths:                      # join() is the real ceiling: socket
+            t.join(max(0.05, end - time.time()))   # timeouts do not bound getaddrinfo
+        if show_prog:
+            sys.stderr.write("\r" + " " * (cols - 1) + "\r")
+            sys.stderr.flush()
     net_log(bag.pop("_net", []))
     return bag
 
