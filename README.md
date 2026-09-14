@@ -68,7 +68,9 @@ lowpingnews -r 3            # later, no signal, zero bytes
 ## Weather
 
 ```sh
-lowpingnews weather -g       # fresh GPS fix, then remembered
+lowpingnews weather -g       # fresh device fix, then remembered
+lowpingnews weather --ip     # no GPS? locate by IP (city-level)
+lowpingnews weather -p "Huntington, New York"   # by place name
 lowpingnews weather          # last known location
 lowpingnews weather -c 40.900,-73.412 --label "Fleets Cove"
 lowpingnews weather -C       # celsius
@@ -111,8 +113,31 @@ which is what you want for a fixed site. `-g` takes a GPS fix and clears any
 pin, so it is also how you stop following one place and start following
 yourself. The header says which you are on: `via network, +/-40m` or `pinned`.
 
-Needs the `termux-api` package **and** the Termux:API app from F-Droid; without
-them the stored or pinned location is used.
+`-p` looks the name up with Open-Meteo's geocoder — no key, same provider as the
+forecast — and stores the match, so you only search once. Ambiguous names resolve
+to the best match and the alternatives are printed to stderr, so `-p Huntington`
+tells you it chose New York over West Virginia rather than silently picking. Add
+a region to disambiguate: `-p "Huntington, West Virginia"`. A matched place is
+sticky like a pin; it will not drift.
+
+**On a laptop** there is usually no GPS, so `-g` uses the OS location service:
+CoreLocation on macOS (via `CoreLocationCLI`, `brew install corelocationcli`) and
+`System.Device.Location` on Windows, which needs Location enabled in Privacy
+settings. Linux desktops have no standard provider, so use `--ip` or pin.
+
+`--ip` asks a public IP-geolocation service where you are. It is accurate to a
+city, not a street, and it necessarily tells that service your IP address —
+which is why it never runs on its own and must be asked for. The header labels
+such a fix `via ip, city-level` so it is never mistaken for a real position.
+Two endpoints are tried in turn; if both fail it says so rather than guessing.
+
+For a fixed desk, `-c` remains the best option: exact, private, no lookup.
+
+On Android it needs the `termux-api` package **and** the matching Termux:API app. The two
+Termux distributions are signed differently, so the companion must come from the
+same source as Termux itself — an F-Droid Termux:API will not pair with a Play
+Store Termux, and the Play build's companion is not released yet. On the Play
+build, pin a location with `-c`; everything else works normally.
 
 ## Signal
 

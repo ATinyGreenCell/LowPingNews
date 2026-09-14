@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "5.1"
+VERSION = "5.4"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -762,13 +762,113 @@ def cat_cost(cat):
     return due, unknown
 
 
+def mac_fix(timeout):
+    """macOS has CoreLocation but no stdlib access; CoreLocationCLI exposes it."""
+    import shutil, subprocess
+    if sys.platform != "darwin" or not shutil.which("CoreLocationCLI"):
+        return None
+    try:
+        o = subprocess.run(["CoreLocationCLI", "-once", "-format",
+                            "%latitude %longitude %horizontalAccuracy"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout)
+        parts = o.stdout.decode("utf-8", "replace").split()
+        if len(parts) >= 2:
+            d = {"latitude": float(parts[0]), "longitude": float(parts[1]),
+                 "_provider": "corelocation"}
+            if len(parts) > 2:
+                d["accuracy"] = float(parts[2])
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def win_fix(timeout):
+    """Windows.Devices.Geolocation via PowerShell. Location must be enabled."""
+    import subprocess
+    if os.name != "nt":
+        return None
+    ps = ("Add-Type -AssemblyName System.Device;"
+          "$w=New-Object System.Device.Location.GeoCoordinateWatcher;"
+          "$w.Start();$n=0;"
+          "while($w.Status -ne 'Ready' -and $n -lt 40){Start-Sleep -m 250;$n++};"
+          "$c=$w.Position.Location;"
+          "if(-not $c.IsUnknown){'{0} {1} {2}' -f $c.Latitude,$c.Longitude,"
+          "$c.HorizontalAccuracy}")
+    try:
+        o = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout)
+        parts = o.stdout.decode("utf-8", "replace").split()
+        if len(parts) >= 2:
+            d = {"latitude": float(parts[0]), "longitude": float(parts[1]),
+                 "_provider": "windows"}
+            if len(parts) > 2:
+                d["accuracy"] = float(parts[2])
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def geocode(name, timeout=12, count=6):
+    """Open-Meteo geocoding: no key, same provider as the forecast."""
+    import urllib.parse
+    url = ("https://geocoding-api.open-meteo.com/v1/search?name=%s"
+           "&count=%d&language=en&format=json"
+           % (urllib.parse.quote(name.strip()), count))
+    raw, _h, _w, _p = get(url, timeout, cap=262144)
+    return (json.loads(raw) or {}).get("results") or []
+
+
+def place_label(r):
+    bits = [r.get("name")]
+    for k in ("admin1", "country"):
+        v = r.get(k)
+        if v and v not in bits:
+            bits.append(v)
+    return ", ".join(b for b in bits if b)
+
+
+def ip_fix(timeout=12):
+    """Coarse, city-level, and it tells a third party your IP. Opt-in only."""
+    for url, la, lo, ac in (
+            ("https://ipapi.co/json/", "latitude", "longitude", "city"),
+            ("https://ipwho.is/", "latitude", "longitude", "city")):
+        try:
+            raw, _, _w, _p = get(url, timeout, cap=65536)
+            j = json.loads(raw)
+            if j.get(la) is None:
+                continue
+            return {"latitude": float(j[la]), "longitude": float(j[lo]),
+                    "accuracy": 5000, "_provider": "ip",
+                    "_place": j.get(ac) or ""}
+        except Exception:
+            continue
+    return None
+
+
 def gps_fix(want_gps, timeout=50):
     """Ask Termux for a fix. GPS is accurate but needs sky; network is instant
     but coarse. Try the accurate one first and fall back rather than fail."""
     import shutil, subprocess
+    for prov in (mac_fix, win_fix):        # laptops: OS location services
+        got = prov(min(timeout, 20))
+        if got:
+            return got, None
     if not shutil.which("termux-location"):
-        return None, ("termux-location not found - install the termux-api "
-                      "package AND the Termux:API app (F-Droid)")
+        if sys.platform == "darwin":
+            return None, ("no location provider. On macOS install CoreLocationCLI "
+                          "(brew install corelocationcli), or use --ip, or pin:\n"
+                          "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
+        if os.name == "nt":
+            return None, ("Windows location services returned nothing. Enable "
+                          "Settings > Privacy > Location, or use --ip, or pin:\n"
+                          "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
+        return None, ("no location provider on this system. Use --ip for a "
+                      "city-level guess, or pin one:\n"
+                      "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
     order = ["gps", "network"] if want_gps else ["network", "gps"]
     last, noapp, nofix = "no fix", False, False
     for p in order:
@@ -786,8 +886,13 @@ def gps_fix(want_gps, timeout=50):
                o.stderr.decode("utf-8", "replace")).strip()
         # the CLI prints a human notice, not JSON, when the companion app is
         # missing. Blaming the sky for that sent people outdoors for nothing.
-        if "termux:api" in txt.lower() or "not yet available" in txt.lower():
-            noapp = True
+        low = txt.lower()
+        if "termux:api" in low or "not yet available" in low:
+            # "not yet available on Google Play" comes from the Play build of
+            # Termux, whose companion app does not exist yet. An F-Droid
+            # Termux:API is signed differently and will never pair with it.
+            noapp = "google play" in low or "play store" in low
+            noapp = "play" if noapp else True
             continue
         try:
             j = json.loads(txt or "null")
@@ -800,10 +905,16 @@ def gps_fix(want_gps, timeout=50):
             return j, None
         nofix = True                   # answered properly, just had no position
         last = "%s returned no fix" % p
+    if noapp == "play":
+        return None, ("this is the Google Play build of Termux, and its "
+                      "Termux:API companion is not released yet. An F-Droid "
+                      "Termux:API is signed differently and cannot pair with "
+                      "it. Pin a location instead:\n"
+                      "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
     if noapp:
         return None, ("the Termux:API app is not installed. The termux-api "
                       "package alone is not enough - install Termux:API from "
-                      "F-Droid, or pin a location:\n"
+                      "the same source as Termux itself, or pin a location:\n"
                       "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
     # only suggest the sky when a provider actually answered without a position
     return None, last + (" - GPS needs open sky; try outdoors" if nofix else "")
@@ -832,8 +943,37 @@ def wx_locate(a):
         jwrite(WXLOC, d)
         return d
 
+    if getattr(a, "place", None):
+        try:
+            hits = geocode(a.place)
+        except Exception as e:
+            sys.exit("news: place lookup failed (%s)" % str(e)[:60])
+        if not hits:
+            sys.exit("news: no place matched %r. Try adding a region, e.g.\n"
+                     "  lowpingnews weather -p 'Huntington, New York'" % a.place)
+        top = hits[0]
+        d = {"lat": round(float(top["latitude"]), 4),
+             "lon": round(float(top["longitude"]), 4),
+             "label": getattr(a, "label", None) or place_label(top),
+             "via": "place", "t": int(time.time())}
+        jwrite(WXLOC, d)
+        others = [place_label(r) for r in hits[1:4]
+                  if place_label(r) != place_label(top)]
+        if others:                          # ambiguity is the user's to resolve
+            sys.stderr.write("  also matched: %s\n" % "; ".join(others))
+        return d
+
+    if getattr(a, "iploc", False):
+        j = ip_fix()
+        if not j:
+            sys.exit("news: IP lookup failed. Pin a location instead:\n"
+                     "  lowpingnews weather -c 40.900,-73.412 --label 'Home'")
+        fix = _store_fix(j, getattr(a, "label", None) or (j.get("_place") or None))
+        jwrite(WXLOC, fix)
+        return fix
+
     if getattr(a, "gps", False):
-        sys.stderr.write("  locating (GPS can take ~30s outdoors)...\r")
+        sys.stderr.write("  locating...\r")
         sys.stderr.flush()
         j, err = gps_fix(True)
         sys.stderr.write("\r" + " " * 48 + "\r")
@@ -853,7 +993,7 @@ def wx_locate(a):
     except Exception:
         d = {}
 
-    pinned = d.get("via") == "pinned"
+    pinned = d.get("via") in ("pinned", "place")
     stale = (time.time() - (d.get("t") or 0)) > LOCTTL
     if d and (pinned or not stale):
         return d                                       # good enough, spend nothing
@@ -939,17 +1079,19 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
           D("  %s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"),
                                t0.strftime("%H:%M"))))
     via = loc.get("via")
-    if via and via != "pinned":
+    if via and via not in ("pinned", "place"):
         t_fix = loc.get("t") or 0
         fixage = int(time.time() - t_fix)
         # an implausible timestamp is unknown age, not a 20000-day-old fix
         when_ = ("" if not t_fix or fixage > 30 * 86400 else
                  ", " + ago(fixage) if fixage > 120 else "")
+        acc_ = ("" if not loc.get("acc") else
+                ", city-level" if via == "ip" else ", +/-%dm" % loc["acc"])
         print(D("  %.4f,%.4f via %s%s%s" % (
-            loc["lat"], loc["lon"], via,
-            ", +/-%dm" % loc["acc"] if loc.get("acc") else "", when_)))
-    elif via == "pinned" or loc.get("label"):
-        print(D("  %.4f,%.4f pinned" % (loc["lat"], loc["lon"])))
+            loc["lat"], loc["lon"], via, acc_, when_)))
+    elif via in ("pinned", "place") or loc.get("label"):
+        print(D("  %.4f,%.4f %s" % (loc["lat"], loc["lon"],
+                                    "matched" if via == "place" else "pinned")))
     temp = round(cu["temperature_2m"])
     tc = (P["cyn"] if temp <= 32 else P["grn"] if temp <= 80 else P["yel"])
     print("  " + B(tc("%d%s" % (temp, U))) +
@@ -1272,20 +1414,21 @@ def sources(a):
 
 
 BOOLF = {"-f": "fresh", "--fresh": "fresh", "--offline": "offline",
-         "--stream": "stream", "-g": "gps", "--gps": "gps",
+         "--stream": "stream", "-g": "gps", "--gps": "gps", "--ip": "iploc",
          "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
          "-u": "unread", "--unread": "unread", "--ascii": "ascii",
          "--check": "check", "-l": "list", "--list": "list",
          "--mark-all": "mark_all"}
-VALF = {"-c": ("coords", str), "--coords": ("coords", str),
+VALF = {"-p": ("place", str), "--place": ("place", str),
+        "-c": ("coords", str), "--coords": ("coords", str),
         "--label": ("label", str), "-n": ("n", int), "-s": ("only", str), "--only": ("only", str),
         "-o": ("open", int), "--open": ("open", int), "-r": ("read", int),
         "--read": ("read", int), "-S": ("star", int), "--star": ("star", int),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
+DEFAULTS_NS = {"place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
                "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
@@ -1353,7 +1496,11 @@ def main():
                    help="top, world, science, tech, bio, all, signal, weather")
     p.add_argument("--check", action="store_true", help="test every feed URL")
     p.add_argument("-g", "--gps", action="store_true",
-                   help="take a fresh GPS fix instead of the pinned location")
+                   help="take a fresh device location fix")
+    p.add_argument("--ip", dest="iploc", action="store_true",
+                   help="locate by IP address (city-level, tells a third party)")
+    p.add_argument("-p", "--place", metavar="NAME",
+                   help="locate by town or city name")
     p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
     p.add_argument("--label", help="name for the pinned location")
     p.add_argument("-C", "--celsius", action="store_true", help="weather in celsius")
