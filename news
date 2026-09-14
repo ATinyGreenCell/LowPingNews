@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "4.1"
+VERSION = "4.2"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -87,6 +87,11 @@ DEFAULTS = [
     D_("brxp", "bioRxiv plant",
        "https://connect.biorxiv.org/biorxiv_xml.php?subject=plant_biology", ["bio"],
        ttl=HEAVY),
+    D_("epmc", "Europe PMC",
+       "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+       "?query=%28plant%20AND%20%28synthetic%20biology%20OR%20transformation%29%29"
+       "&format=json&pageSize=20&sort=P_PDATE_D%20desc", ["bio"], "epmc",
+       ttl=HEAVY),
     D_("brxs", "bioRxiv synbio",
        "https://connect.biorxiv.org/biorxiv_xml.php?subject=synthetic_biology", ["bio"],
        ttl=HEAVY),
@@ -122,12 +127,24 @@ def when(s):
         return int(d.timestamp())
     except Exception:
         pass
-    m = re.match(r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?"
-                 r"(?:\.\d+)?\s*(Z|[+-]\d\d:?\d\d)?\s*$", s)
+    # dc:date routinely carries a bare date; time and zone are both optional
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)"
+                 r"(?:[T ](\d\d):(\d\d)(?::(\d\d))?(?:\.\d+)?)?"
+                 r"\s*(Z|z|[+-]\d\d:?\d\d)?\s*$", s)
     if not m:
+        m2 = re.match(r"(\d{4})/(\d\d)/(\d\d)\s*$", s) or \
+             re.match(r"(\d{4})(\d\d)(\d\d)\s*$", s)
+        if m2:
+            try:
+                return int(dt.datetime(int(m2.group(1)), int(m2.group(2)),
+                                       int(m2.group(3)),
+                                       tzinfo=dt.timezone.utc).timestamp())
+            except Exception:
+                return 0
         return 0
     try:
-        y, mo, da, hh, mi = (int(x) for x in m.groups()[:5])
+        y, mo, da = (int(x) for x in m.groups()[:3])
+        hh, mi = int(m.group(4) or 0), int(m.group(5) or 0)
         ss = int(m.group(6) or 0)
         off = m.group(7)
         d = dt.datetime(y, mo, da, hh, mi, ss, tzinfo=dt.timezone.utc)
@@ -366,7 +383,8 @@ def parse_feed(raw):
         short = clean(txt("description", "summary", "content"))
         full = clean(txt("encoded", "content", "description"), 6000)
         rec = {"ti": ti, "u": link, "s": short,
-               "d": when(txt("pubDate", "published", "date", "updated"))}
+               "d": when(txt("pubDate", "published", "date", "updated",
+                             "publicationDate", "issued", "created", "modified"))}
         if len(full) > len(short) + 200:      # feed shipped the body: already paid for
             rec["c"] = full
         out.append(rec)
@@ -395,9 +413,31 @@ def parse_loose(raw):
             link = mm.group(1) if mm else ""
         out.append({"ti": ti, "u": link,
                     "s": clean(g("description", "summary")),
-                    "d": when(g("pubDate", "published", "date", "updated"))})
+                    "d": when(g("pubDate", "published", "date", "updated",
+                                "publicationDate", "issued"))})
         if len(out) > 200:
             break
+    return out
+
+
+def parse_epmc(raw):
+    """Europe PMC REST search: one JSON request, covers PubMed and preprints."""
+    j = json.loads(raw)
+    out = []
+    for r in (j.get("resultList") or {}).get("result", []):
+        ti = clean(r.get("title") or "", 200)
+        if not ti:
+            continue
+        doi, pmid = r.get("doi"), r.get("pmid")
+        url = ("https://doi.org/" + doi if doi else
+               "https://pubmed.ncbi.nlm.nih.gov/%s/" % pmid if pmid else
+               "https://europepmc.org/article/%s/%s" % (r.get("source", "MED"),
+                                                        r.get("id", "")))
+        bits = [b for b in (r.get("journalTitle"), r.get("authorString")) if b]
+        out.append({"ti": ti, "u": url,
+                    "s": clean(" - ".join(bits), 300),
+                    "d": when(r.get("firstPublicationDate")
+                              or r.get("pubYear") or "")})
     return out
 
 
@@ -465,7 +505,9 @@ def load(src, fresh, bag):
                 return
             raise
         try:
-            items = parse_hn(raw) if src["kind"] == "hn" else parse_feed(raw)
+            kind_ = src["kind"]
+            items = (parse_hn(raw) if kind_ == "hn" else
+                     parse_epmc(raw) if kind_ == "epmc" else parse_feed(raw))
         except Exception:
             if not part:
                 raise
@@ -1597,7 +1639,8 @@ def run(a):
             t0 = time.time()
             try:
                 raw, rh_, wire, _p = get(x["url"], 12)
-                n = len(parse_hn(raw) if x["kind"] == "hn" else parse_feed(raw))
+                n = len(parse_hn(raw) if x["kind"] == "hn" else
+                        parse_epmc(raw) if x["kind"] == "epmc" else parse_feed(raw))
                 val = "v" if (rh_.get("ETag") or rh_.get("Last-Modified")) else "-"
                 cost = P["grn"] if wire < 20480 else P["yel"] if wire < 81920 else P["red"]
                 print("  %-6s %s %3di %s %s %s %4.1fs" % (

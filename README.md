@@ -153,8 +153,10 @@ $EDITOR ~/.config/news/sources.json
  "url": "https://eos.org/feed", "cats": ["science"]}
 ```
 
-`kind` is `rss` (RSS 2.0, RSS 1.0/RDF and Atom are all handled) or `hn` for the
-Hacker News Algolia API. Only `http`/`https` URLs are accepted.
+`kind` is `rss` (RSS 2.0, RSS 1.0/RDF and Atom are all handled), `hn` for the
+Hacker News Algolia API, or `epmc` for a Europe PMC REST search — one JSON
+request, no key, covering PubMed records and preprints. Edit the `query=` part
+of the Europe PMC URL to change what it tracks. Only `http`/`https` URLs are accepted.
 
 Optional `"ttl"` (seconds) sets how long that feed is reused before refetching;
 the default is 900. It matters for feeds that send no `ETag` or `Last-Modified`,
