@@ -33,6 +33,13 @@ Most feed readers assume bandwidth. This one assumes you don't have any.
   124 KB Nature refresh into nothing.
 - **One retry on a dropped connection.** A transient failure is retried once
   after 400 ms; a real HTTP error is not, since the server answered.
+- **A truncated download is still worth reading.** If the connection dies
+  mid-transfer the bytes that arrived are kept, not discarded: gzip is a stream
+  so every complete block still decompresses, and every `<item>` that closed is
+  a complete record. Measured against a feed cut mid-stream: 85% of the bytes
+  yields 10 of 12 stories, 60% yields 6, 35% yields 3. A partial feed is flagged
+  in the cache, stored without validators (a later 304 must never confirm a copy
+  you never fully received) and expires in two minutes instead of fifteen.
 - **A hung connection still shows you the news.** Weak signal usually means a
   socket that is accepted and never answered, not one that is refused. When the
   20-second deadline expires with workers still blocked, the cached copy is

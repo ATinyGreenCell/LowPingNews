@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.4"
+VERSION = "3.6"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -174,7 +174,7 @@ def fetch_article(it):
             pass
     if not it.get("u"):
         return "", 0, "nolink"
-    raw, _, wire = get(it["u"], 20, cap=PAGECAP)
+    raw, _, wire, _p = get(it["u"], 20, cap=PAGECAP)
     txt = extract(raw)
     txt = txt[:ARTMAX]
     if txt:
@@ -256,7 +256,7 @@ def extract(raw):
 
 
 def get(url, t=10, extra=None, cap=FEEDCAP):
-    """-> (body, headers, wire_bytes). Raises HTTPError(304) when unchanged."""
+    """-> (body, headers, wire_bytes, partial). Raises HTTPError(304) when unchanged."""
     h = {"Accept-Encoding": "gzip, deflate", "User-Agent": UA}
     h.update(extra or {})
     import urllib.parse, urllib.request, zlib
@@ -264,9 +264,30 @@ def get(url, t=10, extra=None, cap=FEEDCAP):
         raise ValueError("refusing non-http url")
     r = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(r, timeout=t) as f:
-        b = f.read(cap + 1)
-        if len(b) > cap:
-            raise ValueError("response exceeds %s cap" % kb(cap))
+        # Read in chunks and keep whatever arrived. On a dying link the useful
+        # question is not "did it finish" but "how much of it is usable".
+        import http.client
+        buf, partial = bytearray(), False
+        try:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > cap:
+                    raise ValueError("response exceeds %s cap" % kb(cap))
+            if getattr(f, "length", None):       # server promised more than it sent
+                partial = True
+        except ValueError:
+            raise
+        except http.client.IncompleteRead as e:
+            buf += e.partial                     # the bytes are on the exception
+            partial = True
+        except Exception:
+            if not buf:
+                raise                            # nothing arrived: a real failure
+            partial = True
+        b = bytes(buf)
         wire = len(b)                     # compressed: what the data plan is billed
         ce = (f.headers.get("Content-Encoding") or "").lower()
         if ce in ("gzip", "deflate", "x-gzip"):
@@ -277,11 +298,11 @@ def get(url, t=10, extra=None, cap=FEEDCAP):
                     out = z.decompress(b, cap + 1)   # bounded: a bomb stops here
                     if z.unconsumed_tail:
                         raise ValueError("decompressed body exceeds %s cap" % kb(cap))
-                    b = out
-                    break
+                    b = out                          # truncated gzip still yields
+                    break                            # every complete block so far
                 except zlib.error:
                     continue                  # raw deflate vs zlib-wrapped: try both
-        return b, f.headers, wire
+        return b, f.headers, wire, partial
 
 
 def parse_feed(raw):
@@ -378,7 +399,7 @@ def load(src, fresh, bag):
         try:
             c = json.load(open(cf, encoding="utf-8"))
             if time.time() - c.get("t", 0) < ttl:
-                bag[src["id"]] = (c["items"], 0, 0, 0)
+                bag[src["id"]] = (c["items"], 0, 0, 0, 0)
                 return
         except Exception:
             pass
@@ -401,45 +422,56 @@ def load(src, fresh, bag):
     try:
         try:
             try:
-                raw, rh, wire = get(src["url"], extra=val)
+                raw, rh, wire, part = get(src["url"], extra=val)
             except urllib.error.HTTPError:
                 raise                      # a real HTTP answer: do not retry
             except Exception:
                 time.sleep(0.4)            # transient drop on a weak signal
-                raw, rh, wire = get(src["url"], extra=val)
+                raw, rh, wire, part = get(src["url"], extra=val)
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
                 jwrite(cf, c)
-                bag[src["id"]] = (c["items"], 0, 0, 1)
+                bag[src["id"]] = (c["items"], 0, 0, 1, 0)
                 bag.setdefault("_net", []).append(
                     (True, (time.time() - t_start) * 1000, 0))
                 return
             raise
-        items = parse_hn(raw) if src["kind"] == "hn" else parse_feed(raw)
+        try:
+            items = parse_hn(raw) if src["kind"] == "hn" else parse_feed(raw)
+        except Exception:
+            if not part:
+                raise
+            items = parse_loose(raw)      # truncated: keep the items that closed
         items = [i for i in items if i["ti"]]
         items = sorted(items, key=lambda z: -(z.get("d") or 0))[:STORECAP]
         if not items:
             raise ValueError("no items parsed")
         rec = {"t": int(time.time()), "items": items, "w": wire}
-        if rh.get("ETag"):
-            rec["et"] = rh["ETag"]
-        if rh.get("Last-Modified"):
-            rec["lm"] = rh["Last-Modified"]
+        if part:
+            # Never store validators for a truncated body: a later 304 would
+            # confirm a copy we never fully received. Also expire it quickly.
+            rec["p"] = 1
+            rec["t"] = int(time.time()) - max(0, (src.get("ttl") or TTL) - 120)
+        else:
+            if rh.get("ETag"):
+                rec["et"] = rh["ETag"]
+            if rh.get("Last-Modified"):
+                rec["lm"] = rh["Last-Modified"]
         jwrite(cf, rec)
-        bag[src["id"]] = (items, wire, 0, 0)
+        bag[src["id"]] = (items, wire, 0, 0, 1 if part else 0)
         bag.setdefault("_net", []).append((True, (time.time() - t_start) * 1000, wire))
     except Exception as e:
         if os.path.exists(cf):                      # offline: stale beats nothing
             try:
                 c = json.load(open(cf, encoding="utf-8"))
-                bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0)
+                bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0, 0)
                 bag.setdefault("_net", []).append(      # still a failed request:
                     (False, (time.time() - t_start) * 1000, 0))   # count it as one
                 return
             except Exception:
                 pass
-        bag[src["id"]] = ([], 0, -1, 0)
+        bag[src["id"]] = ([], 0, -1, 0, 0)
         bag.setdefault("_net", []).append((False, (time.time() - t_start) * 1000, 0))
         bag.setdefault("_err", {})[src["id"]] = str(e)[:60]
 
@@ -611,7 +643,7 @@ def wx_fetch(loc, unit, fresh):
          % (loc["lat"], loc["lon"], unit,
             "mph" if unit == "fahrenheit" else "kmh"))
     try:
-        raw, _, wire = get("https://api.open-meteo.com/v1/forecast?" + q, 15)
+        raw, _, wire, _p = get("https://api.open-meteo.com/v1/forecast?" + q, 15)
         d = json.loads(raw)
         if d.get("error"):
             raise ValueError(d.get("reason", "api error"))
@@ -1040,7 +1072,7 @@ def run(a):
         if not os.access(me, os.W_OK):
             sys.exit("news: %s is not writable" % me)
         try:
-            raw, _, wire = get(url, 30, cap=PAGECAP)
+            raw, _, wire, _p = get(url, 30, cap=PAGECAP)
         except Exception as e:
             sys.exit("news: download failed - %s" % str(e)[:70])
         txt = raw.decode("utf-8", "replace")
@@ -1339,7 +1371,7 @@ def run(a):
         for x in srcs:
             t0 = time.time()
             try:
-                raw, rh_, wire = get(x["url"], 12)
+                raw, rh_, wire, _p = get(x["url"], 12)
                 n = len(parse_hn(raw) if x["kind"] == "hn" else parse_feed(raw))
                 val = "v" if (rh_.get("ETag") or rh_.get("Last-Modified")) else "-"
                 cost = P["grn"] if wire < 20480 else P["yel"] if wire < 81920 else P["red"]
@@ -1357,9 +1389,9 @@ def run(a):
         for x in srcs:
             c_ = jread("%s/%s.json" % (CD, x["id"]), {})
             if c_.get("items"):
-                bag[x["id"]] = (c_["items"], 0, int(time.time() - (c_.get("t") or 0)), 0)
+                bag[x["id"]] = (c_["items"], 0, int(time.time() - (c_.get("t") or 0)), 0, 0)
             else:
-                bag[x["id"]] = ([], 0, -1, 0)
+                bag[x["id"]] = ([], 0, -1, 0, 0)
     else:
         bag = gather(srcs, a.fresh)
         for x in srcs:                     # deadline hit with the worker stuck:
@@ -1369,7 +1401,7 @@ def run(a):
             c_ = jread("%s/%s.json" % (CD, x["id"]), {})
             if c_.get("items"):
                 bag[x["id"]] = (c_["items"], 0,
-                                max(1, int(time.time() - (c_.get("t") or 0))), 0)
+                                max(1, int(time.time() - (c_.get("t") or 0))), 0, 0)
     try:
         cols = os.get_terminal_size().columns
     except Exception:
@@ -1378,11 +1410,12 @@ def run(a):
         cols = 46
     cols = min(cols, 100)
 
-    rows, seen, down, stale, bytes_, nm = [], set(), [], 0, 0, 0
+    rows, seen, down, stale, bytes_, nm, partial_n = [], set(), [], 0, 0, 0, 0
     for x in srcs:
-        items, nb, sta, unch = bag.get(x["id"], ([], 0, -1, 0))
+        items, nb, sta, unch, part_ = bag.get(x["id"], ([], 0, -1, 0, 0))
         bytes_ += nb
         nm += unch
+        partial_n += part_
         if sta == -1:
             down.append(x["name"])
             continue
@@ -1395,6 +1428,8 @@ def run(a):
             rows.append((x["name"], it))
     rows.sort(key=lambda r: -(r[1].get("d") or 0))
     foot = "%s %s" % (bul_(a), kb(bytes_) if bytes_ else "0B, cached")
+    if partial_n:
+        foot += " %s %d truncated, salvaged" % (bul_(a), partial_n)
     if nm:
         foot += " %s %d unchanged (304)" % (bul_(a), nm)
     if stale:
