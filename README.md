@@ -40,6 +40,10 @@ Most feed readers assume bandwidth. This one assumes you don't have any.
   yields 10 of 12 stories, 60% yields 6, 35% yields 3. A partial feed is flagged
   in the cache, stored without validators (a later 304 must never confirm a copy
   you never fully received) and expires in two minutes instead of fifteen.
+- **Nothing fails silently.** The fetch budget scales with the number of feeds
+  rather than being a fixed 20 seconds, and any feed that is never reached is
+  counted in the footer as `N not reached (deadline)`. A partial pull that looks
+  complete is worse than an error, because you cannot tell.
 - **A hung connection still shows you the news.** Weak signal usually means a
   socket that is accepted and never answered, not one that is refused. When the
   20-second deadline expires with workers still blocked, the cached copy is
