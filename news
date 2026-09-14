@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.6"
+VERSION = "3.7"
 DATA = os.path.expanduser("~/.local/share/news")
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
@@ -494,10 +494,13 @@ def net_log(entries):
     jwrite(NET, d)
 
 
-def net_stats():
+def net_stats(window=1800):
     d = jread(NET, {})
     log = d.get("log") or []
-    recent = log[-30:]
+    cut = time.time() - window
+    recent = [r for r in log if r[0] >= cut]        # a 20-minute-old outage is
+    if len(recent) < 5:                             # not this connection
+        recent = log[-12:]
     if not recent:
         return None
     ok = [r for r in recent if r[1]]
@@ -505,7 +508,7 @@ def net_stats():
     lat = sorted(r[2] for r in ok) or [0]
     med = lat[len(lat) // 2]
     tp = sorted((r[3] * 1000.0 / r[2]) for r in ok if r[2] > 0 and r[3] > 0)
-    return {"n": len(recent), "rate": rate, "ms": med,
+    return {"n": len(recent), "rate": rate, "ms": med, "win": window,
             "bps": (tp[len(tp) // 2] if tp else 0), "day": d.get("day") or {}}
 
 
@@ -591,6 +594,23 @@ def radio():
                 if dbm is not None:
                     out.append((c.get("type", "cell"), dbm, c.get("level", "")))
     return out
+
+
+def cat_cost(cat):
+    """What a refresh of one category would cost, from cached wire sizes."""
+    try:
+        srcs = [x for x in sources(argparse_ns({"only": None, "cat": cat}))]
+    except SystemExit:
+        return None, 0
+    due, unknown = 0, 0
+    for x in srcs:
+        c = jread("%s/%s.json" % (CD, x["id"]), {})
+        w, t0 = c.get("w"), c.get("t") or 0
+        if w is None:
+            unknown += 1
+        elif time.time() - t0 >= (x.get("ttl") or TTL):
+            due += w
+    return due, unknown
 
 
 def wx_locate(a):
@@ -1260,6 +1280,92 @@ def run(a):
             rows = [(it.get("src", "saved"), it) for it in reversed(st["star"])]
         show(a, rows, rd, "search: %s" % a.query if a.query else "saved",
              "%s no network" % bul_(a))
+        return
+
+    if (a.cat or "").lower() == "weather":
+        loc = wx_locate(a)
+        d, wire, age_s, stale = wx_fetch(loc, a.unit, a.fresh)
+        wx_show(a, P, loc, d, wire, age_s, stale)
+        return
+
+    if (a.cat or "").lower() == "signal":
+        st_ = net_stats()
+        W = cols_()
+        # verdict first: the answer to "should I pull now" belongs on line one
+        probes, verdict, vc = [], "unknown", P["d"]
+        hosts = []
+        for x in sources(argparse_ns({"only": None, "cat": "all"})):
+            hp = hostport(x["url"])
+            if hp[0] and hp not in hosts:
+                hosts.append(hp)
+        probes = probe(hosts[:2])
+        reach = [r for r in probes if r["tcp"] is not None]
+        if probes and not reach:
+            verdict, vc = "offline", P["red"]
+        elif st_:
+            if st_["rate"] >= 90 and st_["bps"] > 20000:
+                verdict, vc = "good", P["grn"]
+            elif st_["rate"] >= 60:
+                verdict, vc = "usable", P["yel"]
+            else:
+                verdict, vc = "poor", P["red"]
+        elif reach:
+            verdict, vc = "reachable", P["yel"]
+        print(P["hdr"]("SIGNAL") + "  " + vc(verdict))
+
+        for r_ in probes:
+            h = r_["host"].split(".")
+            short = r_["host"]
+            if len(h) > 3 and not r_["host"].replace(".", "").isdigit():
+                short = ".".join(h[-3:])   # trim subdomains, never an IP literal
+            if r_["tcp"] is None:
+                print("  %-7s %s %s" % ("link", P["red"]("%9s" % "no route"),
+                                        D(short[:W - 20])))
+                continue
+            tc = (P["grn"] if r_["tcp"] < 150 else
+                  P["yel"] if r_["tcp"] < 500 else P["red"])
+            dc = (D if (r_["dns_cold"] or 0) < 120 else P["yel"])
+            note = " proxied?" if (r_["tcp"] < 2 and not r_["host"].startswith(
+                ("127.", "10.", "192.168."))) else ""
+            print("  %-7s %s %s  %s%s" % (
+                "link", tc("%5dms" % r_["tcp"]), dc("%4dms dns" % (r_["dns_cold"] or 0)),
+                D(short[:W - 26]), P["yel"](note)))
+        ic = icmp(hosts[0][0]) if hosts else None
+        if ic:
+            print("  %-7s %s %s" % ("", D("%5.0fms" % (ic["avg"] or 0)),
+                  D("icmp, %.0f%% loss" % ic["loss"])))
+
+        if st_:
+            rc = (P["grn"] if st_["rate"] >= 90 else
+                  P["yel"] if st_["rate"] >= 60 else P["red"])
+            print("  %-7s %s %s %s" % (
+                "rate", P["b"]("%8s/s" % kbs(int(st_["bps"]))),
+                D("%dms" % st_["ms"]),
+                rc("%.0f%% ok" % st_["rate"]) + D(" of %d" % st_["n"])))
+
+        # the actionable part: what a refresh costs, and how long it would take
+        shown = 0
+        for cat in ("top", "science", "tech", "bio", "world"):
+            due, unk = cat_cost(cat)
+            if due is None or (not due and not unk):
+                continue
+            eta = (" ~%.0fs" % (due / st_["bps"])) if (st_ and st_["bps"] > 500
+                                                       and due) else ""
+            cc = (P["grn"] if due < 20480 else
+                  P["yel"] if due < 81920 else P["red"])
+            print("  %-7s %s%s%s" % (cat if shown or True else "", cc("%8s" % kbs(due)),
+                  D(eta), D("  %d unknown" % unk) if unk else ""))
+            shown += 1
+        if not shown:
+            print("  %-7s %s" % ("fresh", D("everything within ttl, 0B to refresh")))
+
+        days = sorted((st_ or {}).get("day", {}).items())[-7:]
+        if days:
+            today_ = (st_ or {})["day"].get(dt.date.today().isoformat(), 0)
+            print("  %-7s %s %s" % ("data", D("%8s today" % kbs(today_)),
+                  D("%s over %dd" % (kbs(sum(v_ for _, v_ in days)), len(days)))))
+        if verdict == "poor":
+            print(D("  tip: lowpingnews --light skips the heavy feeds"))
         return
 
     if (a.cat or "").lower() == "weather":

@@ -222,20 +222,31 @@ against the budget and always proceed.
 ## Knowing before you spend
 
 ```
-$ news signal
-SIGNAL
-  wifi     -58 dBm  130 Mbps
-  measured good    18 recent fetches
-           100% ok  142ms median  84.1K/s
-           a light feed ~ 0.1s
-           Nature ~ 1.5s
-  data     1.2M over 7 days
-           today 269K
+$ lowpingnews signal
+SIGNAL  good
+  link       23ms   37ms dns  bbci.co.uk
+  link       21ms  127ms dns  rss.csmonitor.com
+             29ms  icmp, 0% loss
+  rate    31.9K/s  167ms  100% ok of 12
+  top        61.4K ~2s
+  science   147.1K ~5s
+  bio       149.5K ~5s
+  data       191.8K today  1.2M over 7d
 ```
 
-The `probe` lines do a DNS lookup and TCP connect to the hosts your feeds
+The verdict is on the first line, because the question is "should I pull now".
+Then the link itself, then measured throughput, then **what a refresh of each
+category would actually cost and how long it would take at the rate you are
+currently getting**. Categories already within their TTL are omitted; if
+everything is fresh it says so and there is nothing to spend.
+
+Throughput and success rate come from the last 30 minutes of real fetches, not
+a fixed count — an outage from an hour ago should not colour the connection you
+have now. Below five samples in that window it falls back to the last twelve.
+
+The `link` lines do a DNS lookup and TCP connect to the hosts your feeds
 actually live on, at the port the feed URL specifies. No ICMP and no TLS: a
-SYN/ACK per attempt, no payload. ICMP is only shown as a supplement when `ping`
+SYN/ACK per attempt, no payload. ICMP appears only as a supplement when `ping`
 is installed, because carriers drop or deprioritise it independently of TCP and
 it skips DNS entirely — and DNS is the usual thing that dies on a weak link.
 
@@ -244,22 +255,10 @@ captive portal or transparent proxy answers for every address, so a connect
 under 2 ms to a remote host is flagged `proxied?` — treat those numbers as
 measuring your local gateway, not the feed.
 
-The probe and the radio line run without any fetch history, so `news signal`
-is useful on a fresh install before you have spent a single byte.
-
 The radio line needs both the `termux-api` package and the separate Termux:API
 app, which is only on F-Droid — it is not on Google Play. Without the app the
 CLI prints a notice and the radio line is simply omitted; everything else in
-`news signal` still works. It is deliberately not
-the headline, because dBm predicts throughput badly — a strong bar on congested
-backhaul is slower than a weak clear one. The verdict comes from the last 30
-real fetches: success rate, median latency and median throughput. That is the
-number that predicts whether a download finishes.
-
-`news --cost` estimates a refresh from each feed's last known size and TTL,
-opening no sockets. `news --light` drops feeds that last cost over 30 KB.
-`news --offline` reads only the cache. Together: check the cost, check the
-signal, then choose.
+`lowpingnews signal` still works.
 
 ## Files
 
