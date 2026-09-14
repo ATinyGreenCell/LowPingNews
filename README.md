@@ -222,15 +222,34 @@ against the budget and always proceed.
 
 ## While it fetches
 
+`--stream` prints each feed the moment it arrives instead of waiting for all of
+them, so on a bad link you read the early ones while the slow ones are still in
+flight, and a connection that dies partway still leaves you whatever landed.
+Output is flushed per feed, so nothing is lost in a buffer.
+
+Ordering becomes arrival order rather than newest-first, which is the trade:
+without `--stream` everything is sorted chronologically across all feeds, but
+nothing appears until the slowest one finishes.
+
+Resuming is automatic either way. Each feed writes its own cache entry as it
+completes, so if signal dies after nine of fourteen, the next run finds those
+nine within their TTL and only refetches the five that are missing. There is no
+resume state to manage — the cache *is* the resume point.
+
+## Progress
+
 ```
   [████████······] 3/5 24.1K/~61.4K dw,ars
 ```
 
-Feeds are pulled in parallel and a weak link can take twenty seconds, so the
+The bar is shown when not streaming. Feeds are pulled in parallel and a weak
+link can take twenty seconds, so the
 fetch reports live instead of leaving a blank terminal: how many feeds are done,
 bytes so far, which ones are still in flight. When the cache knows what those
 feeds usually cost, the bar is a real percentage against that estimate (`~`);
-on a cold cache it falls back to counting completed feeds.
+on a cold cache it falls back to counting completed feeds. Feeds that answer
+`304` cost nothing, so a run where most are unchanged finishes well under the
+estimate.
 
 It writes to stderr and only when stderr is a terminal, so piping stays clean.
 `LPN_NO_PROGRESS=1` turns it off.

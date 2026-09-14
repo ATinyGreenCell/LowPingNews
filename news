@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "4.0"
+VERSION = "4.1"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -458,8 +458,8 @@ def load(src, fresh, bag):
             if he.code == 304 and c:
                 c["t"] = int(time.time())
                 jwrite(cf, c)
-                DONE.add(src["id"])
                 bag[src["id"]] = (c["items"], 0, 0, 1, 0)
+                DONE.add(src["id"])
                 bag.setdefault("_net", []).append(
                     (True, (time.time() - t_start) * 1000, 0))
                 return
@@ -487,22 +487,22 @@ def load(src, fresh, bag):
                 rec["lm"] = rh["Last-Modified"]
         jwrite(cf, rec)
         PROG[src["id"]] = wire
-        DONE.add(src["id"])
         bag[src["id"]] = (items, wire, 0, 0, 1 if part else 0)
+        DONE.add(src["id"])
         bag.setdefault("_net", []).append((True, (time.time() - t_start) * 1000, wire))
     except Exception as e:
         if os.path.exists(cf):                      # offline: stale beats nothing
             try:
                 c = json.load(open(cf, encoding="utf-8"))
-                DONE.add(src["id"])
                 bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0, 0)
+                DONE.add(src["id"])
                 bag.setdefault("_net", []).append(      # still a failed request:
                     (False, (time.time() - t_start) * 1000, 0))   # count it as one
                 return
             except Exception:
                 pass
-        DONE.add(src["id"])
         bag[src["id"]] = ([], 0, -1, 0, 0)
+        DONE.add(src["id"])
         bag.setdefault("_net", []).append((False, (time.time() - t_start) * 1000, 0))
         bag.setdefault("_err", {})[src["id"]] = str(e)[:60]
 
@@ -840,7 +840,7 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     print(D("\n  " + foot))
 
 
-def gather(srcs, fresh):
+def gather(srcs, fresh, on_feed=None):
     import threading
     want_total = expected(srcs)            # before any cache file is rewritten
     os.makedirs(CD, exist_ok=True)
@@ -856,15 +856,26 @@ def gather(srcs, fresh):
             ths.append(t)
         show_prog = sys.stderr.isatty() and not os.environ.get("LPN_NO_PROGRESS")
         cols = cols_()
+        announced = set()
         while time.time() < end and any(t.is_alive() for t in ths):
-            if show_prog:                  # stderr: never pollutes piped output
+            if on_feed:
+                for x in srcs:             # announce in the main thread only
+                    if x["id"] in DONE and x["id"] not in announced and x["id"] in bag:
+                        announced.add(x["id"])
+                        on_feed(x, bag[x["id"]])
+            elif show_prog:                # bar and stream would fight for the line
                 sys.stderr.write("\r" + progress_line(srcs, cols,
                                                       want_total).ljust(cols - 1))
                 sys.stderr.flush()
             time.sleep(0.12)
         for t in ths:                      # join() is the real ceiling: socket
             t.join(max(0.05, end - time.time()))   # timeouts do not bound getaddrinfo
-        if show_prog:
+        if on_feed:
+            for x in srcs:                 # anything that landed on the last tick
+                if x["id"] in DONE and x["id"] not in announced and x["id"] in bag:
+                    announced.add(x["id"])
+                    on_feed(x, bag[x["id"]])
+        elif show_prog:
             sys.stderr.write("\r" + " " * (cols - 1) + "\r")
             sys.stderr.flush()
     net_log(bag.pop("_net", []))
@@ -1034,6 +1045,7 @@ def sources(a):
 
 
 BOOLF = {"-f": "fresh", "--fresh": "fresh", "--offline": "offline",
+         "--stream": "stream",
          "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
          "-u": "unread", "--unread": "unread", "--ascii": "ascii",
@@ -1046,7 +1058,7 @@ VALF = {"-c": ("coords", str), "--coords": ("coords", str),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"coords": None, "label": None, "celsius": False,
+DEFAULTS_NS = {"stream": False, "coords": None, "label": None, "celsius": False,
                "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
@@ -1116,6 +1128,8 @@ def main():
     p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
     p.add_argument("--label", help="name for the pinned location")
     p.add_argument("-C", "--celsius", action="store_true", help="weather in celsius")
+    p.add_argument("--stream", action="store_true",
+                   help="print each feed as it lands instead of waiting")
     p.add_argument("--offline", action="store_true", help="cache only, open no sockets")
     p.add_argument("--light", action="store_true",
                    help="skip feeds that last cost over 30KB")
@@ -1603,6 +1617,39 @@ def run(a):
                 bag[x["id"]] = (c_["items"], 0, int(time.time() - (c_.get("t") or 0)), 0, 0)
             else:
                 bag[x["id"]] = ([], 0, -1, 0, 0)
+    elif a.stream:
+        import textwrap
+        cols_s = cols_()
+        now_ = dt.datetime.now()
+        print(P["hdr"]("NEWS") + " " + P["cyn"]((a.cat or "top").lower()) +
+              D("   %s %d %s %s" % (now_.strftime("%a"), now_.day,
+                                    now_.strftime("%b"), now_.strftime("%H:%M"))))
+        print()
+        st_seen, st_keep, st_n = set(), [], [0]
+        wrap_s = textwrap.TextWrapper(width=max(20, cols_s - 5),
+                                      initial_indent="    ", subsequent_indent="    ")
+
+        def emit(x, entry):
+            items, nb, sta, unch, part_ = entry
+            if sta == -1:
+                print(D("  %s unreachable" % x["name"]))
+                return
+            for it in sorted(items, key=lambda z: -(z.get("d") or 0))[:a.n]:
+                k_ = key(it["ti"])
+                if k_ in st_seen:
+                    continue
+                if a.unread and k_ in rd:
+                    continue
+                st_seen.add(k_)
+                st_n[0] += 1
+                r_ = dict(it)
+                r_["src"] = x["name"]
+                st_keep.append(r_)
+                render_row(a, P, st_n[0], x["name"], it, rd, cols_s, wrap_s)
+            sys.stdout.flush()              # a dying link should not lose buffered rows
+
+        bag = gather(srcs, a.fresh, on_feed=emit)
+        jwrite(LAST, st_keep)
     else:
         bag = gather(srcs, a.fresh)
         for x in srcs:                     # deadline hit with the worker stuck:
@@ -1621,6 +1668,15 @@ def run(a):
         cols = 46
     cols = min(cols, 100)
 
+    if a.stream:                           # rows already printed as they arrived
+        tot_b = sum(bag.get(x["id"], ([], 0, 0, 0, 0))[1] for x in srcs)
+        dn = [x["name"] for x in srcs if bag.get(x["id"], ([], 0, -1, 0, 0))[2] == -1]
+        wrapout("%d item%s %s %s%s" % (
+            st_n[0], "" if st_n[0] == 1 else "s", bul_(a),
+            kbs(tot_b) if tot_b else "0B, cached",
+            (" %s down: %s" % (bul_(a), ", ".join(dn))) if dn else ""),
+            P, cols_())
+        return
     rows, seen, down, stale, bytes_, nm, partial_n = [], set(), [], 0, 0, 0, 0
     for x in srcs:
         items, nb, sta, unch, part_ = bag.get(x["id"], ([], 0, -1, 0, 0))
@@ -1650,6 +1706,44 @@ def run(a):
     show(a, rows, rd, (a.cat or "top").lower() if not a.only else a.only, foot)
 
 
+def render_row(a, P, i, src, it, rd, cols, wrap):
+    """One item, exactly as the batch view draws it. Shared so the streaming
+    path and the sorted path can never render differently."""
+    import textwrap
+    D, B = P["d"], P["b"]
+    bul = bul_(a)
+    secs = int(time.time()) - it["d"] if it.get("d") else -1
+    stamp = age(secs) if secs >= 0 else "?"
+    k = key(it["ti"])
+    unread = k not in rd
+    offline = bool(it.get("c") or have(k))
+    mark = ""
+    if unread:
+        mark += P["yel"]("*" if a.ascii else "\u25cf") + " "
+    if offline:
+        mark += P["grn"]("+" if a.ascii else "\u2193") + " "
+    print(" %s %s %s %s" % (D("%2d" % i), srcpaint(src, a.color)(src), D(bul),
+                            (agepaint(secs, P) if secs >= 0 else D)(stamp)))
+    body_c = B if unread else D          # read items recede
+    plain = ("%s%s" % ("*" if a.ascii else "\u25cf", " ") if unread else "")
+    plain += ("%s%s" % ("+" if a.ascii else "\u2193", " ") if offline else "")
+    lines = textwrap.wrap(plain + it["ti"], max(16, cols - 5)) or [plain]
+    for j, ln in enumerate(lines):
+        if j == 0 and plain:             # recolour the marker, keep the width
+            print("    " + mark + body_c(ln[len(plain):]))
+        else:
+            print("    " + body_c(ln))
+    if not a.titles and it.get("s"):
+        body = wrap.wrap(it["s"])
+        if len(body) > 2:
+            body = body[:2]
+            body[1] = body[1][:max(4, len(body[1]) - 1)].rstrip() + (
+                "..." if a.ascii else "\u2026")
+        for ln in body:
+            print(D(ln))
+    print()
+
+
 def show(a, rows, rd, tag, foot):
     import textwrap
     P = pal(a.color)
@@ -1672,36 +1766,7 @@ def show(a, rows, rd, tag, foot):
         r = dict(it)
         r["src"] = src
         keep.append(r)
-        secs = int(time.time()) - it["d"] if it.get("d") else -1
-        stamp = age(secs) if secs >= 0 else "?"
-        k = key(it["ti"])
-        unread = k not in rd
-        offline = bool(it.get("c") or have(k))
-        mark = ""
-        if unread:
-            mark += P["yel"]("*" if a.ascii else "\u25cf") + " "
-        if offline:
-            mark += P["grn"]("+" if a.ascii else "\u2193") + " "
-        print(" %s %s %s %s" % (D("%2d" % i), srcpaint(src, a.color)(src), D(bul),
-                                (agepaint(secs, P) if secs >= 0 else D)(stamp)))
-        body_c = B if unread else D          # read items recede
-        plain = ("%s%s" % ("*" if a.ascii else "\u25cf", " ") if unread else "")
-        plain += ("%s%s" % ("+" if a.ascii else "\u2193", " ") if offline else "")
-        lines = textwrap.wrap(plain + it["ti"], max(16, cols - 5)) or [plain]
-        for j, ln in enumerate(lines):
-            if j == 0 and plain:             # recolour the marker, keep the width
-                print("    " + mark + body_c(ln[len(plain):]))
-            else:
-                print("    " + body_c(ln))
-        if not a.titles and it.get("s"):
-            body = wrap.wrap(it["s"])
-            if len(body) > 2:
-                body = body[:2]
-                body[1] = body[1][:max(4, len(body[1]) - 1)].rstrip() + (
-                    "..." if a.ascii else "\u2026")
-            for ln in body:
-                print(D(ln))
-        print()
+        render_row(a, P, i, src, it, rd, cols, wrap)
     jwrite(LAST, keep)
     n = len(keep)
     wrapout("%d item%s %s %s news -r N to read"
