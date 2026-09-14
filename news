@@ -4,8 +4,21 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "3.8"
-DATA = os.path.expanduser("~/.local/share/news")
+VERSION = "3.9"
+def _base(env, win, fallback):
+    """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
+    v = os.environ.get(env)
+    if v and os.path.isabs(v):
+        return os.path.join(v, "lowpingnews")
+    if os.name == "nt":
+        w = os.environ.get(win) or os.environ.get("APPDATA")
+        if w:
+            return os.path.join(w, "lowpingnews")
+    return os.path.expanduser(fallback)
+
+
+DATA = _base("XDG_DATA_HOME", "LOCALAPPDATA", "~/.local/share/news")
+
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
 WMO = {0: ("Clear", "CL"), 1: ("Mostly clear", "MC"), 2: ("Partly cloudy", "PC"),
@@ -28,8 +41,8 @@ STARCAP = 500
 STORECAP = 40                  # items kept per feed; DW ships 136, you read 5
 DLBUDGET = 4 * 1024 * 1024     # ceiling for one -d run; raise with --budget
 ST = DATA + "/state.json"
-CD = os.path.expanduser("~/.cache/news")
-CFD = os.path.expanduser("~/.config/news")
+CD = _base("XDG_CACHE_HOME", "LOCALAPPDATA", "~/.cache/news")
+CFD = _base("XDG_CONFIG_HOME", "APPDATA", "~/.config/news")
 WXLOC = CFD + "/loc.json"
 WXC = CD + "/weather.json"
 WXTTL = 1800
@@ -109,10 +122,19 @@ def when(s):
         return int(d.timestamp())
     except Exception:
         pass
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?"
+                 r"(?:\.\d+)?\s*(Z|[+-]\d\d:?\d\d)?\s*$", s)
+    if not m:
+        return 0
     try:
-        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
+        y, mo, da, hh, mi = (int(x) for x in m.groups()[:5])
+        ss = int(m.group(6) or 0)
+        off = m.group(7)
+        d = dt.datetime(y, mo, da, hh, mi, ss, tzinfo=dt.timezone.utc)
+        if off and off not in ("Z", "z"):
+            off = off.replace(":", "")
+            mins = int(off[1:3]) * 60 + int(off[3:5])
+            d -= dt.timedelta(minutes=mins if off[0] == "+" else -mins)
         return int(d.timestamp())
     except Exception:
         return 0
@@ -554,18 +576,27 @@ def probe(targets, n=3):
     return res
 
 
+def pingcmd(n, host):
+    if os.name == "nt":
+        return ["ping", "-n", str(n), "-w", "2000", host]
+    if sys.platform == "darwin":
+        return ["ping", "-c", str(n), "-W", "2000", host]   # macOS: milliseconds
+    return ["ping", "-c", str(n), "-W", "2", host]          # Linux/BSD: seconds
+
+
 def icmp(host, n=3):
     """Supplementary only, and absent on most Termux installs."""
     import shutil, subprocess
     if not shutil.which("ping"):
         return None
     try:
-        r = subprocess.run(["ping", "-c", str(n), "-W", "2", host],
-                           capture_output=True, timeout=12, text=True)
+        r = subprocess.run(pingcmd(n, host), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=12)
     except Exception:
         return None
-    m = re.search(r"(\d+(?:\.\d+)?)% packet loss", r.stdout)
-    t = re.search(r"=\s*[\d.]+/([\d.]+)/", r.stdout)
+    out = r.stdout.decode("utf-8", "replace")
+    m = re.search(r"(\d+(?:\.\d+)?)% (?:packet )?loss", out)
+    t = re.search(r"=\s*[\d.]+/([\d.]+)/", out)
     if not m:
         return None
     return {"loss": float(m.group(1)), "avg": float(t.group(1)) if t else None}
@@ -581,8 +612,9 @@ def radio():
         if not shutil.which(cmd):
             continue
         try:
-            r = subprocess.run([cmd], capture_output=True, timeout=6, text=True)
-            j = json.loads(r.stdout or "null")
+            r = subprocess.run([cmd], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=6)
+            j = json.loads(r.stdout.decode("utf-8", "replace") or "null")
         except Exception:
             continue
         if want == "wifi" and isinstance(j, dict) and j.get("rssi") is not None:
@@ -630,8 +662,9 @@ def wx_locate(a):
         import shutil, subprocess
         if shutil.which("termux-location"):
             o = subprocess.run(["termux-location", "-p", "network"],
-                               capture_output=True, timeout=25, text=True)
-            j = json.loads(o.stdout or "null")
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=25)
+            j = json.loads(o.stdout.decode("utf-8", "replace") or "null")
             if j and j.get("latitude") is not None:
                 d = {"lat": round(float(j["latitude"]), 3),
                      "lon": round(float(j["longitude"]), 3), "label": None}
@@ -1066,6 +1099,14 @@ def run(a):
     a.unit = "celsius" if getattr(a, "celsius", False) else "fahrenheit"
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
         a.color = False
+    elif os.name == "nt":                  # enable VT processing or go colourless
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            if not k.SetConsoleMode(k.GetStdHandle(-11), 7):
+                a.color = False
+        except Exception:
+            a.color = False
     enc = (getattr(sys.stdout, "encoding", None) or "ascii").lower()
     if "utf" not in enc:
         a.ascii = True                    # LANG=C: box glyphs would raise mid-line
@@ -1172,7 +1213,12 @@ def run(a):
             if shutil.which("termux-open-url"):
                 subprocess.run(["termux-open-url", it["u"]])
             else:
-                print(it["u"])
+                try:
+                    import webbrowser
+                    if not webbrowser.open(it["u"]):
+                        raise RuntimeError
+                except Exception:
+                    print(it["u"])        # no browser: the URL is the fallback
             return
         # -r: feed body first (already paid for), network only as fallback
         try:

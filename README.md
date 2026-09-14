@@ -76,7 +76,8 @@ cp news $PREFIX/bin/ && chmod +x $PREFIX/bin/news
 sed -i "1s|.*|#!$(command -v python3)|" $PREFIX/bin/news
 ```
 
-Requires Python 3.8+. Nothing else.
+Requires Python 3.5 or newer. Nothing else — no pip, no compiler, no
+dependencies.
 
 Run `news --check` first — it fetches every configured feed and reports
 ok / empty / fail with item count, latency, and two sizes: `wire` (compressed,
@@ -294,6 +295,28 @@ content marker, and a full `ast.parse()` — because a truncated download is the
 normal failure on a lossy link and a half-written file still installs cleanly
 enough to break the command. The replace is atomic and the previous version is
 kept at `news.bak`.
+
+## Portability
+
+Pure standard library, Python 3.5+, verified with `vermin`. No f-strings, no
+`fromisoformat`, no `subprocess(capture_output=)` — the newest thing it needs is
+from 2015.
+
+- **Paths** honour `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_DATA_HOME` where
+  set, `%APPDATA%` / `%LOCALAPPDATA%` on Windows, and `~/.config` style
+  otherwise.
+- **Colour** is enabled on Windows by turning on VT processing, and dropped
+  automatically if that fails, if output is piped, or if `NO_COLOR` is set.
+- **`ping`** flags differ per platform: `-W` is seconds on Linux/BSD,
+  milliseconds on macOS, and Windows uses `-n`/`-w`. ICMP is optional anyway.
+- **Opening a link** tries `termux-open-url`, then the stdlib `webbrowser`,
+  then prints the URL.
+- **The installer** avoids `sed -i`, which is mutually incompatible between GNU
+  and BSD, and rewrites the shebang in Python instead. It picks the first
+  writable directory among `$PREFIX/bin`, `~/.local/bin`, `/usr/local/bin` and
+  `~/bin`, and tells you if it is not on your `PATH`.
+
+Not supported: Python 2, and Windows without a VT-capable console.
 
 ## Development
 
