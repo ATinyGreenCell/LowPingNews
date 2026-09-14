@@ -158,6 +158,12 @@ Hacker News Algolia API, or `epmc` for a Europe PMC REST search — one JSON
 request, no key, covering PubMed records and preprints. Edit the `query=` part
 of the Europe PMC URL to change what it tracks. Only `http`/`https` URLs are accepted.
 
+Optional `"timeout"` (seconds, default 10, max 60) sets how long to wait for a
+feed. Some endpoints build their output on demand — `connect.biorxiv.org` does,
+and the larger subjects can take twenty seconds — so those ship with
+`"timeout": 25`. The overall fetch deadline grows to fit the slowest source plus
+its retry, rather than capping everything at twenty seconds.
+
 Optional `"ttl"` (seconds) sets how long that feed is reused before refetching;
 the default is 900. It matters for feeds that send no `ETag` or `Last-Modified`,
 because those can't answer with a cheap 304 and must resend in full. `news

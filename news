@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "4.2"
+VERSION = "4.4"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -54,10 +54,12 @@ MAXPAR = 6                     # concurrent fetches; a phone radio is not a data
 ARTMAX = 200000                # per-article text ceiling
 UA = "news/1.0 (+termux)"
 
-def D_(i, n, u, c, k="rss", ttl=None):
+def D_(i, n, u, c, k="rss", ttl=None, timeout=None):
     d = {"id": i, "name": n, "url": u, "cats": c, "kind": k}
     if ttl:
         d["ttl"] = ttl
+    if timeout:
+        d["timeout"] = timeout
     return d
 
 
@@ -86,7 +88,7 @@ DEFAULTS = [
     # bio - preprints, no editorial layer at all
     D_("brxp", "bioRxiv plant",
        "https://connect.biorxiv.org/biorxiv_xml.php?subject=plant_biology", ["bio"],
-       ttl=HEAVY),
+       ttl=HEAVY, timeout=25),
     D_("epmc", "Europe PMC",
        "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
        "?query=%28plant%20AND%20%28synthetic%20biology%20OR%20transformation%29%29"
@@ -94,7 +96,7 @@ DEFAULTS = [
        ttl=HEAVY),
     D_("brxs", "bioRxiv synbio",
        "https://connect.biorxiv.org/biorxiv_xml.php?subject=synthetic_biology", ["bio"],
-       ttl=HEAVY),
+       ttl=HEAVY, timeout=25),
 ]
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -488,12 +490,14 @@ def load(src, fresh, bag):
     try:
         try:
             try:
-                raw, rh, wire, part = get(src["url"], extra=val, tap=tapper)
+                raw, rh, wire, part = get(src["url"], extra=val,
+                                          tap=tapper, t=src.get("timeout") or 10)
             except urllib.error.HTTPError:
                 raise                      # a real HTTP answer: do not retry
             except Exception:
                 time.sleep(0.4)            # transient drop on a weak signal
-                raw, rh, wire, part = get(src["url"], extra=val, tap=tapper)
+                raw, rh, wire, part = get(src["url"], extra=val,
+                                          tap=tapper, t=src.get("timeout") or 10)
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
@@ -562,7 +566,7 @@ def expected(srcs):
     return tot
 
 
-def progress_line(srcs, cols, want):
+def progress_line(srcs, cols, want, t0=None):
     """One-line status: real percentage when we know what the feeds usually cost."""
     got = sum(PROG.get(x["id"], 0) for x in srcs)
     done = [x for x in srcs if x["id"] in DONE]
@@ -572,8 +576,9 @@ def progress_line(srcs, cols, want):
     w_bar = max(6, min(14, cols - 30))
     fill = int(frac * w_bar)
     bar = "\u2588" * fill + "\u00b7" * (w_bar - fill)
-    txt = "  [%s] %d/%d %s%s" % (bar, len(done), len(srcs), kbs(got),
-                                 ("/~" + kbs(want)) if want else "")
+    el = (" %ds" % int(time.time() - t0)) if t0 else ""
+    txt = "  [%s] %d/%d %s%s%s" % (bar, len(done), len(srcs), kbs(got),
+                                   ("/~" + kbs(want)) if want else "", el)
     if live:
         txt += " " + ",".join(live[:2])
     return txt[:cols - 1]
@@ -726,7 +731,49 @@ def cat_cost(cat):
     return due, unknown
 
 
+def gps_fix(want_gps, timeout=50):
+    """Ask Termux for a fix. GPS is accurate but needs sky; network is instant
+    but coarse. Try the accurate one first and fall back rather than fail."""
+    import shutil, subprocess
+    if not shutil.which("termux-location"):
+        return None, ("termux-location not found - install the termux-api "
+                      "package AND the Termux:API app (F-Droid)")
+    order = ["gps", "network"] if want_gps else ["network", "gps"]
+    last = "no fix"
+    for p in order:
+        try:
+            o = subprocess.run(["termux-location", "-p", p],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=timeout)
+            j = json.loads(o.stdout.decode("utf-8", "replace") or "null")
+        except subprocess.TimeoutExpired:
+            last = "%s timed out after %ds" % (p, timeout)
+            continue
+        except Exception as e:
+            last = "%s failed (%s)" % (p, str(e)[:40])
+            continue
+        if j and j.get("latitude") is not None:
+            j["_provider"] = p
+            return j, None
+        last = "%s returned no fix" % p
+    return None, last + " - GPS needs open sky; try outdoors"
+
+
 def wx_locate(a):
+    if getattr(a, "gps", False):
+        sys.stderr.write("  locating (GPS can take ~30s outdoors)...\r")
+        sys.stderr.flush()
+        j, err = gps_fix(True)
+        sys.stderr.write(" " * 46 + "\r")
+        sys.stderr.flush()
+        if not j:
+            sys.exit("news: %s" % err)
+        d = {"lat": round(float(j["latitude"]), 4),
+             "lon": round(float(j["longitude"]), 4),
+             "label": getattr(a, "label", None),
+             "acc": j.get("accuracy"), "via": j.get("_provider")}
+        jwrite(WXLOC, d)
+        return d
     if getattr(a, "coords", None):
         try:
             la, lo = [float(x) for x in a.coords.replace(" ", "").split(",")]
@@ -763,8 +810,8 @@ def wx_fetch(loc, unit, fresh):
     fresh_enough = (not fresh and c.get("t")
                     and time.time() - c["t"] < WXTTL
                     and c.get("u") == unit
-                    and abs((c.get("lat") or 999) - loc["lat"]) < .05
-                    and abs((c.get("lon") or 999) - loc["lon"]) < .05)
+                    and abs((c.get("lat") or 999) - loc["lat"]) < .03
+                    and abs((c.get("lon") or 999) - loc["lon"]) < .03)
     if fresh_enough:
         return c["d"], 0, int(time.time() - c["t"]), False
     q = ("latitude=%s&longitude=%s&current=temperature_2m,apparent_temperature,"
@@ -817,9 +864,15 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     name, mark = WMO.get(int(cu.get("weather_code") or 0), ("Unknown", "??"))
     if not cu.get("is_day", 1) and mark in ("CL", "MC"):
         mark = "cl"
-    print(P["hdr"](loc.get("label") or "%.2f,%.2f" % (loc["lat"], loc["lon"])) +
+    print(P["hdr"](loc.get("label") or "%.3f,%.3f" % (loc["lat"], loc["lon"])) +
           D("  %s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"),
                                t0.strftime("%H:%M"))))
+    if loc.get("via"):
+        print(D("  %.4f,%.4f via %s%s" % (
+            loc["lat"], loc["lon"], loc["via"],
+            ", +/-%dm" % loc["acc"] if loc.get("acc") else "")))
+    elif loc.get("label"):
+        print(D("  %.3f,%.3f pinned" % (loc["lat"], loc["lon"])))
     temp = round(cu["temperature_2m"])
     tc = (P["cyn"] if temp <= 32 else P["grn"] if temp <= 80 else P["yel"])
     print("  " + B(tc("%d%s" % (temp, U))) +
@@ -885,9 +938,11 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
 def gather(srcs, fresh, on_feed=None):
     import threading
     want_total = expected(srcs)            # before any cache file is rewritten
+    slowest = max([x.get("timeout") or 10 for x in srcs] or [10])
+    deadline = max(DEADLINE, slowest * 2 + 6)   # one retry plus slack
     os.makedirs(CD, exist_ok=True)
     bag = {}
-    end = time.time() + DEADLINE
+    end = time.time() + deadline
     for i in range(0, len(srcs), MAXPAR):       # batches: 40 feeds != 40 sockets
         if time.time() >= end:
             break
@@ -898,7 +953,7 @@ def gather(srcs, fresh, on_feed=None):
             ths.append(t)
         show_prog = sys.stderr.isatty() and not os.environ.get("LPN_NO_PROGRESS")
         cols = cols_()
-        announced = set()
+        announced, t_started = set(), time.time()
         while time.time() < end and any(t.is_alive() for t in ths):
             if on_feed:
                 for x in srcs:             # announce in the main thread only
@@ -906,8 +961,8 @@ def gather(srcs, fresh, on_feed=None):
                         announced.add(x["id"])
                         on_feed(x, bag[x["id"]])
             elif show_prog:                # bar and stream would fight for the line
-                sys.stderr.write("\r" + progress_line(srcs, cols,
-                                                      want_total).ljust(cols - 1))
+                sys.stderr.write("\r" + progress_line(
+                    srcs, cols, want_total, t_started).ljust(cols - 1))
                 sys.stderr.flush()
             time.sleep(0.12)
         for t in ths:                      # join() is the real ceiling: socket
@@ -1066,6 +1121,10 @@ def sources(a):
             x["ttl"] = max(0, min(int(x.get("ttl") or TTL), 604800))
         except Exception:
             x["ttl"] = TTL
+        try:
+            x["timeout"] = max(3, min(int(x.get("timeout") or 10), 60))
+        except Exception:
+            x["timeout"] = 10
         c = x.get("cats")
         x["cats"] = [str(z) for z in c] if isinstance(c, list) and c else ["top"]
         ok.append(x)
@@ -1087,7 +1146,7 @@ def sources(a):
 
 
 BOOLF = {"-f": "fresh", "--fresh": "fresh", "--offline": "offline",
-         "--stream": "stream",
+         "--stream": "stream", "-g": "gps", "--gps": "gps",
          "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
          "-u": "unread", "--unread": "unread", "--ascii": "ascii",
@@ -1100,7 +1159,7 @@ VALF = {"-c": ("coords", str), "--coords": ("coords", str),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"stream": False, "coords": None, "label": None, "celsius": False,
+DEFAULTS_NS = {"gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
                "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
@@ -1167,6 +1226,8 @@ def main():
     p.add_argument("cat", nargs="?", metavar="CATEGORY",
                    help="top, world, science, tech, bio, all, signal, weather")
     p.add_argument("--check", action="store_true", help="test every feed URL")
+    p.add_argument("-g", "--gps", action="store_true",
+                   help="take a fresh GPS fix instead of the pinned location")
     p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
     p.add_argument("--label", help="name for the pinned location")
     p.add_argument("-C", "--celsius", action="store_true", help="weather in celsius")
