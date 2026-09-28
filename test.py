@@ -562,6 +562,87 @@ def t_tui_lists_reads_and_switches_category(env, srv):
     assert "SCIENCE" in out.upper(), "n did not switch category:\n%s" % out[-400:]
 
 
+def _page(srv, path, html):
+    raw = html if isinstance(html, bytes) else html.encode()
+
+    def handler(h):
+        h.send_response(200)
+        h.send_header("Content-Length", str(len(raw)))
+        h.end_headers()
+        h.wfile.write(raw)
+    srv.routes[path] = handler
+
+
+def _body(n, word="paragraph"):
+    return "".join(
+        "<p>Body %s %d with enough words to count as a real paragraph of an "
+        "article rather than a teaser or a caption line.</p>" % (word, i)
+        for i in range(n))
+
+
+@test
+def t_preprint_prefers_full_text_over_abstract(env, srv):
+    """bioRxiv serves an abstract at the bare link and the paper at .full."""
+    _page(srv, "/content/10.1101/2026.01.15.123456v1", "<html><body><article><h2>Abstract</h2>"
+          "<p>A short abstract describing the preprint in a single block of "
+          "text, as the landing page shows it to anyone visiting.</p>"
+          "</article></body></html>")
+    _page(srv, "/content/10.1101/2026.01.15.123456v1.full", "<html><body><article><h2>Abstract</h2><p>Short "
+          "abstract text repeated at the head of the full paper here.</p>"
+          "<h2>Introduction</h2>" + _body(6) + "<h2>Results</h2>" + _body(8) +
+          "<h2>Methods</h2>" + _body(6) + "<h2>Discussion</h2>" + _body(3) +
+          "</article></body></html>")
+    srv.feed("/f", [item("A preprint", link=srv.url("/content/10.1101/2026.01.15.123456v1"))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-r", "1")
+    assert "full article" in out, "did not report full text:\n%s" % out[:300]
+    assert "Results" in out or "Body paragraph" in out, "body missing"
+    paths = [p.split("?")[0] for p, _h in srv.seen]
+    assert "/content/10.1101/2026.01.15.123456v1.full" in paths, "never asked for the full text: %s" % paths
+
+
+@test
+def t_abstract_only_is_labelled_honestly(env, srv):
+    """No .full page (PDF-only preprints): say abstract, do not imply more."""
+    _page(srv, "/content/10.1101/2026.02.02.999999v1", "<html><body><article><h2>Abstract</h2>"
+          "<p>Only an abstract is published here for this particular preprint, "
+          "with no full text available to read on the web at all.</p>"
+          "</article></body></html>")
+    srv.feed("/f", [item("Abstract only preprint", link=srv.url("/content/10.1101/2026.02.02.999999v1"))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-r", "1")
+    assert "abstract only" in out, "an abstract was presented as an article:\n%s" % out[:300]
+    assert "full article" not in out
+
+
+@test
+def t_ordinary_article_counts_as_full(env, srv):
+    _page(srv, "/story", "<html><body><div class='article-main'>" + _body(11) +
+          "</div></body></html>")
+    srv.feed("/f", [item("An ordinary news story", link=srv.url("/story"))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-r", "1")
+    assert "full article" in out, "a complete news article was called partial:\n%s" % out[:300]
+
+
+@test
+def t_paywall_is_not_called_full(env, srv):
+    _page(srv, "/pay", "<html><body><article><p>Subscribers only. Sign in to "
+          "continue reading this article today.</p></article></body></html>")
+    srv.feed("/f", [item("Paywalled story", link=srv.url("/pay"))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-r", "1")
+    assert "full article" not in out, "a paywall teaser was called a full article"
+
+
 @test
 def t_version_is_consistent(env, srv):
     m = load()

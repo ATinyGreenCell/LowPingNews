@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "6.0"
+VERSION = "6.1"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -211,10 +211,11 @@ def have(k):
     return os.path.exists(apath(k))
 
 
-def store_article(k, txt):
+def store_article(k, txt, kind="abstract"):
     try:
         os.makedirs(ADIR, exist_ok=True)
         with open(apath(k), "w", encoding="utf-8") as fh:
+            fh.write("\x01kind:%s\n" % kind)
             fh.write(txt)
     except Exception:
         return
@@ -234,24 +235,107 @@ def store_article(k, txt):
             pass
 
 
+KINDNOTE = {
+    "full": ("full article", "grn"),
+    "offline-full": ("full article, saved copy", "grn"),
+    "abstract": ("abstract only - no full text available", "yel"),
+    "offline-abstract": ("abstract only, saved copy", "yel"),
+    "feed": ("feed summary only - no full text available", "yel"),
+}
+
+
+def kind_note(how):
+    return KINDNOTE.get(how, (how, "d"))
+
+
+def full_text_urls(u):
+    """Where a site keeps the whole article, best first.
+
+    bioRxiv and medRxiv serve an abstract at the bare link and the complete
+    paper at the same URL plus `.full`; asking for the bare link and calling
+    the result "the article" would be wrong.
+    """
+    lu = (u or "").lower()
+    base = (u or "").split("?")[0].split("#")[0].rstrip("/")
+    # bioRxiv and medRxiv use a DOI path ending in a version: .../10.1101/...v1
+    # Match the shape, not just the hostname, so mirrors work too.
+    if re.search(r"/content/10\.\d+/\S+v\d+$", base) or \
+       "biorxiv.org/content/" in lu or "medrxiv.org/content/" in lu:
+        if base.endswith(".full"):
+            return [base]
+        return [base + ".full", base]
+    if "europepmc.org/article/" in lu:
+        return [base + "#free-full-text", base]
+    return [base or u]
+
+
+def looks_complete(txt, url):
+    """Full paper, or just an abstract? Judged, not guessed at random.
+
+    A bioRxiv `.full` page carries the body sections; an abstract page is one
+    block of a few hundred words. Elsewhere, length plus paragraph count is
+    the only signal available without a site-specific parser.
+    """
+    if not txt:
+        return False
+    lu = (url or "").lower()
+    paras = [p for p in txt.split("\n\n") if len(p) > 80]
+    if "biorxiv.org" in lu or "medrxiv.org" in lu:
+        # the body of a paper names its own sections
+        marks = sum(1 for w in ("introduction", "results", "methods", "discussion",
+                                "materials and methods", "conclusion")
+                    if w in txt[:12000].lower())
+        return marks >= 2 and len(txt) > 4000
+    # a news article runs a few thousand characters over several paragraphs;
+    # a paywall teaser or abstract is one or two blocks
+    return len(txt) > 1200 and len(paras) >= 4
+
+
 def fetch_article(it):
-    """-> (text, bytes_over_wire, source). Feed body and offline copies are free."""
+    """-> (text, bytes_over_wire, source). Feed body and offline copies are free.
+
+    source is one of: feed, offline-full, offline-abstract, full, abstract,
+    nolink. The caller shows the reader which one they got.
+    """
     k = key(it["ti"])
-    if it.get("c"):
-        return it["c"], 0, "feed"
     if have(k):
         try:
-            return open(apath(k), encoding="utf-8").read(), 0, "offline"
+            blob = open(apath(k), encoding="utf-8").read()
         except OSError:
-            pass
+            blob = ""
+        if blob:
+            kind, txt = _split_kind(blob)
+            return txt, 0, "offline-" + kind
     if not it.get("u"):
+        if it.get("c"):
+            return it["c"], 0, "feed"
         return "", 0, "nolink"
-    raw, _, wire, _p = get(it["u"], 20, cap=PAGECAP)
-    txt = extract(raw)
-    txt = txt[:ARTMAX]
-    if txt:
-        store_article(k, txt)
-    return txt, wire, "web"
+    best, best_url, wire_tot = "", "", 0
+    for u in full_text_urls(it["u"]):
+        try:
+            raw, _, wire, _p = get(u, 20, cap=PAGECAP)
+        except Exception:
+            continue
+        wire_tot += wire
+        txt = extract(raw)[:ARTMAX]
+        if len(txt) > len(best):
+            best, best_url = txt, u
+        if looks_complete(txt, u):
+            break                          # got the paper; stop paying for more
+    if not best and it.get("c"):
+        return it["c"], wire_tot, "feed"
+    kind = "full" if looks_complete(best, best_url) else "abstract"
+    if best:
+        store_article(k, best, kind)
+    return best, wire_tot, kind
+
+
+def _split_kind(blob):
+    """Stored articles carry their kind on the first line."""
+    if blob.startswith("\x01kind:"):
+        head, _, rest = blob.partition("\n")
+        return head.split(":", 1)[1].strip() or "abstract", rest
+    return "abstract", blob
 
 
 _RD = [None]
@@ -1714,12 +1798,13 @@ def tui_main(scr, a, cats):
         try:
             txt, _nb, how = fetch_article(it)
         except Exception as e:
-            txt, how = "", "(could not fetch: %s)" % str(e)[:60]
+            txt, how = "", "could not fetch: %s" % str(e)[:60]
         if not txt:
             txt = it.get("s") or "(no text available)"
-        if how:
-            out.append("[%s]" % how)
-            out.append("")
+            if how in ("full", "abstract"):
+                how = "feed"
+        out.append("[%s]" % kind_note(how)[0])
+        out.append("")
         for para in txt.split("\n"):
             if not para.strip():
                 out.append("")
@@ -1936,9 +2021,10 @@ def cmd_pick(a, P, D, pick):
     Pr = pal(a.color)
     for ln in textwrap.wrap(it["ti"], max(20, cols - 2)) or [""]:
         print(Pr["b"](ln))
+    note, col = kind_note(how)
     print(Pr["d"]("  %s %s %s" % (
         it.get("src", "?"), bul_(a), age(int(time.time()) - it["d"])
-        if it.get("d") else "?")) + "\n")
+        if it.get("d") else "?")) + Pr["d"](" %s " % bul_(a)) + Pr[col](note) + "\n")
     for para in (body or "").split("\n\n"):
         print(textwrap.fill(para, max(20, cols - 2), initial_indent="  ",
                             subsequent_indent="  ") + "\n")

@@ -404,6 +404,28 @@ If an interactive reading mode is ever wanted, `curses` is in the standard
 library, imports in ~12 ms, and would slot in behind a flag without touching
 the default path or adding a dependency.
 
+## Reading an article
+
+Pressing enter in `--tui`, or `news -r N`, fetches the article itself rather
+than the feed blurb, and says which of three things you actually got:
+
+```
+  full article
+  abstract only - no full text available
+  feed summary only - no full text available
+```
+
+bioRxiv and medRxiv publish an abstract at the link in the feed and the whole
+paper at the same address plus `.full`, so that is tried first and the abstract
+page is only used as a fallback — matched on the DOI path shape, so mirrors work
+too. For ordinary sites the page is the article. Whether what came back is the
+whole thing is a judgement: a preprint counts as complete when it carries its
+own section headings and real length, anything else when it runs past a few
+paragraphs. A paywall teaser fails both and is never called a full article.
+
+Saved copies remember which kind they were, so a re-read does not claim more
+than the first fetch found.
+
 ## Interactive mode
 
 ```sh
