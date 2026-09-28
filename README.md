@@ -386,6 +386,42 @@ lpn release 4.5     bump, install, test, commit, tag, gh release
 containing files this project does not own. `ship` and `release` refuse to
 commit anything outside the files this project owns. `release` is idempotent.
 
+## Why not a TUI, or TypeScript
+
+Measured, not assumed. Importing Textual costs ~207 ms and Rich ~57 ms before
+any work happens; the whole program currently runs in ~47 ms. Together they pull
+13.5 MB across 8 packages and require Python 3.9, against this program's 86 KB,
+zero dependencies and 3.5 floor. Node would mean a ~50 MB runtime for a tool
+whose entire output is text.
+
+The deeper reason is that this is a filter, not an application. `news -q term`,
+`news | head`, `--stream`, terminal scrollback and text selection all work
+because output is an ordinary stream. A full-screen TUI takes the terminal over
+and loses every one of those — a poor trade on a phone, where scrollback and
+copy/paste are how you actually read.
+
+If an interactive reading mode is ever wanted, `curses` is in the standard
+library, imports in ~12 ms, and would slot in behind a flag without touching
+the default path or adding a dependency.
+
+## Interactive mode
+
+```sh
+lowpingnews --tui
+```
+
+  j/k move    enter read    b back    s star    o open
+  n/p category    r refresh    q quit
+
+Built on `curses`, which is in the standard library: no dependency, ~12 ms to
+import, and it only loads when you ask for it. The default path is untouched,
+so `news | head`, `-q` and `--stream` keep working as before.
+
+`curses` is POSIX-only. On Linux, macOS and Termux it is present; on Windows it
+needs `pip install windows-curses`, and `--tui` says so rather than failing
+obscurely. Tab is deliberately not the category key — terminal emulators and
+phone keyboards swallow it before curses sees it, so `n`/`p` are used instead.
+
 ## Tests
 
 ```sh

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """news - ultra-light terminal headlines. Parallel gzipped fetch, cached for offline."""
-import datetime as dt, json, os, re, sys, time
+import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "5.8"
+VERSION = "6.0"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -1131,15 +1131,26 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     # number is tonight's sunset, not tomorrow's sunrise
     cand = [(ts, lbl) for lbl, key_ in (("rises", "sunrise"), ("sets", "sunset"))
             for ts in (dy.get(key_) or [])[:3] if ts and ts > cu["time"]]
-    sun = ""
+    sun = sun_short = ""
     if cand:
         ts, lbl = min(cand)
         mins = int((ts - cu["time"]) / 60)
+        sun_short = D("   %s %s" % (lbl, L(ts).strftime("%H:%M")))
         if mins < 180:                      # imminent: say how long is left
             sun = P["yel"]("   %s %s in %dh%02dm" % (
                 lbl, L(ts).strftime("%H:%M"), mins // 60, mins % 60))
         else:
-            sun = D("   %s %s" % (lbl, L(ts).strftime("%H:%M")))
+            sun = sun_short
+    base = "  %s %d%s%s   RH %d%%" % (
+        wd, spd, "mph" if a.unit == "fahrenheit" else "km/h",
+        (" g%d" % round(gust)) if gtxt else "",
+        round(cu.get("relative_humidity_2m") or 0))
+    # the countdown form is the long one; drop it, then the whole clause,
+    # rather than overflowing a narrow screen
+    for cand in (sun, sun_short, ""):
+        if len(base) + len(_plain(cand)) <= cols:
+            sun = cand
+            break
     print(D("  %s %d%s" % (wd, spd, "mph" if a.unit == "fahrenheit" else "km/h"))
           + gtxt + D("   RH %d%%" % round(cu.get("relative_humidity_2m") or 0)) + sun)
     n = min(24, len(h["time"]), max(1, cols - 4))
@@ -1309,6 +1320,11 @@ def agepaint(sec, P):
     return P["d"]
 
 
+def _plain(s):
+    """Visible width: colour codes take no columns."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
 def kbs(n):
     """Compact, fixed-width-ish: a phone terminal is 40 columns."""
     if n < 1024:
@@ -1439,7 +1455,7 @@ def sources(a):
     return sel
 
 
-BOOLF = {"-f": "fresh", "--fresh": "fresh", "--offline": "offline",
+BOOLF = {"--tui": "tui", "-f": "fresh", "--fresh": "fresh", "--offline": "offline",
          "--stream": "stream", "-g": "gps", "--gps": "gps", "--ip": "iploc",
          "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
@@ -1454,7 +1470,7 @@ VALF = {"-p": ("place", str), "--place": ("place", str),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
+DEFAULTS_NS = {"tui": False, "place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
                "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
@@ -1525,6 +1541,8 @@ def main():
                    help="take a fresh device location fix")
     p.add_argument("--ip", dest="iploc", action="store_true",
                    help="locate by IP address (city-level, tells a third party)")
+    p.add_argument("--tui", action="store_true",
+                   help="interactive reader (curses; POSIX only)")
     p.add_argument("-p", "--place", metavar="NAME",
                    help="locate by town or city name")
     p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
@@ -1562,6 +1580,512 @@ def main():
     return run(a)
 
 
+def open_url(u):
+    """Hand a link to the platform. False means nothing could open it."""
+    u = safe_url(u)
+    if not u:
+        return False
+    import shutil, subprocess
+    if shutil.which("termux-open-url"):
+        subprocess.run(["termux-open-url", u])
+        return True
+    try:
+        import webbrowser
+        return bool(webbrowser.open(u))
+    except Exception:
+        return False
+
+
+def tui_available():
+    """curses is POSIX-only; on Windows it needs a third-party package."""
+    try:
+        import curses                     # noqa: F401
+        return True, ""
+    except Exception as e:
+        if os.name == "nt":
+            return False, ("the interactive view needs curses, which is not "
+                           "bundled on Windows.\n  pip install windows-curses")
+        return False, "curses is unavailable here (%s)" % str(e)[:50]
+
+
+def _tui_rows(a, fresh):
+    """Same fetch path the list view uses: gather() fills a bag of 5-tuples,
+    then stale cache backfills anything the deadline missed."""
+    want = sources(a)                      # already filtered by a.cat
+    if not want:
+        return []
+    bag = gather(want, fresh)
+    for x in want:
+        got = bag.get(x["id"])
+        if got is not None and got[2] not in (-1, -2):
+            continue
+        c_ = jread("%s/%s.json" % (CD, x["id"]), {})
+        if c_.get("items"):
+            bag[x["id"]] = (c_["items"], 0,
+                            max(1, int(time.time() - (c_.get("t") or 0))), 0, 0)
+    out = []
+    for x in want:
+        items = (bag.get(x["id"]) or ([],))[0]
+        for it in items:
+            out.append((it, x))
+    out.sort(key=lambda r: -when_sort(r[0]))
+    seen, rows = set(), []
+    for it, x in out:
+        k = key(it["ti"])
+        if k in seen:
+            continue
+        seen.add(k)
+        rows.append((it, x))
+    return rows[:STORECAP]
+
+
+def tui_main(scr, a, cats):
+    import curses
+    curses.curs_set(0)
+    scr.keypad(True)
+    colour = False
+    try:
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            for i in range(1, 7):
+                curses.init_pair(i, i, -1)
+            colour = True
+    except Exception:
+        colour = False
+
+    def C(n, bold=False):
+        if not colour:
+            return curses.A_BOLD if bold else curses.A_NORMAL
+        at = curses.color_pair(n)
+        return at | curses.A_BOLD if bold else at
+
+    ci = cats.index(a.cat) if (a.cat or "") in cats else 0
+    rows = _tui_rows(a, False)
+    st = state()
+    sel, top, mode, body, bscroll, msg = 0, 0, "list", [], 0, ""
+
+    def draw():
+        scr.erase()
+        h, w = scr.getmaxyx()
+        hdr = " %s  %d items " % (cats[ci].upper(), len(rows))
+        scr.addnstr(0, 0, hdr.ljust(w - 1), w - 1, C(6, True))
+        if mode == "list":
+            if not rows:
+                scr.addnstr(2, 2, "nothing to show - press r to refresh",
+                            max(1, w - 3), C(4))
+            for n in range(h - 2):
+                idx = top + n
+                if idx < 0 or idx >= len(rows):
+                    break
+                it, s_ = rows[idx]
+                rd = key(it["ti"]) in st["read"]
+                sd = any(key(x["ti"]) == key(it["ti"]) for x in st["star"])
+                secs = int(time.time()) - (it.get("d") or 0)
+                if not it.get("d") or secs < -3600:
+                    stamp = "?"
+                elif secs < 0:
+                    stamp = "just now"
+                else:
+                    stamp = age(secs)
+                mark = "*" if sd else (" " if rd else "\u2022")
+                line = "%s %-9s %-7s %s" % (mark, s_["name"][:9], stamp[:7],
+                                            it["ti"])
+                at = C(0) if rd else C(7 if not colour else 0, not rd)
+                if idx == sel:
+                    at = curses.A_REVERSE
+                scr.addnstr(n + 1, 0, line.ljust(w - 1), w - 1, at)
+        else:
+            for n in range(h - 2):
+                if bscroll + n >= len(body):
+                    break
+                scr.addnstr(n + 1, 0, body[bscroll + n][:w - 1], w - 1)
+        keys = (" j/k move  enter read  s star  o open  r refresh  n/p cat  q quit"
+                if mode == "list" else
+                " j/k scroll  b back  s star  o open  q quit")
+        scr.addnstr(h - 1, 0, (msg or keys).ljust(w - 1), w - 1, C(4))
+        scr.refresh()
+
+    def wrap_article(it):
+        h, w = scr.getmaxyx()
+        width = max(20, min(w - 2, 100))
+        out = [it["ti"], ""]
+        txt, how = "", ""
+        try:
+            txt, _nb, how = fetch_article(it)
+        except Exception as e:
+            txt, how = "", "(could not fetch: %s)" % str(e)[:60]
+        if not txt:
+            txt = it.get("s") or "(no text available)"
+        if how:
+            out.append("[%s]" % how)
+            out.append("")
+        for para in txt.split("\n"):
+            if not para.strip():
+                out.append("")
+                continue
+            line = ""
+            for word in para.split():
+                if len(line) + len(word) + 1 > width:
+                    out.append(line)
+                    line = word
+                else:
+                    line = (line + " " + word).strip()
+            out.append(line)
+        out += ["", it.get("u") or ""]
+        return out
+
+    while True:
+        draw()
+        msg = ""
+        try:
+            c = scr.getch()
+        except KeyboardInterrupt:
+            break
+        h, _w = scr.getmaxyx()
+        page = max(1, h - 3)
+        if c in (ord("q"), 27):
+            if mode == "read":
+                mode = "list"
+                continue
+            break
+        if mode == "list":
+            last = max(0, len(rows) - 1)     # empty list: stay at 0, never -1
+            if c in (ord("j"), curses.KEY_DOWN):
+                sel = min(last, sel + 1)
+            elif c in (ord("k"), curses.KEY_UP):
+                sel = max(0, sel - 1)
+            elif c in (curses.KEY_NPAGE, ord(" ")):
+                sel = min(last, sel + page)
+            elif c == curses.KEY_PPAGE:
+                sel = max(0, sel - page)
+            elif c in (ord("\n"), curses.KEY_ENTER, 10, 13):
+                if rows:
+                    it = rows[sel][0]
+                    msg = " fetching..."
+                    draw()
+                    body, bscroll, mode = wrap_article(it), 0, "read"
+                    k = key(it["ti"])
+                    if k not in st["read"]:
+                        st["read"].append(k)
+                        state(st)
+            elif c == ord("r"):
+                msg = " refreshing..."
+                draw()
+                rows, sel, top = _tui_rows(a, True), 0, 0
+            elif c in (ord("n"), ord("p"), 9):
+                # letters, not Tab: terminal emulators and phone keyboards
+                # swallow Tab before curses ever sees it
+                ci = (ci + (-1 if c == ord("p") else 1)) % len(cats)
+                a.cat = cats[ci]
+                msg = " loading %s..." % cats[ci]
+                draw()
+                rows, sel, top = _tui_rows(a, False), 0, 0
+            elif c == ord("s") and rows:
+                it = rows[sel][0]
+                k = key(it["ti"])
+                keep = [x for x in st["star"] if key(x["ti"]) != k]
+                if len(keep) == len(st["star"]):
+                    keep.append(it)
+                    msg = " starred"
+                else:
+                    msg = " unstarred"
+                st["star"] = keep[-STARCAP:]
+                state(st)
+            elif c == ord("o") and rows:
+                u = rows[sel][0].get("u")
+                if u:
+                    open_url(u)
+                    msg = " opened"
+            sel = max(0, min(sel, max(0, len(rows) - 1)))
+            if sel < top:
+                top = sel
+            if sel >= top + (h - 2):
+                top = sel - (h - 3)
+            top = max(0, min(top, max(0, len(rows) - 1)))
+        else:
+            if c in (ord("j"), curses.KEY_DOWN):
+                bscroll = min(max(0, len(body) - 1), bscroll + 1)
+            elif c in (ord("k"), curses.KEY_UP):
+                bscroll = max(0, bscroll - 1)
+            elif c in (curses.KEY_NPAGE, ord(" ")):
+                bscroll = min(max(0, len(body) - 1), bscroll + page)
+            elif c == curses.KEY_PPAGE:
+                bscroll = max(0, bscroll - page)
+            elif c == ord("b"):
+                mode = "list"
+
+
+def cmd_tui(a, P, D):
+    ok, why = tui_available()
+    if not ok:
+        sys.exit("news: %s" % why)
+    if not sys.stdout.isatty():
+        sys.exit("news: --tui needs a terminal (this looks like a pipe)")
+    import curses
+    os.environ["LPN_NO_PROGRESS"] = "1"     # the progress bar would draw over us
+    was, a.cat = a.cat, "all"              # sources() filters by a.cat
+    every = sources(a)
+    a.cat = was
+    cats = sorted({str(c).lower() for x in every for c in x.get("cats", [])}) or ["top"]
+    a.cat = (a.cat or "top").lower()
+    if a.cat not in cats:
+        a.cat = cats[0]
+    # stderr would draw over the curses screen, but discarding it would hide
+    # crashes: capture instead, and replay once the screen is released
+    buf = io.StringIO()
+    real_err, sys.stderr = sys.stderr, buf
+    try:
+        curses.wrapper(tui_main, a, cats)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stderr = real_err
+        held = buf.getvalue().strip()
+        if held:
+            sys.stderr.write(held + "\n")
+    return
+
+
+def cmd_update(a, P, D):
+    url = a.update or os.environ.get("NEWS_UPDATE_URL", "")
+    uf = CFD + "/update.url"
+    if not url and os.path.exists(uf):
+        url = open(uf, encoding="utf-8").read().strip()
+    if not url:
+        sys.exit("news: no update URL. Set one once:\n"
+                 "  news --update https://.../news")
+    me = os.path.realpath(sys.argv[0])
+    if not os.access(me, os.W_OK):
+        sys.exit("news: %s is not writable" % me)
+    try:
+        raw, _, wire, _p = get(url, 30, cap=PAGECAP)
+    except Exception as e:
+        sys.exit("news: download failed - %s" % str(e)[:70])
+    txt = raw.decode("utf-8", "replace")
+    # verify before overwriting ourselves: truncated downloads are the
+    # normal failure mode on a lossy link, and a half-file still "installs"
+    if len(raw) < 8000 or "ultra-light headlines" not in txt:
+        sys.exit("news: that does not look like news (%s) - not installing" % kbs(len(raw)))
+    try:
+        import ast
+        ast.parse(txt)
+    except SyntaxError as e:
+        sys.exit("news: downloaded file does not parse (line %s) - not installing"
+                 % e.lineno)
+    new = "?"
+    for ln in txt.splitlines()[:40]:
+        if ln.startswith("VERSION = "):
+            new = ln.split("=", 1)[1].strip().strip('"\'')
+    lines = txt.splitlines(True)
+    if lines and lines[0].startswith("#!"):
+        lines[0] = "#!%s\n" % (sys.executable or "/usr/bin/env python3")
+    tmp = me + ".new"
+    open(tmp, "w", encoding="utf-8").write("".join(lines))
+    os.chmod(tmp, 0o755)
+    try:
+        shutil_copy(me, me + ".bak")
+    except Exception:
+        pass
+    os.replace(tmp, me)                      # atomic: never a half-written news
+    print(D("  updated %s -> %s %s %s %s backup at %s.bak"
+            % (VERSION, new, bul_(a), kbs(wire), bul_(a),
+               os.path.basename(me))))
+    if not os.path.exists(uf) or open(uf, encoding="utf-8").read().strip() != url:
+        os.makedirs(CFD, exist_ok=True)
+        open(uf, "w", encoding="utf-8").write(url + "\n")
+    return
+
+
+def cmd_pick(a, P, D, pick):
+    try:
+        last = json.load(open(LAST, encoding="utf-8"))
+    except Exception:
+        sys.exit("news: nothing listed yet - run `news` first")
+    if not 1 <= pick <= len(last):
+        sys.exit("news: pick 1-%d" % len(last))
+    it = last[pick - 1]
+    st = state()
+    if a.star:
+        k = key(it["ti"])
+        keep = [x for x in st["star"] if key(x["ti"]) != k]
+        on = len(keep) == len(st["star"])
+        st["star"] = (keep + ([it] if on else []))[-STARCAP:]
+        state(st)
+        print(D("  %s %s" % ("saved" if on else "unsaved", it["ti"][:50])))
+        return
+    if key(it["ti"]) not in st["read"]:
+        st["read"].append(key(it["ti"]))
+        state(st)
+    if a.open:
+        if not open_url(it["u"]):
+            print(it["u"])            # no browser: the URL is the fallback
+        return
+    # -r: feed body first (already paid for), network only as fallback
+    try:
+        cols = min(os.get_terminal_size().columns, 100)
+    except Exception:
+        cols = 46
+    try:
+        body, nb, how = fetch_article(it)
+    except Exception as e:
+        sys.exit("news: fetch failed - %s" % str(e)[:60])
+    if how == "nolink":
+        sys.exit("news: no link and no text in feed")
+    import textwrap
+    Pr = pal(a.color)
+    for ln in textwrap.wrap(it["ti"], max(20, cols - 2)) or [""]:
+        print(Pr["b"](ln))
+    print(Pr["d"]("  %s %s %s" % (
+        it.get("src", "?"), bul_(a), age(int(time.time()) - it["d"])
+        if it.get("d") else "?")) + "\n")
+    for para in (body or "").split("\n\n"):
+        print(textwrap.fill(para, max(20, cols - 2), initial_indent="  ",
+                            subsequent_indent="  ") + "\n")
+    if not body:
+        print(D("  no readable paragraphs - likely paywalled or JS-rendered"))
+    print(D("  %s" % ({"feed": "from feed, 0B over the wire",
+                       "offline": "from offline store, 0B over the wire"}
+                      .get(how, "fetched %s, stored offline" % kbs(nb)))))
+    return
+
+
+def cmd_download(a, P, D):
+    try:
+        last = json.load(open(LAST, encoding="utf-8"))
+    except Exception:
+        sys.exit("news: nothing listed yet - run `news` first")
+    if a.download.strip().lower() == "all":
+        want = list(range(1, len(last) + 1))
+    else:
+        try:
+            want = [int(x) for x in a.download.replace(" ", "").split(",") if x]
+        except ValueError:
+            sys.exit("news: -d takes 1,3,5 or all")
+    cap_ = max(1024, a.budget * 1024) if a.budget else DLBUDGET
+    tot, got, free = 0, 0, 0
+    for i in want:
+        if not 1 <= i <= len(last):
+            print(D("  %2d skipped - out of range" % i))
+            continue
+        it = last[i - 1]
+        if tot >= cap_ and not (it.get("c") or have(key(it["ti"]))):
+            print(D("  stopped before %d - budget %s spent (--budget KB to raise)"
+                    % (i, kbs(tot))))
+            break                       # check before spending, so counts stay true
+        try:
+            txt, nb, how = fetch_article(it)
+        except Exception as e:
+            print(D("  %2d failed   %s" % (i, str(e)[:40])))
+            continue
+        tot += nb
+        if how in ("feed", "offline"):
+            free += 1
+        if txt:
+            got += 1
+        Pd = pal(a.color)
+        tag_ = (Pd["grn"]("%-6s" % "free") if not nb
+                else (Pd["yel"] if nb < 102400 else Pd["red"])("%-6s" % kbs(nb)))
+        print("  %s %s %s %s" % (Pd["d"]("%2d" % i), tag_,
+                                 Pd["d"]("%-7s" % how),
+                                 it["ti"][:max(10, cols_() - 21)]))
+    print()
+    wrapout("%d/%d stored %s %s over the wire%s"
+            % (got, len(want), bul_(a), kbs(tot),
+               "" if not free else " %s %d already had text" % (bul_(a), free)),
+            pal(a.color), cols_())
+    return
+
+
+def cmd_signal(a, P, D):
+    st_ = net_stats()
+    W = cols_()
+    # verdict first: the answer to "should I pull now" belongs on line one
+    probes, verdict, vc = [], "unknown", P["d"]
+    hosts = []
+    for x in sources(argparse_ns({"only": None, "cat": "all"})):
+        hp = hostport(x["url"])
+        if hp[0] and hp not in hosts:
+            hosts.append(hp)
+    probes = probe(hosts[:2])
+    reach = [r for r in probes if r["tcp"] is not None]
+    if probes and not reach:
+        verdict, vc = "offline", P["red"]
+    elif st_:
+        if st_["rate"] >= 90 and st_["bps"] > 20000:
+            verdict, vc = "good", P["grn"]
+        elif st_["rate"] >= 60:
+            verdict, vc = "usable", P["yel"]
+        else:
+            verdict, vc = "poor", P["red"]
+    elif reach:
+        verdict, vc = "reachable", P["yel"]
+    print(P["hdr"]("SIGNAL") + "  " + vc(verdict))
+
+    for r_ in probes:
+        h = r_["host"].split(".")
+        short = r_["host"]
+        if len(h) > 3 and not r_["host"].replace(".", "").isdigit():
+            short = ".".join(h[-3:])   # trim subdomains, never an IP literal
+        if r_["tcp"] is None:
+            print("  %-7s %s %s" % ("link", P["red"]("%9s" % "no route"),
+                                    D(short[:W - 20])))
+            continue
+        tc = (P["grn"] if r_["tcp"] < 150 else
+              P["yel"] if r_["tcp"] < 500 else P["red"])
+        dc = (D if (r_["dns_cold"] or 0) < 120 else P["yel"])
+        note = " proxied?" if (r_["tcp"] < 2 and not r_["host"].startswith(
+            ("127.", "10.", "192.168."))) else ""
+        print("  %-7s %s %s  %s%s" % (
+            "link", tc("%5dms" % r_["tcp"]), dc("%4dms dns" % (r_["dns_cold"] or 0)),
+            D(short[:W - 26]), P["yel"](note)))
+    ic = icmp(hosts[0][0]) if hosts else None
+    if ic:
+        print("  %-7s %s %s" % ("", D("%5.0fms" % (ic["avg"] or 0)),
+              D("icmp, %.0f%% loss" % ic["loss"])))
+
+    if st_:
+        rc = (P["grn"] if st_["rate"] >= 90 else
+              P["yel"] if st_["rate"] >= 60 else P["red"])
+        print("  %-7s %s %s %s" % (
+            "rate", P["b"]("%8s/s" % kbs(int(st_["bps"]))),
+            D("%dms" % st_["ms"]),
+            rc("%.0f%% ok" % st_["rate"]) + D(" of %d" % st_["n"])))
+
+    # the actionable part: what a refresh costs, and how long it would take
+    allsrc = sources(argparse_ns({"only": None, "cat": "all"}))
+    unmeasured = sum(1 for x in allsrc
+                     if jread("%s/%s.json" % (CD, x["id"]), {}).get("w") is None)
+    shown = 0
+    for cat in ("top", "science", "tech", "bio", "world"):
+        due, _unk = cat_cost(cat)
+        if not due:                    # within ttl: nothing to decide about
+            continue
+        eta = (" ~%.0fs" % (due / st_["bps"])) if (st_ and st_["bps"] > 500) else ""
+        cc = (P["grn"] if due < 20480 else
+              P["yel"] if due < 81920 else P["red"])
+        print("  %-7s %s%s" % (cat, cc("%8s" % kbs(due)), D(eta)))
+        shown += 1
+    if not shown:
+        if unmeasured >= len(allsrc):   # never fetched is not the same as fresh
+            print("  %-7s %s" % ("cold", D("nothing cached yet, first pull "
+                                           "fetches everything")))
+        else:
+            print("  %-7s %s" % ("fresh", D("all feeds within ttl, 0B to refresh")))
+    if unmeasured:
+        print("  %-7s %s" % ("", D("%d feed%s not measured yet" % (
+            unmeasured, "" if unmeasured == 1 else "s"))))
+
+    days = sorted((st_ or {}).get("day", {}).items())[-7:]
+    if days:
+        today_ = (st_ or {})["day"].get(dt.date.today().isoformat(), 0)
+        print("  %-7s %s %s" % ("data", D("%8s today" % kbs(today_)),
+              D("%s over %dd" % (kbs(sum(v_ for _, v_ in days)), len(days)))))
+    if verdict == "poor":
+        print(D("  tip: lowpingnews --light skips the heavy feeds"))
+    return
+
+
 def run(a):
     a.unit = "celsius" if getattr(a, "celsius", False) else "fahrenheit"
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -1594,54 +2118,11 @@ def run(a):
     P = pal(a.color)
     D, B, C = P["d"], P["b"], P["cyn"]
 
+    if getattr(a, "tui", False):
+        return cmd_tui(a, P, D)
+
     if a.update is not None:
-        url = a.update or os.environ.get("NEWS_UPDATE_URL", "")
-        uf = CFD + "/update.url"
-        if not url and os.path.exists(uf):
-            url = open(uf, encoding="utf-8").read().strip()
-        if not url:
-            sys.exit("news: no update URL. Set one once:\n"
-                     "  news --update https://.../news")
-        me = os.path.realpath(sys.argv[0])
-        if not os.access(me, os.W_OK):
-            sys.exit("news: %s is not writable" % me)
-        try:
-            raw, _, wire, _p = get(url, 30, cap=PAGECAP)
-        except Exception as e:
-            sys.exit("news: download failed - %s" % str(e)[:70])
-        txt = raw.decode("utf-8", "replace")
-        # verify before overwriting ourselves: truncated downloads are the
-        # normal failure mode on a lossy link, and a half-file still "installs"
-        if len(raw) < 8000 or "ultra-light headlines" not in txt:
-            sys.exit("news: that does not look like news (%s) - not installing" % kbs(len(raw)))
-        try:
-            import ast
-            ast.parse(txt)
-        except SyntaxError as e:
-            sys.exit("news: downloaded file does not parse (line %s) - not installing"
-                     % e.lineno)
-        new = "?"
-        for ln in txt.splitlines()[:40]:
-            if ln.startswith("VERSION = "):
-                new = ln.split("=", 1)[1].strip().strip('"\'')
-        lines = txt.splitlines(True)
-        if lines and lines[0].startswith("#!"):
-            lines[0] = "#!%s\n" % (sys.executable or "/usr/bin/env python3")
-        tmp = me + ".new"
-        open(tmp, "w", encoding="utf-8").write("".join(lines))
-        os.chmod(tmp, 0o755)
-        try:
-            shutil_copy(me, me + ".bak")
-        except Exception:
-            pass
-        os.replace(tmp, me)                      # atomic: never a half-written news
-        print(D("  updated %s -> %s %s %s %s backup at %s.bak"
-                % (VERSION, new, bul_(a), kbs(wire), bul_(a),
-                   os.path.basename(me))))
-        if not os.path.exists(uf) or open(uf, encoding="utf-8").read().strip() != url:
-            os.makedirs(CFD, exist_ok=True)
-            open(uf, "w", encoding="utf-8").write(url + "\n")
-        return
+        return cmd_update(a,P,D)
 
     if a.list:
         allsrc = sources(argparse_ns({"only": None, "cat": "all"}))
@@ -1662,110 +2143,10 @@ def run(a):
 
     pick = a.open or a.read or a.star
     if pick is not None:
-        try:
-            last = json.load(open(LAST, encoding="utf-8"))
-        except Exception:
-            sys.exit("news: nothing listed yet - run `news` first")
-        if not 1 <= pick <= len(last):
-            sys.exit("news: pick 1-%d" % len(last))
-        it = last[pick - 1]
-        st = state()
-        if a.star:
-            k = key(it["ti"])
-            keep = [x for x in st["star"] if key(x["ti"]) != k]
-            on = len(keep) == len(st["star"])
-            st["star"] = (keep + ([it] if on else []))[-STARCAP:]
-            state(st)
-            print(D("  %s %s" % ("saved" if on else "unsaved", it["ti"][:50])))
-            return
-        if key(it["ti"]) not in st["read"]:
-            st["read"].append(key(it["ti"]))
-            state(st)
-        if a.open:
-            import shutil, subprocess
-            if shutil.which("termux-open-url"):
-                subprocess.run(["termux-open-url", it["u"]])
-            else:
-                try:
-                    import webbrowser
-                    if not webbrowser.open(it["u"]):
-                        raise RuntimeError
-                except Exception:
-                    print(it["u"])        # no browser: the URL is the fallback
-            return
-        # -r: feed body first (already paid for), network only as fallback
-        try:
-            cols = min(os.get_terminal_size().columns, 100)
-        except Exception:
-            cols = 46
-        try:
-            body, nb, how = fetch_article(it)
-        except Exception as e:
-            sys.exit("news: fetch failed - %s" % str(e)[:60])
-        if how == "nolink":
-            sys.exit("news: no link and no text in feed")
-        import textwrap
-        Pr = pal(a.color)
-        for ln in textwrap.wrap(it["ti"], max(20, cols - 2)) or [""]:
-            print(Pr["b"](ln))
-        print(Pr["d"]("  %s %s %s" % (
-            it.get("src", "?"), bul_(a), age(int(time.time()) - it["d"])
-            if it.get("d") else "?")) + "\n")
-        for para in (body or "").split("\n\n"):
-            print(textwrap.fill(para, max(20, cols - 2), initial_indent="  ",
-                                subsequent_indent="  ") + "\n")
-        if not body:
-            print(D("  no readable paragraphs - likely paywalled or JS-rendered"))
-        print(D("  %s" % ({"feed": "from feed, 0B over the wire",
-                           "offline": "from offline store, 0B over the wire"}
-                          .get(how, "fetched %s, stored offline" % kbs(nb)))))
-        return
+        return cmd_pick(a,P,D,pick)
 
     if a.download:
-        try:
-            last = json.load(open(LAST, encoding="utf-8"))
-        except Exception:
-            sys.exit("news: nothing listed yet - run `news` first")
-        if a.download.strip().lower() == "all":
-            want = list(range(1, len(last) + 1))
-        else:
-            try:
-                want = [int(x) for x in a.download.replace(" ", "").split(",") if x]
-            except ValueError:
-                sys.exit("news: -d takes 1,3,5 or all")
-        cap_ = max(1024, a.budget * 1024) if a.budget else DLBUDGET
-        tot, got, free = 0, 0, 0
-        for i in want:
-            if not 1 <= i <= len(last):
-                print(D("  %2d skipped - out of range" % i))
-                continue
-            it = last[i - 1]
-            if tot >= cap_ and not (it.get("c") or have(key(it["ti"]))):
-                print(D("  stopped before %d - budget %s spent (--budget KB to raise)"
-                        % (i, kbs(tot))))
-                break                       # check before spending, so counts stay true
-            try:
-                txt, nb, how = fetch_article(it)
-            except Exception as e:
-                print(D("  %2d failed   %s" % (i, str(e)[:40])))
-                continue
-            tot += nb
-            if how in ("feed", "offline"):
-                free += 1
-            if txt:
-                got += 1
-            Pd = pal(a.color)
-            tag_ = (Pd["grn"]("%-6s" % "free") if not nb
-                    else (Pd["yel"] if nb < 102400 else Pd["red"])("%-6s" % kbs(nb)))
-            print("  %s %s %s %s" % (Pd["d"]("%2d" % i), tag_,
-                                     Pd["d"]("%-7s" % how),
-                                     it["ti"][:max(10, cols_() - 21)]))
-        print()
-        wrapout("%d/%d stored %s %s over the wire%s"
-                % (got, len(want), bul_(a), kbs(tot),
-                   "" if not free else " %s %d already had text" % (bul_(a), free)),
-                pal(a.color), cols_())
-        return
+        return cmd_download(a,P,D)
 
     if a.mark_all:
         st = state()
@@ -1808,92 +2189,7 @@ def run(a):
         return
 
     if (a.cat or "").lower() == "signal":
-        st_ = net_stats()
-        W = cols_()
-        # verdict first: the answer to "should I pull now" belongs on line one
-        probes, verdict, vc = [], "unknown", P["d"]
-        hosts = []
-        for x in sources(argparse_ns({"only": None, "cat": "all"})):
-            hp = hostport(x["url"])
-            if hp[0] and hp not in hosts:
-                hosts.append(hp)
-        probes = probe(hosts[:2])
-        reach = [r for r in probes if r["tcp"] is not None]
-        if probes and not reach:
-            verdict, vc = "offline", P["red"]
-        elif st_:
-            if st_["rate"] >= 90 and st_["bps"] > 20000:
-                verdict, vc = "good", P["grn"]
-            elif st_["rate"] >= 60:
-                verdict, vc = "usable", P["yel"]
-            else:
-                verdict, vc = "poor", P["red"]
-        elif reach:
-            verdict, vc = "reachable", P["yel"]
-        print(P["hdr"]("SIGNAL") + "  " + vc(verdict))
-
-        for r_ in probes:
-            h = r_["host"].split(".")
-            short = r_["host"]
-            if len(h) > 3 and not r_["host"].replace(".", "").isdigit():
-                short = ".".join(h[-3:])   # trim subdomains, never an IP literal
-            if r_["tcp"] is None:
-                print("  %-7s %s %s" % ("link", P["red"]("%9s" % "no route"),
-                                        D(short[:W - 20])))
-                continue
-            tc = (P["grn"] if r_["tcp"] < 150 else
-                  P["yel"] if r_["tcp"] < 500 else P["red"])
-            dc = (D if (r_["dns_cold"] or 0) < 120 else P["yel"])
-            note = " proxied?" if (r_["tcp"] < 2 and not r_["host"].startswith(
-                ("127.", "10.", "192.168."))) else ""
-            print("  %-7s %s %s  %s%s" % (
-                "link", tc("%5dms" % r_["tcp"]), dc("%4dms dns" % (r_["dns_cold"] or 0)),
-                D(short[:W - 26]), P["yel"](note)))
-        ic = icmp(hosts[0][0]) if hosts else None
-        if ic:
-            print("  %-7s %s %s" % ("", D("%5.0fms" % (ic["avg"] or 0)),
-                  D("icmp, %.0f%% loss" % ic["loss"])))
-
-        if st_:
-            rc = (P["grn"] if st_["rate"] >= 90 else
-                  P["yel"] if st_["rate"] >= 60 else P["red"])
-            print("  %-7s %s %s %s" % (
-                "rate", P["b"]("%8s/s" % kbs(int(st_["bps"]))),
-                D("%dms" % st_["ms"]),
-                rc("%.0f%% ok" % st_["rate"]) + D(" of %d" % st_["n"])))
-
-        # the actionable part: what a refresh costs, and how long it would take
-        allsrc = sources(argparse_ns({"only": None, "cat": "all"}))
-        unmeasured = sum(1 for x in allsrc
-                         if jread("%s/%s.json" % (CD, x["id"]), {}).get("w") is None)
-        shown = 0
-        for cat in ("top", "science", "tech", "bio", "world"):
-            due, _unk = cat_cost(cat)
-            if not due:                    # within ttl: nothing to decide about
-                continue
-            eta = (" ~%.0fs" % (due / st_["bps"])) if (st_ and st_["bps"] > 500) else ""
-            cc = (P["grn"] if due < 20480 else
-                  P["yel"] if due < 81920 else P["red"])
-            print("  %-7s %s%s" % (cat, cc("%8s" % kbs(due)), D(eta)))
-            shown += 1
-        if not shown:
-            if unmeasured >= len(allsrc):   # never fetched is not the same as fresh
-                print("  %-7s %s" % ("cold", D("nothing cached yet, first pull "
-                                               "fetches everything")))
-            else:
-                print("  %-7s %s" % ("fresh", D("all feeds within ttl, 0B to refresh")))
-        if unmeasured:
-            print("  %-7s %s" % ("", D("%d feed%s not measured yet" % (
-                unmeasured, "" if unmeasured == 1 else "s"))))
-
-        days = sorted((st_ or {}).get("day", {}).items())[-7:]
-        if days:
-            today_ = (st_ or {})["day"].get(dt.date.today().isoformat(), 0)
-            print("  %-7s %s %s" % ("data", D("%8s today" % kbs(today_)),
-                  D("%s over %dd" % (kbs(sum(v_ for _, v_ in days)), len(days)))))
-        if verdict == "poor":
-            print(D("  tip: lowpingnews --light skips the heavy feeds"))
-        return
+        return cmd_signal(a,P,D)
 
     srcs = sources(a)
     if a.light:

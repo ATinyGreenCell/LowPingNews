@@ -127,6 +127,46 @@ class Server(object):
         self.routes[path] = handler
 
 
+def _drive_tui(env, keys, rows=24, cols=64, settle=0.7):
+    """Run the curses interface on a pty and feed it real keystrokes."""
+    import fcntl, pty, select, struct, termios
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(env)
+        os.execv(NEWS, ["news", "--tui"])
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    buf = b""
+
+    def pump(t):
+        global_end = time.time() + t
+        out = b""
+        while time.time() < global_end:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r:
+                try:
+                    out += os.read(fd, 65536)
+                except OSError:
+                    break
+        return out
+    buf += pump(2.0)
+    for k in keys:
+        try:
+            os.write(fd, k)
+        except OSError:
+            break
+        buf += pump(settle)
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except Exception:
+        pass
+    txt = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", buf.decode("utf-8", "replace"))
+    return txt.replace("\r", "").replace("\x0f", "")
+
+
 def item(title, when=None, body="Summary text.", link="http://example.invalid/a"):
     d = "<dc:date>%s</dc:date>" % when if when else ""
     return ("<item><title>%s</title><link>%s</link>"
@@ -374,7 +414,9 @@ def t_weather_severity_is_ranked_not_maxed(env, srv):
 def t_weather_renders_and_fits_narrow_terminals(env, srv):
     tmp = tempfile.mkdtemp()
     try:
-        srv.json("/fc", _forecast(rain=True))
+        # pin the hour so the sunrise countdown (the widest line) always renders
+        h = (int(time.time()) // 86400) * 86400 + 4 * 3600
+        srv.json("/fc", _forecast(hour=h, rain=True))
         binary = _wx_binary(srv, tmp)
         e = dict(env); e["COLUMNS"] = "40"
         subprocess.run([binary, "weather", "-c", "40.9,-73.4", "--label", "Test"],
@@ -494,6 +536,30 @@ def t_download_budget_is_enforced(env, srv):
     run(env, "-t", "-n", "5")
     out, _, _ = run(env, "-d", "all", "--budget", "1")
     assert "budget" in out, "budget ceiling never reported:\n%s" % out
+
+
+@test
+def t_tui_survives_an_empty_list(env, srv):
+    """sel went to -1 on an empty list, and rows[-1] is a valid index."""
+    import pty, select, struct, termios, fcntl
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": "http://127.0.0.1:9/nothing"}])
+    out = _drive_tui(env, [b"j", b"j", b"k", b"\r", b"s", b"n", b" ", b"q"])
+    assert "Traceback" not in out, out[-300:]
+
+
+@test
+def t_tui_lists_reads_and_switches_category(env, srv):
+    srv.feed("/f", [item("Alpha headline %d" % i, body="Summary.") for i in range(6)])
+    srv.feed("/f2", [item("Beta headline %d" % i, body="Summary.") for i in range(6)])
+    sources(env, [{"id": "a", "name": "Alpha", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")},
+                  {"id": "b", "name": "Beta", "kind": "rss", "cats": ["science"],
+                   "url": srv.url("/f2")}])
+    out = _drive_tui(env, [b"j", b"\r", b"b", b"n", b"q"], settle=1.2)
+    assert "Traceback" not in out, out[-300:]
+    assert "headline" in out.lower(), "no items rendered:\n%s" % out[-400:]
+    assert "SCIENCE" in out.upper(), "n did not switch category:\n%s" % out[-400:]
 
 
 @test
