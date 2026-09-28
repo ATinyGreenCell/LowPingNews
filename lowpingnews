@@ -12,7 +12,7 @@ RAW="${LPN_RAW:-https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/mai
 PY="$(command -v python3 || command -v python || true)"
 
 die() { printf '%s\n' "lowpingnews: $*" >&2; exit 1; }
-OWNED="news README.md install.sh lowpingnews LICENSE .gitignore"
+OWNED="news README.md install.sh lowpingnews LICENSE .gitignore test.py"
 owned() { for o in $OWNED; do [ "$1" = "$o" ] && return 0; done; return 1; }
 say() { printf '  %s\n' "$*"; }
 [ -n "$PY" ] || die "python3 not found (pkg install python)"
@@ -69,26 +69,47 @@ cmd_status() {
 cmd_sync() {
   # Extract FIRST: an archive alone is a complete delivery. Requiring a loose
   # build before extracting meant a tarball-only drop could never sync.
-  newest_tar=""; nt=0
+  newest_tar=""; nv=""; nt=0
   for d in $DLS; do
     for t in "$d"/*.tar.gz; do
       [ -f "$t" ] || continue
       bad=0
       for m in $(tar tzf "$t" 2>/dev/null); do
         case "$m" in
-          news|README.md|install.sh|lowpingnews|LICENSE|.gitignore) ;;
+          news|test.py|README.md|install.sh|lowpingnews|LICENSE|.gitignore) ;;
           */) ;;
           *) bad=1; break ;;
         esac
       done
       [ "$bad" -eq 1 ] && continue        # unrelated archive: never touch the repo
-      mt="$("$PY" -c "import os,sys;print(int(os.path.getmtime(sys.argv[1])))" "$t")"
-      [ "$mt" -gt "$nt" ] && { newest_tar="$t"; nt="$mt"; }
+      # pick by the version inside, not by mtime: a stale archive in another
+      # download directory must never outrank a newer build
+      tv="$(tar xzf "$t" -O news 2>/dev/null | sed -n 's/^VERSION = "\(.*\)"/\1/p' | head -1)"
+      [ -n "$tv" ] || continue
+      if [ -z "$newest_tar" ] \
+         || [ "$(printf '%s\n%s\n' "$nv" "$tv" | sort -V | tail -1)" = "$tv" ]; then
+        newest_tar="$t"; nv="$tv"
+      fi
     done
   done
   if [ -n "$newest_tar" ]; then
+    # check the version BEFORE overwriting the repo: a stale tarball in
+    # Downloads once overwrote good source and was then released as newer
+    peek="$(mktemp -d)"
+    if tar xzf "$newest_tar" -C "$peek" news 2>/dev/null; then
+      tv="$(ver "$peek/news" 2>/dev/null || true)"
+      cur="$(installed_ver)"
+      if [ -n "$tv" ] && [ -n "$cur" ] && [ "$tv" != "$cur" ] \
+         && [ "$(printf '%s\n%s\n' "$cur" "$tv" | sort -V | tail -1)" = "$cur" ] \
+         && [ "${LPN_FORCE:-}" != "1" ]; then
+        rm -rf "$peek"
+        die "refusing: $(basename "$newest_tar") is v$tv, older than installed v$cur.
+  Download the current build first, or set LPN_FORCE=1 to override."
+      fi
+    fi
+    rm -rf "$peek"
     tar xzf "$newest_tar" -C "$REPO" || die "extract failed: $newest_tar"
-    say "extracted $(basename "$newest_tar")"
+    say "extracted $(basename "$newest_tar") (v$(ver "$REPO/news" 2>/dev/null || echo '?'))"
   fi
 
   src="$(newest_download || true)"        # a loose build wins only if it is newer
@@ -130,7 +151,11 @@ cmd_install() {
 }
 
 cmd_test() {
-  v="$(installed_ver)"; [ -n "$v" ] || die "news is not installed"
+  # the suite exercises the source tree, so it runs before any install check
+  if [ -f "$REPO/test.py" ]; then
+    python3 "$REPO/test.py" ${1:+"$1"} || die "test suite failed"
+  fi
+  v="$(installed_ver)"; [ -n "$v" ] || { say "not installed; suite only"; return 0; }
   say "v$v"
   news --version >/dev/null || die "--version failed"
   news -t -n 2 >/dev/null 2>&1 || say "WARN: listing failed (offline is fine)"
@@ -159,9 +184,29 @@ cmd_ship() {
   say "pushed $(git -C "$REPO" rev-parse --short HEAD)"
 }
 
+release_has_changes() {
+  # the failure this prevents: a stale build synced, version bumped, released.
+  # Compare against the last tag ignoring the VERSION line itself.
+  last="$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null || true)"
+  [ -n "$last" ] || return 0
+  git -C "$REPO" show "$last:news" 2>/dev/null \
+    | grep -v '^VERSION = ' > "$REPO/.rel_old" || return 0
+  grep -v '^VERSION = ' "$REPO/news" > "$REPO/.rel_new"
+  if cmp -s "$REPO/.rel_old" "$REPO/.rel_new"; then
+    rm -f "$REPO/.rel_old" "$REPO/.rel_new"
+    return 1
+  fi
+  rm -f "$REPO/.rel_old" "$REPO/.rel_new"
+  return 0
+}
+
 cmd_release() {
   [ $# -ge 1 ] || die "usage: lowpingnews release <version>"
   v="$1"
+  if ! release_has_changes; then
+    die "refusing: news is identical to the last release apart from VERSION.
+  A stale tarball was probably synced. Download the current build and re-sync."
+  fi
   case "$v" in
     *[!0-9.]*|""|.*|*.) die "version must be digits and dots, e.g. 2.1" ;;
   esac
@@ -285,7 +330,7 @@ case "$c" in
   status)  cmd_status ;;
   sync)    cmd_sync ;;
   install) cmd_install ;;
-  test)    cmd_test ;;
+  test)    cmd_test ${1:+"$1"} ;;
   pull)    cmd_pull ;;
   ship)    cmd_ship "$@" ;;
   release) cmd_release "$@" ;;

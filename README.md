@@ -386,6 +386,22 @@ lpn release 4.5     bump, install, test, commit, tag, gh release
 containing files this project does not own. `ship` and `release` refuse to
 commit anything outside the files this project owns. `release` is idempotent.
 
+## Tests
+
+```sh
+python3 test.py            # everything
+python3 test.py weather    # just the weather tests
+lpn test                   # same, via the dev tool
+```
+
+No network, and the program itself is not mocked: each test starts a local HTTP
+server and runs the real binary against it, with config, cache and state
+redirected to a scratch directory. The suite covers failures that actually
+shipped — a truncated transfer cached as complete, a future-dated item pinning
+itself to the top of the list, warm-cache paths that crashed because only cold
+ones were exercised, control characters reaching the terminal, and lines
+overflowing a 40-column screen.
+
 ## License
 
 MIT

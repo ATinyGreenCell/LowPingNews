@@ -4,7 +4,7 @@ import datetime as dt, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "5.7"
+VERSION = "5.8"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -819,16 +819,33 @@ def geocode(name, timeout=12, count=6):
            "&count=%d&language=en&format=json"
            % (urllib.parse.quote(name.strip()), count))
     raw, _h, _w, _p = get(url, timeout, cap=262144)
-    return (json.loads(raw) or {}).get("results") or []
+    res = (json.loads(raw) or {}).get("results")
+    if not isinstance(res, list):          # the API may answer with anything
+        return []
+    out = []
+    for r in res:
+        if not isinstance(r, dict):
+            continue
+        try:
+            la, lo = float(r["latitude"]), float(r["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue                       # a place without coordinates is not one
+        if not (-90 <= la <= 90 and -180 <= lo <= 180):
+            continue
+        r = dict(r)
+        r["latitude"], r["longitude"] = la, lo
+        out.append(r)
+    return out
 
 
 def place_label(r):
-    bits = [r.get("name")]
-    for k in ("admin1", "country"):
-        v = r.get(k)
+    # names come from a remote API and land in the header: clean and bound them
+    bits = []
+    for k in ("name", "admin1", "country"):
+        v = clean(str(r.get(k) or ""), 40)
         if v and v not in bits:
             bits.append(v)
-    return ", ".join(b for b in bits if b)
+    return ", ".join(bits)[:60]
 
 
 def ip_fix(timeout=12):
@@ -841,9 +858,12 @@ def ip_fix(timeout=12):
             j = json.loads(raw)
             if j.get(la) is None:
                 continue
-            return {"latitude": float(j[la]), "longitude": float(j[lo]),
+            lat_, lon_ = float(j[la]), float(j[lo])
+            if not (-90 <= lat_ <= 90 and -180 <= lon_ <= 180):
+                continue
+            return {"latitude": lat_, "longitude": lon_,
                     "accuracy": 5000, "_provider": "ip",
-                    "_place": j.get(ac) or ""}
+                    "_place": clean(str(j.get(ac) or ""), 40)}
         except Exception:
             continue
     return None
@@ -923,7 +943,8 @@ def gps_fix(want_gps, timeout=50):
 def _store_fix(j, label=None):
     return {"lat": round(float(j["latitude"]), 4),
             "lon": round(float(j["longitude"]), 4),
-            "label": label, "acc": j.get("accuracy"),
+            "label": clean(str(label or ""), 60) or None,
+            "acc": j.get("accuracy"),
             "via": j.get("_provider"), "t": int(time.time())}
 
 
@@ -938,7 +959,8 @@ def wx_locate(a):
         if not (-90 <= la <= 90 and -180 <= lo <= 180):
             sys.exit("news: latitude must be -90..90 and longitude -180..180")
         d = {"lat": round(la, 4), "lon": round(lo, 4),
-             "label": getattr(a, "label", None), "via": "pinned",
+             "label": clean(str(getattr(a, "label", None) or ""), 60) or None,
+             "via": "pinned",
              "t": int(time.time())}
         jwrite(WXLOC, d)
         return d
@@ -954,7 +976,8 @@ def wx_locate(a):
         top = hits[0]
         d = {"lat": round(float(top["latitude"]), 4),
              "lon": round(float(top["longitude"]), 4),
-             "label": getattr(a, "label", None) or place_label(top),
+             "label": clean(str(getattr(a, "label", None) or ""), 60)
+                      or place_label(top) or None,
              "via": "place", "t": int(time.time())}
         jwrite(WXLOC, d)
         others = [place_label(r) for r in hits[1:4]
@@ -1130,9 +1153,12 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     tot = sum(amt)
     unit_p = "in" if a.unit == "fahrenheit" else "mm"
     if pr[k] >= 10:
-        # probability alone does not support a decision; amount does
+        # probability alone does not support a decision; amount does - but the
+        # bar is already n wide, so only add it when the line actually fits
         note = "  %d%% @%sh" % (pr[k], L(h["time"][k]).strftime("%H"))
-        note += (", %.2f%s" % (tot, unit_p)) if tot >= 0.005 else ", trace"
+        extra = (", %.2f%s" % (tot, unit_p)) if tot >= 0.005 else ", trace"
+        if 2 + n + len(note) + len(extra) <= cols:
+            note += extra
     else:
         note = "  dry"
     print("  " + P["cyn"](rainbar(pr, a.ascii)) + D(note))
@@ -1559,6 +1585,12 @@ def run(a):
     acts = [x for x in (a.open, a.read, a.star) if x is not None]
     if len(acts) > 1:
         sys.exit("news: pick one of -o / -r / -S at a time")
+    locs = [n for n, v in (("-p", getattr(a, "place", None)),
+                           ("-c", getattr(a, "coords", None)),
+                           ("-g", getattr(a, "gps", False)),
+                           ("--ip", getattr(a, "iploc", False))) if v]
+    if len(locs) > 1:                      # silently preferring one is a guess
+        sys.exit("news: pick one location source, not %s" % " and ".join(locs))
     P = pal(a.color)
     D, B, C = P["d"], P["b"], P["cyn"]
 
