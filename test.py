@@ -2178,6 +2178,16 @@ def t_place_region_filters_and_is_never_part_of_the_name(env, srv):
 
 
 @test
+def t_location_flags_are_refused_by_the_news_list(env, srv):
+    """`lowpingnews -p PLACE` used to open the reader, ignore the place, and
+    exit 0 - looking as if the radio had been moved when it had not."""
+    for args in (("-p", "Huntington, NY"), ("-c", "40.9,-73.41"), ("top", "--marine", "ANZ335")):
+        _o, err, rc = run(env, *(args + ("--plain", "--offline")))
+        assert rc == 2 and "lowpingnews weather" in err, "%s was accepted silently" % (args,)
+    assert not os.path.exists(os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "loc.json"))
+
+
+@test
 def t_version_is_consistent(env, srv):
     m = load()
     out, _, _ = run(env, "--version")

@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "7.4"
+VERSION = "7.5"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -1943,7 +1943,9 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     # i.e. base_w + W + 17 cells; without the bar: base_w + range(8) + 7
     W = max(0, min(12, cols - base_w - 17))
     use_bar = W >= 5
-    fl, gp = ("#", ".") if a.ascii else ("\u2588", "\u00b7")
+    # a mid-line bar, not a full block: in phone fonts the block is taller than
+    # the line, so seven days of it merged into one shape instead of seven ranges
+    fl, gp = ("#", ".") if a.ascii else ("\u25ac", "\u00b7")
     if use_bar:
         head = "  7 DAY".ljust(base_w) + "low " + " " * (W + 1) + "high" + " " + "rain".rjust(5)
     elif base_w + 15 <= cols:
@@ -4862,6 +4864,18 @@ def run(a):
         d, wire, age_s, stale = wx_fetch(loc, a.unit, a.fresh)
         wx_show(a, P, loc, d, wire, age_s, stale)
         return
+
+    # location and radio flags mean nothing to the reader. Ignoring them
+    # silently let `lowpingnews -p PLACE` look like it had moved the radio.
+    misplaced = [f for f, k in (("-p", "place"), ("-c", "coords"), ("--label", "label"),
+                                ("-g", "gps"), ("--ip", "iploc"), ("--marine", "marine"),
+                                ("--full", "full")) if getattr(a, k, None)]
+    if misplaced:
+        sys.stderr.write("news: %s %s for weather and radio, not the news list. Try:\n"
+                         "  lowpingnews weather %s ...\n  lowpingnews radio %s ...\n"
+                         % (" ".join(misplaced), "is" if len(misplaced) == 1 else "are",
+                            misplaced[0], misplaced[0]))
+        raise SystemExit(2)
 
     if (a.cat or "").lower() == "signal":
         return cmd_signal(a,P,D)
