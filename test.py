@@ -30,6 +30,9 @@ def sandbox():
     env["XDG_CACHE_HOME"] = os.path.join(d, "cache")
     env["XDG_DATA_HOME"] = os.path.join(d, "data")
     env["LPN_NO_PROGRESS"] = "1"
+    # what Termux sets; the host's own TERM (here "linux") would test a
+    # different terminal - no alternate screen, another mouse encoding
+    env["TERM"] = "xterm-256color"
     return d, env
 
 
@@ -127,13 +130,12 @@ class Server(object):
         self.routes[path] = handler
 
 
-def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",)):
+def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",), raw=False):
     """Run the curses interface on a pty and feed it real keystrokes."""
     import fcntl, pty, select, struct, termios
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update(env)
-        os.environ.setdefault("TERM", "xterm-256color")
         os.execv(NEWS, ["news"] + list(args))
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     buf = b""
@@ -164,6 +166,8 @@ def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",)):
         os.waitpid(pid, os.WNOHANG)
     except Exception:
         pass
+    if raw:
+        return buf.decode("utf-8", "replace")
     txt = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", buf.decode("utf-8", "replace"))
     return txt.replace("\r", "").replace("\x0f", "")
 
@@ -1658,6 +1662,62 @@ def t_catalog_only_changes_can_be_released(env, srv):
         assert allowed(), "a catalog-only change was refused"
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _tap(col, row):
+    """A touchscreen tap as the terminal reports it: SGR press, then release."""
+    return ("\x1b[<0;%d;%dM\x1b[<0;%d;%dm" % (col, row, col, row)).encode()
+
+
+@test
+def t_catalog_opens_the_tick_box_editor_in_a_terminal(env, srv):
+    e = dict(env); e.update(LPN_NO_PING="1", LPN_CATALOG_URL=srv.url("/none"))
+    out = _drive_tui(e, [b"q"], args=("catalog",), cols=72)
+    # only the editor says this; the printed list merely mentions tick boxes
+    assert "space: tick" in out, "catalog printed a list instead of the editor"
+    p = subprocess.run([NEWS, "catalog"], stdout=subprocess.PIPE, env=e)
+    assert b"FEEDS" in p.stdout and b"\x1b[?1049h" not in p.stdout, "a pipe got the editor"
+    p = subprocess.run([NEWS, "catalog", "--plain"], stdout=subprocess.PIPE, env=e)
+    assert b"FEEDS" in p.stdout
+
+
+@test
+def t_tapping_a_feed_ticks_it_once(env, srv):
+    """A tap arrives as a press and a release; acting on both would tick and
+    untick in one touch, so it would look as though nothing happened."""
+    e = dict(env); e.update(LPN_NO_PING="1", LPN_CATALOG_URL=srv.url("/none"))
+    run(e, "-l")                                      # write the default sources
+    cfg = os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "sources.json")
+    # `catalog alerts` opens with the alerts heading on row 2, its first feed on row 3
+    _drive_tui(e, [_tap(12, 3), b"q"], args=("catalog", "alerts"), cols=72, settle=0.8)
+    after_one = json.load(io.open(cfg, encoding="utf-8"))
+    ticked = [x for x in after_one if "alerts" in x.get("cats", [])]
+    assert len(ticked) == 1, "one tap should tick exactly one feed: %s" % ticked
+    _drive_tui(e, [_tap(12, 3), b"q"], args=("catalog", "alerts"), cols=72, settle=0.8)
+    after_two = json.load(io.open(cfg, encoding="utf-8"))
+    assert not [x for x in after_two if "alerts" in x.get("cats", [])], "a second tap did not untick"
+
+
+@test
+def t_taps_off_the_list_change_nothing(env, srv):
+    e = dict(env); e.update(LPN_NO_PING="1", LPN_CATALOG_URL=srv.url("/none"))
+    run(e, "-l")
+    cfg = os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "sources.json")
+    before = io.open(cfg, encoding="utf-8").read()
+    _drive_tui(e, [_tap(3, 2), _tap(10, 1), _tap(10, 24), b"q"], args=("catalog", "alerts"),
+               cols=72, settle=0.6)
+    assert io.open(cfg, encoding="utf-8").read() == before, "a tap on a heading or edge changed feeds"
+
+
+@test
+def t_editor_gives_text_selection_back(env, srv):
+    e = dict(env); e.update(LPN_NO_PING="1", LPN_CATALOG_URL=srv.url("/none"))
+    out = _drive_tui(e, [b"q"], args=("catalog",), cols=72, raw=True)
+    assert "\x1b[?1006;1000h" in out, "taps were never enabled"
+    assert "\x1b[?1006;1000l" in out, "mouse reporting left on after the editor closed"
+    e2 = dict(e); e2["LPN_NO_MOUSE"] = "1"
+    out = _drive_tui(e2, [b"q"], args=("catalog",), cols=72, raw=True)
+    assert "1000h" not in out, "LPN_NO_MOUSE ignored"
 
 
 @test

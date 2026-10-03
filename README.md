@@ -485,8 +485,11 @@ same `.full` page. When full text still is not had, the reader says why:
 
 ## Choosing feeds
 
-Press **f** in the reader for the feed manager: every category is a section,
-and ticking a feed puts it in that category. Each row shows the feed's size
+Run `lowpingnews catalog` — or press **f** in the reader — for the feed
+editor: every category is a section, and every feed a tick box. **Tap a feed to
+tick or untick it**, or move with j/k and press space; swipe to scroll.
+`lowpingnews catalog alerts` opens at that section. Ticking a feed puts it in
+that category; changes are saved as you make them. Each row shows the feed's size
 and the host it points to. A ★ marks a recommended feed that a recorded check
 has found working and light; a recommended feed nobody has checked yet shows
 `unverified` instead, and gets its star once `catalog check` vouches for it.
@@ -498,11 +501,17 @@ has found working and light; a recommended feed nobody has checked yet shows
  [ ]   GDACS disasters             ? gdacs.org
 ```
 
-  space  tick or untick for this category
+  tap    tick or untick for this category (space does the same)
   t      add this feed to another category - type a new name to create one
   a      add any feed by address, or a website that advertises one
   d      remove a feed from every category
   u      fetch the newest feed list
+
+Tapping works by asking the terminal to report touches, which also stops it
+from selecting text — so that is switched on only while the editor is open,
+and handed back when you leave. `LPN_NO_MOUSE=1` keeps it off entirely.
+Piped, or with `--plain`, `catalog` prints the list instead of opening the
+editor.
 
 The same from the command line, apt-style:
 

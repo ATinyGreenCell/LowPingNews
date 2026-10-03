@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "6.7"
+VERSION = "6.8"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -2479,7 +2479,9 @@ def _cmd_catalog(argv):
     nsa = argparse_ns({"ascii": asc})
     if "--offline" in argv:
         OFFLINE[0] = True
-    opts, pos, it = {}, [], iter([x for x in argv if x not in ("--no-color", "--offline", "--ascii")])
+    plain = "--plain" in argv
+    opts, pos, it = {}, [], iter([x for x in argv if x not in ("--no-color", "--offline",
+                                                               "--ascii", "--plain")])
     for x in it:
         if x in ("--to", "--from", "--name", "--write", "--budget"):
             opts[x[2:]] = next(it, "")
@@ -2499,6 +2501,12 @@ def _cmd_catalog(argv):
         seed = json.loads(CATALOG_SEED)
         sys.stdout.write(catalog_dump(seed))
         return
+    if verb == "list" and not plain:
+        # at a terminal, the list is something you edit: tick boxes, not text
+        na = argparse_ns({"ascii": asc, "color": on})
+        jump = norm_cat(args[0]) if args else None
+        if cmd_feeds_tui(na, jump=jump):
+            return
     idx = catalog_load()
     by_id = {e["id"]: e for e in idx["feeds"]}
 
@@ -2602,8 +2610,10 @@ def _cmd_catalog(argv):
                     m_ = mark(e, cols - 9 - len(tail))
                     pr(D("      " + tail) + (("  " + m_) if m_ else ""))
         pr()
-        wrapout("add: catalog add ID [--to CATEGORY]  remove: catalog remove ID  "
-                "newest list: catalog update  " + STAR + " light and reliable", P, cols)
+        wrapout("tick boxes: run `lowpingnews catalog` in a terminal, or press f in "
+                "the reader. add: catalog add ID [--to CATEGORY]  remove: catalog "
+                "remove ID  newest list: catalog update  " + STAR +
+                " checked light and reliable", P, cols)
         return
     if verb == "add":
         if not args:
@@ -3184,7 +3194,7 @@ def all_cats(a):
     return sorted({str(c).lower() for x in every for c in x.get("cats", [])}) or ["top"]
 
 
-def feeds_screen(scr, put, C, a):
+def feeds_screen(scr, put, C, a, jump=None):
     """The feed manager: categories as sections, feeds as tick boxes. A tick
     means "this feed appears in this category". -> True if anything changed."""
     import curses
@@ -3284,8 +3294,27 @@ def feeds_screen(scr, put, C, a):
         state_["msg"] = str(m)[:120]
 
     rows, idx = build()
-    # start on the first feed, not a heading
-    state_["sel"] = next((i for i, r in enumerate(rows) if r[0] == "feed"), 0)
+    # start on the first feed - of the asked-for category, if there was one
+    start = 0
+    if jump:
+        start = next((i for i, r in enumerate(rows) if r[0] == "hdr" and r[1] == jump), 0)
+    state_["sel"] = next((i for i, r in enumerate(rows) if i >= start and r[0] == "feed"),
+                         next((i for i, r in enumerate(rows) if r[0] == "feed"), 0))
+    state_["top"] = start
+    # Taps: on a touchscreen, tapping the row is the natural way to tick it.
+    # Mouse reporting stops the terminal's own text selection, so it is on only
+    # while this screen is open, and LPN_NO_MOUSE=1 keeps it off entirely.
+    mouse = False
+    if not os.environ.get("LPN_NO_MOUSE"):
+        try:
+            want = (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED |
+                    getattr(curses, "BUTTON4_PRESSED", 0) |
+                    getattr(curses, "BUTTON5_PRESSED", 0))
+            got, _old = curses.mousemask(want)
+            mouse = bool(got)
+            curses.mouseinterval(0)            # a press is a press: no click merging
+        except Exception:
+            mouse = False
     while True:
         scr.erase()
         h, w = scr.getmaxyx()
@@ -3316,8 +3345,8 @@ def feeds_screen(scr, put, C, a):
                                            e["name"][:max(6, w - 32)], size, host[:14])
             at = curses.A_REVERSE if i == sel else (C(2) if on else C(0))
             put(n + 1, 0, line.ljust(w - 1), w - 1, at)
-        hint = state_["msg"] or (" space tick  a add URL  t to category  d delete  "
-                                 "u update list  q back")
+        hint = state_["msg"] or ((" tap or space: tick" if mouse else " space: tick") +
+                                 "  a add URL  t to category  d delete  u update list  q back")
         put(h - 1, 0, hint.ljust(w - 1), w - 1, C(4))
         scr.refresh()
         scr.timeout(-1)
@@ -3327,6 +3356,30 @@ def feeds_screen(scr, put, C, a):
             break
         state_["msg"] = ""
         page = max(1, body_h - 1)
+        if c == curses.KEY_MOUSE:
+            try:
+                _mid, _mx, my, _mz, bst = curses.getmouse()
+            except curses.error:
+                continue
+            if bst & getattr(curses, "BUTTON4_PRESSED", 0):        # wheel / swipe up
+                state_["sel"] = max(0, sel - 3)
+                continue
+            if bst & getattr(curses, "BUTTON5_PRESSED", 0):        # wheel / swipe down
+                state_["sel"] = min(len(rows) - 1, sel + 3)
+                continue
+            if not bst & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                continue                       # releases and drags: nothing to do
+            i = state_["top"] + my - 1
+            if not (1 <= my <= body_h and 0 <= i < len(rows)):
+                continue                       # header or hint line
+            if rows[i][0] != "feed":
+                # a category heading: go to its first feed, so the cursor stays
+                # visible instead of resting on a line that is never highlighted
+                nxt = next((j for j in range(i, len(rows)) if rows[j][0] == "feed"), sel)
+                state_["sel"] = nxt
+                continue
+            state_["sel"] = sel = i
+            c = ord(" ")                       # a tap on a feed ticks it
         if c in (ord("q"), ord("b"), 27):
             break
         if c in (ord("j"), curses.KEY_DOWN):
@@ -3411,12 +3464,17 @@ def feeds_screen(scr, put, C, a):
                 _st, m_ = catalog_update()
                 say("%s (~%s)" % (m_, kbs(NETSTAT["est"] - e0)))
                 rows, idx = build()
+    if mouse:
+        try:
+            curses.mousemask(0)                # give text selection back
+        except Exception:
+            pass
     return state_["changed"]
 
 
-def tui_main(scr, a, cats, meter=None):
+def tui_setup(scr, a):
+    """Drawing and colour for any curses screen. -> (put, C, colour)."""
     import curses
-    import threading
     import unicodedata
     try:
         curses.curs_set(0)
@@ -3471,6 +3529,15 @@ def tui_main(scr, a, cats, meter=None):
             return curses.A_BOLD if bold else curses.A_NORMAL
         at = curses.color_pair(n)
         return at | curses.A_BOLD if bold else at
+
+    return put, C, colour
+
+
+def tui_main(scr, a, cats, meter=None):
+    import curses
+    import threading
+    import unicodedata
+    put, C, colour = tui_setup(scr, a)
 
     # ---- state -----------------------------------------------------------
     S = {"rows": [], "meta": {}, "st": state(), "sel": 0, "top": 0,
@@ -3802,6 +3869,32 @@ def default_tui_ok(a):
             return False
     if getattr(a, "n", 5) not in (None, 5):     # -n shapes the list
         return False
+    return True
+
+
+def cmd_feeds_tui(a, jump=None):
+    """The feed manager as its own screen. -> True if it ran."""
+    if not tui_can_start():
+        return False
+    import curses
+    os.environ["LPN_NO_PROGRESS"] = "1"
+    buf = io.StringIO()
+    real_err, sys.stderr = sys.stderr, buf
+
+    def body(scr):
+        put, C, _colour = tui_setup(scr, a)
+        return feeds_screen(scr, put, C, a, jump=jump)
+    try:
+        changed = curses.wrapper(body)
+    except KeyboardInterrupt:
+        changed = False
+    finally:
+        sys.stderr = real_err
+        held = buf.getvalue().strip()
+        if held:
+            sys.stderr.write(held + "\n")
+    if changed:
+        print("  feeds saved - `lowpingnews` to read them")
     return True
 
 
