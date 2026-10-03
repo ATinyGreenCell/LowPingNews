@@ -2148,6 +2148,36 @@ def t_radio_always_says_which_spot_it_checked(env, srv):
 
 
 @test
+def t_place_region_filters_and_is_never_part_of_the_name(env, srv):
+    """'Huntington, New York' was once sent whole as a name; the geocoder
+    fuzzy-matched it and the location ended up in Queens."""
+    tmp = tempfile.mkdtemp()
+    try:
+        srv.json("/geo", {"results": [
+            {"name": "Huntington", "latitude": 38.42, "longitude": -82.45, "admin1": "West Virginia",
+             "admin2": "Cabell", "country": "United States", "country_code": "US", "population": 46000},
+            {"name": "Huntington", "latitude": 40.87, "longitude": -73.43, "admin1": "New York",
+             "admin2": "Suffolk", "country": "United States", "country_code": "US", "population": 18000}]})
+        srv.json("/fc", _forecast())
+        b = _wx_binary(srv, tmp)
+        m = load()
+        for q in ("Huntington, New York", "Huntington, NY", "Huntington, Suffolk"):
+            subprocess.run([b, "weather", "-p", q, "--plain"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=env)
+            sent = [p_ for p_, _h in srv.seen if p_.startswith("/geo")][-1]
+            assert "name=Huntington&" in sent, "the region was sent as part of the name: " + sent
+            loc = json.load(open(os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "loc.json")))
+            assert abs(loc["lat"] - 40.87) < 0.01, "%s landed at %s" % (q, loc["lat"])
+        p = subprocess.run([b, "weather", "-p", "Huntington, Virginia", "--plain"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        assert p.returncode != 0 and b"no place matched" in p.stderr, \
+            "an unmatched region must fail, not fall back to another state"
+        assert m.place_parts("Springfield, IL, US") == ("Springfield", [["il", "illinois"], ["us"]])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
 def t_version_is_consistent(env, srv):
     m = load()
     out, _, _ = run(env, "--version")

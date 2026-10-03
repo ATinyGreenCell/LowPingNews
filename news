@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "7.3"
+VERSION = "7.4"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -1207,12 +1207,54 @@ def win_fix(timeout):
     return None
 
 
+US_STATES = dict(x.split(":") for x in (
+    "AL:Alabama;AK:Alaska;AZ:Arizona;AR:Arkansas;CA:California;CO:Colorado;"
+    "CT:Connecticut;DE:Delaware;DC:District of Columbia;FL:Florida;GA:Georgia;"
+    "HI:Hawaii;ID:Idaho;IL:Illinois;IN:Indiana;IA:Iowa;KS:Kansas;KY:Kentucky;"
+    "LA:Louisiana;ME:Maine;MD:Maryland;MA:Massachusetts;MI:Michigan;MN:Minnesota;"
+    "MS:Mississippi;MO:Missouri;MT:Montana;NE:Nebraska;NV:Nevada;NH:New Hampshire;"
+    "NJ:New Jersey;NM:New Mexico;NY:New York;NC:North Carolina;ND:North Dakota;"
+    "OH:Ohio;OK:Oklahoma;OR:Oregon;PA:Pennsylvania;RI:Rhode Island;"
+    "SC:South Carolina;SD:South Dakota;TN:Tennessee;TX:Texas;UT:Utah;VT:Vermont;"
+    "VA:Virginia;WA:Washington;WV:West Virginia;WI:Wisconsin;WY:Wyoming;"
+    "PR:Puerto Rico").split(";"))
+
+
+def place_parts(name):
+    """'Huntington, NY' -> ('Huntington', ['new york', 'ny']). The geocoder
+    matches names only: a whole 'town, region' string is fuzzy-matched as a
+    name and can land on a large place that merely shares a word."""
+    parts = [p.strip() for p in str(name).split(",") if p.strip()]
+    if not parts:
+        return "", []
+    quals = []
+    for q in parts[1:]:
+        alts = [q.lower()]
+        if q.upper() in US_STATES:
+            alts.append(US_STATES[q.upper()].lower())
+        quals.append(alts)
+    return parts[0], quals
+
+
+def place_fits(r, quals):
+    """Every qualifier must match the state, county, country or country code."""
+    fields = [str(r.get(k) or "").lower() for k in
+              ("admin1", "admin2", "admin3", "admin4", "country", "country_code")]
+    # exact, allowing only " county": "Virginia" must not match West Virginia
+    return all(any(f and (alt == f or f == alt + " county" or alt == f + " county")
+                   for alt in alts for f in fields) for alts in quals)
+
+
 def geocode(name, timeout=12, count=6):
-    """Open-Meteo geocoding: no key, same provider as the forecast."""
+    """Open-Meteo geocoding: no key, same provider as the forecast. A region
+    after a comma filters the matches; it is never sent as part of the name."""
     import urllib.parse
+    town, quals = place_parts(name)
+    if not town:
+        return []
     url = ("https://geocoding-api.open-meteo.com/v1/search?name=%s"
            "&count=%d&language=en&format=json"
-           % (urllib.parse.quote(name.strip()), count))
+           % (urllib.parse.quote(town), 20 if quals else count))
     raw, _h, _w, _p = get(url, timeout, cap=262144)
     res = (json.loads(raw) or {}).get("results")
     if not isinstance(res, list):          # the API may answer with anything
@@ -1230,7 +1272,9 @@ def geocode(name, timeout=12, count=6):
         r = dict(r)
         r["latitude"], r["longitude"] = la, lo
         out.append(r)
-    return out
+    if quals:
+        out = [r for r in out if place_fits(r, quals)]   # none fit: say so, never guess
+    return out[:count]
 
 
 def place_label(r):

@@ -357,6 +357,14 @@ Config lives outside the cache, so clearing the cache never eats your feed list.
 `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME` are honoured where set,
 `%APPDATA%`/`%LOCALAPPDATA%` on Windows.
 
+## Place names
+
+`-p "Huntington, New York"` searches for Huntington and keeps only matches in
+New York; postal abbreviations work too (`-p "Huntington, NY"`), as do counties
+and countries (`-p "Paris, France"`). If nothing matches the region, it says so
+rather than choosing a place elsewhere. A place name is remembered, so
+`weather` and `radio` both show which spot they used, and how it was set.
+
 ## NOAA radio
 
 `lowpingnews radio` (or `noaa`) is a weather radio in text: active watches and
