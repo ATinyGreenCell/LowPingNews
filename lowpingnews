@@ -12,7 +12,7 @@ RAW="${LPN_RAW:-https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/mai
 PY="$(command -v python3 || command -v python || true)"
 
 die() { printf '%s\n' "lowpingnews: $*" >&2; exit 1; }
-OWNED="news README.md install.sh lowpingnews LICENSE .gitignore test.py"
+OWNED="news README.md install.sh lowpingnews LICENSE .gitignore test.py catalog.json"
 owned() { for o in $OWNED; do [ "$1" = "$o" ] && return 0; done; return 1; }
 say() { printf '  %s\n' "$*"; }
 [ -n "$PY" ] || die "python3 not found (pkg install python)"
@@ -76,7 +76,7 @@ cmd_sync() {
       bad=0
       for m in $(tar tzf "$t" 2>/dev/null); do
         case "$m" in
-          news|test.py|README.md|install.sh|lowpingnews|LICENSE|.gitignore) ;;
+          news|test.py|catalog.json|README.md|install.sh|lowpingnews|LICENSE|.gitignore) ;;
           */) ;;
           *) bad=1; break ;;
         esac
@@ -150,7 +150,22 @@ cmd_install() {
   fi
 }
 
+ensure_catalog() {
+  # The published feed index. If the repo has none yet - the first release that
+  # carries one, or a tarball from a sync too old to accept the file - write it
+  # from the copy built into news. An existing catalog.json is never replaced:
+  # it may hold check results (`catalog check all --write catalog.json`).
+  [ -f "$REPO/catalog.json" ] && return 0
+  [ -f "$REPO/news" ] || return 0
+  "$PY" "$REPO/news" catalog export > "$REPO/catalog.json.new" \
+    && [ -s "$REPO/catalog.json.new" ] \
+    && mv "$REPO/catalog.json.new" "$REPO/catalog.json" \
+    && say "wrote catalog.json from the built-in index" \
+    || { rm -f "$REPO/catalog.json.new"; die "could not write catalog.json"; }
+}
+
 cmd_test() {
+  ensure_catalog                  # tests check exactly what release publishes
   # the suite exercises the source tree, so it runs before any install check
   if [ -f "$REPO/test.py" ]; then
     python3 "$REPO/test.py" ${1:+"$1"} || die "test suite failed"
@@ -194,6 +209,12 @@ release_has_changes() {
   grep -v '^VERSION = ' "$REPO/news" > "$REPO/.rel_new"
   if cmp -s "$REPO/.rel_old" "$REPO/.rel_new"; then
     rm -f "$REPO/.rel_old" "$REPO/.rel_new"
+    # news is unchanged, but the feed index may not be: publishing check
+    # results (`catalog check all --write catalog.json`) is a real release
+    if [ -f "$REPO/catalog.json" ] && ! git -C "$REPO" show "$last:catalog.json" 2>/dev/null \
+         | cmp -s - "$REPO/catalog.json"; then
+      return 0
+    fi
     return 1
   fi
   rm -f "$REPO/.rel_old" "$REPO/.rel_new"

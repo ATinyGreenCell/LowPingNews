@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "6.5"
+VERSION = "6.7"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -507,6 +507,35 @@ EST_TCP_PLAIN = 900
 EST_FRAMING = 0.05
 NETSTAT = {"full": 0, "resumed": 0, "plain": 0, "est": 0, "body": 0}
 TLS_SESS = {}              # host -> ssl session: a repeat connection resumes
+PROBEWIN = 8192            # receive buffer for probes: caps what is in flight
+
+
+def _small_window(address, timeout=None, source_address=None, *a, **kw):
+    """create_connection with a small receive buffer, set BEFORE connecting so
+    the advertised TCP window is small. A server that ignores Range then cannot
+    stream far ahead of a probe that only wants the first few KB: measured,
+    129 KB arrived for a 16 KB probe with the default window."""
+    import socket
+    host, port = address
+    err = None
+    for af, st, proto, _cn, sa in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        sk = None
+        try:
+            sk = socket.socket(af, st, proto)
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, PROBEWIN)
+            if timeout is not None:
+                sk.settimeout(timeout)
+            sk.connect(sa)
+            return sk
+        except OSError as e:
+            err = e
+            if sk is not None:
+                sk.close()
+    raise err or OSError("no address for %s" % host)
+
+
+import threading as _thr
+_PROBE = _thr.local()      # set while get() is fetching in probe (soft) mode
 _OPENER = [None]
 
 
@@ -520,6 +549,11 @@ def _opener():
     ctx = ssl.create_default_context()
 
     class Resuming(http.client.HTTPSConnection):
+        def __init__(self, *a, **kw):
+            http.client.HTTPSConnection.__init__(self, *a, **kw)
+            if getattr(_PROBE, "on", False):
+                self._create_connection = _small_window
+
         def connect(self):
             http.client.HTTPConnection.connect(self)      # also handles proxies
             host = getattr(self, "_tunnel_host", None) or self.host
@@ -549,10 +583,16 @@ def _opener():
         def https_open(self, req):
             return self.do_open(Resuming, req, context=self._context)
 
+    class PlainConn(http.client.HTTPConnection):
+        def __init__(self, *a, **kw):
+            http.client.HTTPConnection.__init__(self, *a, **kw)
+            if getattr(_PROBE, "on", False):
+                self._create_connection = _small_window
+
     class Plain(urllib.request.HTTPHandler):
         def http_open(self, req):
             NETSTAT["plain"] += 1
-            return urllib.request.HTTPHandler.http_open(self, req)
+            return self.do_open(PlainConn, req)
 
     _OPENER[0] = urllib.request.build_opener(Handler(context=ctx), Plain())
     return _OPENER[0]
@@ -590,7 +630,10 @@ class OfflineError(OSError):
     pass
 
 
-def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
+LAST_URL = [""]            # where the last get() actually ended up, after redirects
+
+
+def get(url, t=10, extra=None, cap=FEEDCAP, tap=None, soft=False, until=None):
     """-> (body, headers, wire_bytes, partial). Raises HTTPError(304) when unchanged."""
     if OFFLINE[0]:
         # one choke point: a caller that forgets --offline cannot reach the net
@@ -616,25 +659,52 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
         NETSTAT["est"] += e
         NETSTAT["body"] += body_len
         return e
+    _PROBE.on = bool(soft)
     try:
         f = _opener().open(r, timeout=t)
     except urllib.error.HTTPError as he:
         account(0, he.headers or {})              # a 304 is not free: it paid a handshake
         raise
+    finally:
+        _PROBE.on = False
     with f:
         # Read in chunks and keep whatever arrived. On a dying link the useful
         # question is not "did it finish" but "how much of it is usable".
         import http.client
         buf, partial = bytearray(), False
+        # `until` looks at what the bytes SAY: if they arrive compressed (servers
+        # gzip ranged responses too), test the decompressed stream, or a marker
+        # like </head> never matches and the read runs on to the cap
+        enc_ = (f.headers.get("Content-Encoding") or "").lower()
+        dz = None
+        if until is not None and enc_ in ("gzip", "x-gzip", "deflate"):
+            dz = zlib.decompressobj(16 + zlib.MAX_WBITS if "gzip" in enc_ else zlib.MAX_WBITS)
+        seen_ = bytearray()
         try:
             while True:
-                chunk = f.read(65536)
+                # near a soft cap, read only what is still wanted: a 64 KB read
+                # pulls (and pays for) far more than a probe keeps
+                chunk = f.read(65536 if not soft else max(1, min(4096, cap - len(buf) + 1)))
                 if not chunk:
                     break
                 buf += chunk
                 if tap:
                     tap(len(buf))         # live byte count for the progress bar
+                if until is not None:
+                    if dz is not None:
+                        try:
+                            seen_ += dz.decompress(bytes(chunk), 1 << 20)
+                        except zlib.error:
+                            dz, seen_ = None, buf    # not really compressed
+                    view = seen_ if dz is not None else buf
+                    if until(bytes(view)):
+                        partial = True    # got what was wanted: stop paying
+                        break
                 if len(buf) > cap:
+                    if soft:              # a probe: keep the head, stop paying
+                        partial = True
+                        del buf[cap:]
+                        break
                     raise ValueError("response exceeds %s cap" % kbs(cap))
             if getattr(f, "length", None):       # server promised more than it sent
                 partial = True
@@ -648,8 +718,15 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
                 raise                            # nothing arrived: a real failure
             partial = True
         b = bytes(buf)
+        stopped_early = bool(partial and (soft or until is not None))
+        try:
+            LAST_URL[0] = f.geturl()
+        except Exception:
+            LAST_URL[0] = url
         wire = len(b)                     # compressed body; the full cost is est_wire()
-        account(wire, f.headers)
+        # stopping early does not recall what is already in flight: up to a
+        # receive window more arrives and is billed. Measured ~9 KB at PROBEWIN.
+        account(wire + (PROBEWIN + 1024 if stopped_early else 0), f.headers)
         ce = (f.headers.get("Content-Encoding") or "").lower()
         if ce in ("gzip", "deflate", "x-gzip"):
             for wbits in ((16 + zlib.MAX_WBITS,) if "gzip" in ce
@@ -657,7 +734,7 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
                 try:
                     z = zlib.decompressobj(wbits)
                     out = z.decompress(b, cap + 1)   # bounded: a bomb stops here
-                    if z.unconsumed_tail:
+                    if z.unconsumed_tail and not soft:
                         raise ValueError("decompressed body exceeds %s cap" % kbs(cap))
                     b = out                          # truncated gzip still yields
                     break                            # every complete block so far
@@ -1770,10 +1847,13 @@ def sources(a):
     os.makedirs(CFD, exist_ok=True)
     if not os.path.exists(CFG):
         jwrite(CFG, DEFAULTS)
-    try:
-        s = json.load(open(CFG, encoding="utf-8"))
-    except Exception:
-        s = DEFAULTS
+    s = jread(CFG, None)
+    if s is None:
+        try:
+            with open(CFG, encoding="utf-8") as fh:
+                s = json.load(fh)
+        except Exception:
+            s = DEFAULTS
     if not isinstance(s, list):
         s = DEFAULTS
     ok, seen = [], set()
@@ -1790,7 +1870,7 @@ def sources(a):
             continue
         seen.add(i)
         x["id"] = i
-        x["name"] = str(x.get("name") or i)[:32]
+        x["name"] = clean(str(x.get("name") or i), 32) or i   # no escapes to the terminal
         x.setdefault("kind", "rss")
         try:
             x["ttl"] = max(0, min(int(x.get("ttl") or TTL), 604800))
@@ -1801,7 +1881,12 @@ def sources(a):
         except Exception:
             x["timeout"] = 10
         c = x.get("cats")
-        x["cats"] = [str(z) for z in c] if isinstance(c, list) and c else ["top"]
+        cs = []
+        for z in (c if isinstance(c, list) else []):
+            z = norm_cat(z)
+            if z and z not in cs:
+                cs.append(z)
+        x["cats"] = cs or ["top"]
         ok.append(x)
     s = ok or DEFAULTS
     if a.only:
@@ -1818,6 +1903,869 @@ def sources(a):
         cats = sorted({z for x in s for z in x["cats"]})
         sys.exit("news: no category %r. try: %s, all" % (c, ", ".join(cats)))
     return sel
+
+
+# ---------------------------------------------------------------- catalog
+# An apt-style list of feeds one can subscribe to. The list is data, fetched
+# from the project's repository like a package index: one small gzipped file,
+# conditional on its ETag, never applied on its own. Nothing in it changes
+# what you are subscribed to until you say so.
+CATALOG_URL = (os.environ.get("LPN_CATALOG_URL") or
+               "https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/catalog.json")
+CATC = CD + "/catalog.json"            # the fetched index, with its validators
+CATCAP = 256 * 1024                    # an index bigger than this is not an index
+CATMAXFEEDS = 500
+PROBECAP = 16 * 1024                   # a probe reads at most this much
+KINDS = ("rss", "hn", "epmc")
+CATMAX = 20
+# words the command line already gives meaning to can never be categories
+RESERVED_CATS = {"all", "weather", "signal", "saved", "catalog", "feeds", "help",
+                 "update", "list", "add", "remove", "check", "upgrade"}
+
+
+def norm_cat(c):
+    """A category is a short lowercase word: 'My Stuff!' -> 'my-stuff'."""
+    c = str(c or "").strip().lower().replace(" ", "-")
+    c = re.sub(r"[^\w-]", "", c)[:CATMAX].strip("-_")   # letters in any script
+    return "" if c in RESERVED_CATS else c
+
+
+def norm_id(i):
+    i = re.sub(r"[^A-Za-z0-9_-]", "", str(i or ""))[:24]
+    if i.upper() in WINRESERVED:
+        i += "_"
+    return i
+
+
+def same_url(a_, b_):
+    """Equal for subscription purposes: scheme and host case, trailing slash."""
+    def k(u):
+        u = (u or "").strip()
+        m = re.match(r"(?i)(https?)://([^/?#]+)(.*)$", u)
+        if not m:
+            return u
+        return "%s://%s%s" % (m.group(1).lower(), m.group(2).lower(),
+                              m.group(3).rstrip("/") or "")
+    return k(a_) == k(b_)
+
+
+def catalog_entry(x):
+    """One catalog feed, validated field by field. None if unusable. Every
+    field may have come from the network, so none of it is trusted."""
+    if not isinstance(x, dict):
+        return None
+    i = norm_id(x.get("id"))
+    u = safe_url(str(x.get("url") or ""))
+    if not i or not u or len(u) > 600:
+        return None
+    cats = []
+    for c in (x.get("cats") if isinstance(x.get("cats"), list) else [])[:8]:
+        c = norm_cat(c)
+        if c and c not in cats:
+            cats.append(c)
+    if not cats:
+        return None
+    e = {"id": i, "name": clean(str(x.get("name") or i), 32) or i, "url": u,
+         "cats": cats, "kind": x.get("kind") if x.get("kind") in KINDS else "rss"}
+    for f_, lo, hi in (("ttl", 60, 604800), ("timeout", 3, 60)):
+        try:
+            if x.get(f_) is not None:
+                e[f_] = max(lo, min(int(x[f_]), hi))
+        except (TypeError, ValueError):
+            pass
+    for f_ in ("kb", "raw"):
+        try:
+            v = float(x[f_])
+            if 0 <= v < 1e6 and v == v:         # NaN fails v == v
+                e[f_] = round(v, 1)
+        except (KeyError, TypeError, ValueError):
+            pass
+    for f_ in ("gz", "val", "rec"):
+        if isinstance(x.get(f_), bool):
+            e[f_] = x[f_]
+    for f_, n in (("ok", 10), ("fail", 40), ("note", 60)):
+        if isinstance(x.get(f_), str) and x[f_].strip():
+            e[f_] = clean(x[f_], n)
+    return e
+
+
+def catalog_validate(obj):
+    """-> {"feeds": [...], "cats": {...}, "updated": str}. Bad entries are
+    dropped one by one; an index with nothing usable is rejected whole."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("feeds"), list):
+        raise ValueError("not a feed index")
+    feeds, seen = [], set()
+    for x in obj["feeds"][:CATMAXFEEDS]:
+        e = catalog_entry(x)
+        if e and e["id"] not in seen:
+            seen.add(e["id"])
+            feeds.append(e)
+    if not feeds:
+        raise ValueError("no usable feeds in the index")
+    cats = {}
+    raw_c = obj.get("cats") if isinstance(obj.get("cats"), dict) else {}
+    for k_, v in list(raw_c.items())[:64]:
+        k2 = norm_cat(k_)
+        if k2:
+            cats[k2] = clean(str(v), 40) or k2
+    for e in feeds:
+        for c in e["cats"]:
+            cats.setdefault(c, c)
+    return {"feeds": feeds, "cats": cats,
+            "updated": clean(str(obj.get("updated") or ""), 10)}
+
+
+CATOLD = 14 * 86400                    # an index older than this gets a nudge
+
+
+def starred(e):
+    """A star claims "light and reliable". Being picked is not enough: it also
+    needs a recorded check (`catalog check all --write catalog.json`) that
+    found it working and has not since found it failing."""
+    return bool(e.get("rec") and e.get("ok") and not e.get("fail"))
+
+
+def catalog_age_note(idx):
+    """How current the local copy of the index is - not when it was published,
+    which says nothing about how long ago anyone checked for a newer one."""
+    if idx.get("updated") == "built-in" or not idx.get("fetched"):
+        return "built-in list - catalog update for more"
+    a_ = age_of(idx.get("fetched"))
+    if a_ == float("inf"):
+        return "index age unknown - catalog update"
+    if a_ > CATOLD:
+        return "checked %s - catalog update" % ago(int(a_))
+    return "checked %s" % ago(int(a_))
+
+
+# The index as shipped. With no network at all a new install can still offer
+# every recommended feed, and `catalog export` writes it out as catalog.json,
+# which is how the published index is first created. Validated like any
+# fetched index; if it were ever damaged, the defaults alone are offered.
+CATALOG_SEED = '{"v":1,"updated":"2026-10-03","about":"Feeds LowPingNews can subscribe to. kb = compressed size on the wire; gz = server compresses; val = sends ETag/Last-Modified so unchanged refreshes are cheap; ok = month last verified; rec = recommended: light and reliable.","cats":{"top":"Headlines","world":"World","science":"Science","tech":"Technology","bio":"Biology and preprints","health":"Health","alerts":"Hazards and emergencies","app":"LowPingNews releases"},"feeds":[{"id":"bbc","name":"BBC World","url":"https://feeds.bbci.co.uk/news/world/rss.xml","cats":["top","world"],"kb":4.3,"gz":true,"val":false,"ok":"2026-09","rec":true},{"id":"csm","name":"CS Monitor","url":"https://rss.csmonitor.com/feeds/world","cats":["top","world"],"kb":4.4,"gz":true,"val":false,"ok":"2026-09","rec":true},{"id":"dw","name":"DW","url":"https://rss.dw.com/rdf/rss-en-all","cats":["top","world"],"kb":26.3,"gz":true,"val":false,"ok":"2026-09"},{"id":"aje","name":"Al Jazeera","url":"https://www.aljazeera.com/xml/rss/all.xml","cats":["world"],"kb":4.1,"gz":true,"val":true,"ok":"2026-09","rec":true},{"id":"f24","name":"France 24","url":"https://www.france24.com/en/rss","cats":["world"],"kb":8.5,"gz":true,"val":false,"ok":"2026-09"},{"id":"npr","name":"NPR News","url":"https://feeds.npr.org/1001/rss.xml","cats":["top","world"]},{"id":"guardian","name":"Guardian World","url":"https://www.theguardian.com/world/rss","cats":["world"]},{"id":"un","name":"UN News","url":"https://news.un.org/feed/subscribe/en/news/all/rss.xml","cats":["world"]},{"id":"phys","name":"Phys.org","url":"https://phys.org/rss-feed/","cats":["top","science"],"kb":7.8,"gz":true,"val":false,"ok":"2026-09","rec":true},{"id":"sd","name":"ScienceDaily","url":"https://www.sciencedaily.com/rss/all.xml","cats":["science"],"kb":12.1,"gz":true,"val":true,"ok":"2026-09"},{"id":"quanta","name":"Quanta","url":"https://api.quantamagazine.org/feed/","cats":["science"],"kb":3.1,"gz":true,"val":true,"ok":"2026-09","rec":true},{"id":"nature","name":"Nature","url":"https://www.nature.com/nature.rss","cats":["science"],"ttl":21600,"kb":124.3,"gz":false,"val":false,"ok":"2026-09"},{"id":"newsci","name":"New Scientist","url":"https://www.newscientist.com/feed/home/","cats":["science"]},{"id":"aaas","name":"Science news","url":"https://www.science.org/rss/news_current.xml","cats":["science"]},{"id":"ars","name":"Ars Technica","url":"https://feeds.arstechnica.com/arstechnica/index","cats":["top","tech"],"kb":18.6,"gz":true,"val":true,"ok":"2026-09"},{"id":"reg","name":"The Register","url":"https://www.theregister.com/headlines.atom","cats":["tech"],"kb":86.6,"gz":true,"val":false,"ok":"2026-09"},{"id":"hn","name":"Hacker News","url":"https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=20","cats":["tech"],"kind":"hn","kb":20.7,"gz":false,"val":false,"ok":"2026-09"},{"id":"lobsters","name":"Lobsters","url":"https://lobste.rs/rss","cats":["tech"]},{"id":"lwn","name":"LWN.net","url":"https://lwn.net/headlines/rss","cats":["tech"]},{"id":"brxp","name":"bioRxiv plant","url":"https://connect.biorxiv.org/biorxiv_xml.php?subject=plant_biology","cats":["bio"],"ttl":21600,"timeout":25,"kb":77.6,"gz":false,"val":false,"ok":"2026-09"},{"id":"brxs","name":"bioRxiv synbio","url":"https://connect.biorxiv.org/biorxiv_xml.php?subject=synthetic_biology","cats":["bio"],"ttl":21600,"timeout":25,"kb":71.9,"gz":false,"val":false,"ok":"2026-09"},{"id":"brxg","name":"bioRxiv genomics","url":"https://connect.biorxiv.org/biorxiv_xml.php?subject=genomics","cats":["bio"],"ttl":21600,"timeout":25},{"id":"brxm","name":"bioRxiv microbio","url":"https://connect.biorxiv.org/biorxiv_xml.php?subject=microbiology","cats":["bio"],"ttl":21600,"timeout":25},{"id":"epmc","name":"Europe PMC","url":"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=%28plant%20AND%20%28synthetic%20biology%20OR%20transformation%29%29&format=json&pageSize=20&sort=P_PDATE_D%20desc","cats":["bio"],"kind":"epmc","ttl":21600,"rec":true},{"id":"elife","name":"eLife","url":"https://elifesciences.org/rss/recent.xml","cats":["bio"]},{"id":"plosbio","name":"PLOS Biology","url":"https://journals.plos.org/plosbiology/feed/atom","cats":["bio"]},{"id":"who","name":"WHO news","url":"https://www.who.int/rss-feeds/news-english.xml","cats":["health"],"rec":true},{"id":"stat","name":"STAT News","url":"https://www.statnews.com/feed/","cats":["health"]},{"id":"quakes","name":"USGS big quakes","url":"https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_week.atom","cats":["alerts"],"rec":true},{"id":"quakes45","name":"USGS M4.5+ today","url":"https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.atom","cats":["alerts"]},{"id":"gdacs","name":"GDACS disasters","url":"https://www.gdacs.org/xml/rss.xml","cats":["alerts"],"rec":true},{"id":"reliefweb","name":"ReliefWeb","url":"https://reliefweb.int/updates/rss.xml","cats":["alerts"]},{"id":"lpn","name":"LowPingNews","url":"https://github.com/ATinyGreenCell/LowPingNews/releases.atom","cats":["app"],"ttl":86400,"rec":true,"ok":"2026-10","raw":6.2,"val":true,"kb":6.2,"gz":false}]}'
+
+
+def catalog_builtin():
+    """What is known with no network at all: the index shipped in the code."""
+    try:
+        idx = catalog_validate(json.loads(CATALOG_SEED))
+        known = {e["id"] for e in idx["feeds"]}
+        idx["feeds"] += [e for e in (catalog_entry(d) for d in DEFAULTS)
+                         if e and e["id"] not in known]
+        idx["updated"] = "built-in"
+        return idx
+    except (ValueError, TypeError):
+        return {"feeds": [catalog_entry(d) for d in DEFAULTS if catalog_entry(d)],
+                "cats": {}, "updated": "built-in"}
+
+
+def catalog_load():
+    """The fetched index if there is one; the built-in one otherwise.
+
+    A fetched index is authoritative: a feed it no longer lists (pruned after
+    failing its checks) must not keep being offered from the built-in copy.
+    Only the defaults are merged into it, so what ships subscribed stays
+    visible and can be unticked."""
+    got = jread(CATC, {})
+    try:
+        idx = catalog_validate(got)
+    except ValueError:
+        return catalog_builtin()
+    known = {e["id"] for e in idx["feeds"]}
+    idx["feeds"] += [e for e in (catalog_entry(d) for d in DEFAULTS)
+                     if e and e["id"] not in known]
+    idx["fetched"] = got.get("t")
+    return idx
+
+
+class ConfigError(Exception):
+    pass
+
+
+def subs_load():
+    """sources.json for editing. Unlike sources(), which falls back to the
+    defaults so the reader always works, this refuses a damaged file: writing
+    the defaults over it would silently throw the user's feeds away."""
+    if not os.path.exists(CFG):
+        return [dict(d) for d in DEFAULTS]
+    try:
+        with open(CFG, encoding="utf-8") as fh:
+            s = json.load(fh)
+    except Exception as e:
+        raise ConfigError("%s is unreadable (%s) - fix or move it; nothing changed"
+                          % (CFG, str(e)[:40]))
+    if not isinstance(s, list):
+        raise ConfigError("%s is not a list of feeds - nothing changed" % CFG)
+    return s
+
+
+def subs_save(s):
+    """Atomic, with the previous version kept as sources.json.bak."""
+    os.makedirs(CFD, exist_ok=True)
+    if os.path.exists(CFG):
+        try:
+            import shutil
+            shutil.copyfile(CFG, CFG + ".bak")
+        except OSError:
+            pass
+    jwrite(CFG, s)
+
+
+def sub_find(s, fid=None, url=None):
+    for i, x in enumerate(s):
+        if not isinstance(x, dict):
+            continue
+        if fid and norm_id(x.get("id")) == fid:
+            return i
+        if url and same_url(x.get("url"), url):
+            return i
+    return -1
+
+
+def subscribe(entry, cat=None):
+    """Add a feed, or add a category to a feed already there. -> message."""
+    s = subs_load()
+    cat = norm_cat(cat) if cat else None
+    i = sub_find(s, url=entry["url"])
+    if i < 0:
+        j = sub_find(s, fid=entry["id"])
+        if j >= 0:                         # same id, different address
+            return ("%s is already a feed here with a different address; "
+                    "`catalog upgrade` takes the catalog's" % entry["id"])
+        new = {k: v for k, v in entry.items()
+               if k in ("id", "name", "url", "kind", "ttl", "timeout")}
+        new["cats"] = [cat] if cat else list(entry["cats"])
+        s.append(new)
+        subs_save(s)
+        return "added %s to %s" % (new["name"], ", ".join(new["cats"]))
+    x = s[i]
+    cats = [norm_cat(c) for c in (x.get("cats") or []) if norm_cat(c)]
+    want = [cat] if cat else entry["cats"]
+    add = [c for c in want if c not in cats]
+    if not add:
+        return "%s is already in %s" % (x.get("name") or x.get("id"), ", ".join(want))
+    x["cats"] = cats + add
+    subs_save(s)
+    return "added %s to %s" % (x.get("name") or x.get("id"), ", ".join(add))
+
+
+def unsubscribe(fid, cat=None):
+    """Take a feed out of one category, or out entirely. The last feed cannot
+    go: an empty list would silently bring the defaults back."""
+    s = subs_load()
+    i = sub_find(s, fid=norm_id(fid))
+    if i < 0:
+        return "no feed %r" % fid
+    x = s[i]
+    cats = [norm_cat(c) for c in (x.get("cats") or []) if norm_cat(c)]
+    if cat and norm_cat(cat) in cats and len(cats) > 1:
+        x["cats"] = [c for c in cats if c != norm_cat(cat)]
+        subs_save(s)
+        return "removed %s from %s" % (x.get("name") or fid, norm_cat(cat))
+    if len([y for y in s if isinstance(y, dict)]) <= 1:
+        return "that is the only feed left - add another first"
+    del s[i]
+    subs_save(s)
+    return "removed %s" % (x.get("name") or fid)
+
+
+FEEDSIG = re.compile(r"<(rss|feed|rdf:RDF)[\s>]", re.I)
+ALTLINK = re.compile(r"<link\b[^>]*>", re.I)
+
+
+def feed_links(txt):
+    """hrefs a page advertises as its feeds, in page order. Any <link> is not
+    enough: every page has stylesheets, and "alternate icon" is a favicon."""
+    import html as _h
+    out = []
+    for tag in ALTLINK.findall(txt):
+        low = tag.lower()
+        rel = re.search(r"""rel\s*=\s*["']?([^"'>]+)""", low)
+        if not rel or "alternate" not in rel.group(1).split():
+            continue
+        if "rss+xml" not in low and "atom+xml" not in low:
+            continue
+        href = re.search(r"""href\s*=\s*["']([^"']+)["']""", tag, re.I)
+        if href:
+            out.append(_h.unescape(href.group(1)))
+    return out
+
+
+def feed_url(raw):
+    """-> (url, None) or (None, why). What a person types: "lwn.net/headlines",
+    "https://x.org/feed", or something that cannot be a feed address at all."""
+    import urllib.parse
+    u = (raw or "").strip()
+    if not u:
+        return None, "no address given"
+    m = re.match(r"(?i)([a-z][a-z0-9+.-]*):", u)
+    if m and not re.match(r"(?i)https?://", u):
+        if "." in m.group(1) or u[m.end():m.end() + 1].isdigit():
+            pass                               # "example.org:8080/feed": no scheme
+        else:
+            return None, "only http and https feeds (not %s:)" % m.group(1).lower()
+    if not re.match(r"(?i)https?://", u):
+        u = "https://" + u
+    try:
+        p = urllib.parse.urlsplit(u)
+        host, user, pw = p.hostname, p.username, p.password
+    except ValueError:
+        return None, "not a valid address"
+    if not host:
+        return None, "no host in that address"
+    if user or pw:
+        # sources.json is plain text: a password in a feed address would sit
+        # there in the clear, and be shown in every listing
+        return None, "addresses with a user name or password are not stored"
+    if len(u) > 600:
+        return None, "address too long"
+    return u, None
+
+
+def feed_link_title(txt, href):
+    """The title= a page gave the <link> advertising href, or ""."""
+    import html as _h
+    for tag in ALTLINK.findall(txt):
+        h_ = re.search(r"""href\s*=\s*["']([^"']+)["']""", tag, re.I)
+        if h_ and _h.unescape(h_.group(1)) == href:
+            t_ = re.search(r"""title\s*=\s*["']([^"']*)["']""", tag, re.I)
+            return clean(_h.unescape(t_.group(1)), 40) if t_ else ""
+    return ""
+
+
+def probe_feed(url, discover=True):
+    """Is this a feed? Learned from its first few KB, asked for by Range so a
+    server that honours it sends no more. A web page is searched for the feed
+    it advertises, so a site's address works as well as the feed's."""
+    import urllib.error, urllib.parse
+    r = {"url": url, "ok": False, "why": "", "raw": None, "gz": None, "val": None,
+         "title": "", "ms": None, "final": url}
+    u = safe_url(url)
+    if not u:
+        r["why"] = "not an http(s) address"
+        return r
+    t0 = time.time()
+    try:
+        body, h, _w, part = get(u, 15, extra={"Range": "bytes=0-8191"},
+                                cap=PROBECAP, soft=True)
+    except urllib.error.HTTPError as e:
+        r["why"] = "HTTP %s" % e.code
+        return r
+    except OfflineError:
+        r["why"] = "offline"
+        return r
+    except Exception as e:
+        r["why"] = (str(e) or type(e).__name__)[:40]
+        return r
+    r["ms"] = int((time.time() - t0) * 1000)
+    r["final"] = LAST_URL[0] or u
+    if u.lower().startswith("https://") and r["final"].lower().startswith("http://"):
+        r["why"] = "redirects to plain http"
+        return r
+    txt = body.decode("utf-8", "replace")
+    m = re.match(r"bytes \d+-\d+/(\d+)", h.get("Content-Range") or "")
+    if m:
+        r["raw"] = round(int(m.group(1)) / 1024.0, 1)
+    elif not part:
+        r["raw"] = round(len(body) / 1024.0, 1)
+    r["gz"] = "gzip" in (h.get("Content-Encoding") or "").lower() or None
+    r["val"] = bool(h.get("ETag") or h.get("Last-Modified"))
+    if FEEDSIG.search(txt[:4096]):
+        # the feed's own title precedes its first item; a <title> after that is
+        # an article's, and naming the feed after a headline is wrong
+        head_ = re.split(r"<(?:item|entry)[\s>]", txt, maxsplit=1, flags=re.I)[0]
+        t_ = re.search(r"<title[^>]*>(.*?)</title>", head_, re.S | re.I)
+        if t_:
+            import html as _h
+            tt = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", t_.group(1), flags=re.S)
+            r["title"] = clean(_h.unescape(tt), 40)
+        r["ok"] = True
+        return r
+    if discover and re.search(r"<html|<!doctype html", txt[:2048], re.I):
+        if not re.search(r"</head>", txt, re.I) and not feed_links(txt):
+            # big sites put tens of KB of scripts in <head>; the feed link is in
+            # there somewhere. Read on, but only until the head ends.
+            try:
+                more, _h2, _w2, _p2 = get(r["final"], 15, extra={"Range": "bytes=0-98303"},
+                                          cap=96 * 1024, soft=True,
+                                          until=lambda b: b"</head>" in b or b"</HEAD>" in b)
+                txt = more.decode("utf-8", "replace")
+            except Exception:
+                pass
+        for href in feed_links(txt)[:2]:           # first is the main feed; one spare
+            nxt = urllib.parse.urljoin(r["final"], href)
+            found = probe_feed(nxt, discover=False)
+            if found["ok"]:
+                found["page"] = u
+                if not found.get("title"):         # the page named it: use that
+                    found["title"] = feed_link_title(txt, href)
+                return found
+        r["why"] = "a web page with no feed advertised"
+        return r
+    r["why"] = "not a feed" if txt.strip() else "empty response"
+    return r
+
+
+def new_feed_id(s, url, title=""):
+    import urllib.parse
+    host = (urllib.parse.urlsplit(url).hostname or "feed").lower()
+    host = re.sub(r"^(www|feeds?|rss)\.", "", host)
+    # a name you would type: "Weird Little Blog" -> weird-little-blog; the
+    # host only when there is no title, and never a bare IP address
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:16].strip("-")
+    if not slug and not re.match(r"^[\d.]+$|^\[", host):
+        slug = host.split(".")[0]
+    base = norm_id(slug or "feed")[:16] or "feed"
+    used = {norm_id(x.get("id")) for x in s if isinstance(x, dict)}
+    cand, n = base, 2
+    while cand in used:
+        cand = "%s%d" % (base, n)
+        n += 1
+    return cand
+
+
+def add_custom(url, name=None, cat=None, probe=None):
+    """Subscribe to any feed by address (or a site that advertises one)."""
+    p = probe or probe_feed(url)
+    if not p["ok"]:
+        return False, "not added: %s" % (p["why"] or "not a feed")
+    s = subs_load()
+    feed_url = p["final"]
+    entry = {"id": new_feed_id(s, feed_url, name or p["title"]),
+             "name": clean(name or p["title"] or "", 32),
+             "url": feed_url, "cats": [norm_cat(cat) or "top"], "kind": "rss"}
+    entry["name"] = entry["name"] or entry["id"]
+    return True, subscribe(entry, entry["cats"][0])
+
+
+def catalog_update():
+    """apt update: fetch the index if it changed. -> (state, message)."""
+    import urllib.error
+    old = jread(CATC, {})
+    extra = {}
+    if old.get("et"):
+        extra["If-None-Match"] = old["et"]
+    elif old.get("lm"):
+        extra["If-Modified-Since"] = old["lm"]
+    try:
+        raw, h, _w, part = get(CATALOG_URL, 20, extra=extra, cap=CATCAP)
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and old:
+            old["t"] = int(time.time())
+            jwrite(CATC, old)
+            return "same", "feed index unchanged since %s" % (old.get("updated") or "?")
+        if e.code == 404:
+            return "missing", "no feed index published at %s yet" % CATALOG_URL
+        return "error", "feed index: HTTP %s - kept the one you had" % e.code
+    except OfflineError:
+        return "error", "offline - kept the index you had"
+    except Exception as e:
+        return "error", "feed index: %s - kept the one you had" % (str(e)[:40] or "failed")
+    if part:
+        return "error", "feed index arrived truncated - kept the one you had"
+    try:
+        idx = catalog_validate(json.loads(raw.decode("utf-8")))
+    except (ValueError, UnicodeDecodeError) as e:
+        return "error", "feed index rejected (%s) - kept the one you had" % str(e)[:40]
+    before = {e_["id"]: e_ for e_ in (catalog_validate(old)["feeds"] if old.get("feeds") else [])}
+    rec = dict(idx, t=int(time.time()))
+    if h.get("ETag"):
+        rec["et"] = h["ETag"]
+    if h.get("Last-Modified"):
+        rec["lm"] = h["Last-Modified"]
+    jwrite(CATC, rec)
+    new_ids = [e_["id"] for e_ in idx["feeds"] if e_["id"] not in before]
+    gone = [i for i in before if i not in {e_["id"] for e_ in idx["feeds"]}]
+    msg = "feed index %s: %d feeds" % (idx["updated"] or "?", len(idx["feeds"]))
+    if before:
+        msg += ", %d new, %d gone" % (len(new_ids), len(gone))
+    moved = catalog_moved(idx)
+    if moved:
+        msg += "; %d of yours moved (catalog upgrade)" % len(moved)
+    return "new", msg
+
+
+def catalog_moved(idx=None):
+    """Subscribed feeds whose catalog entry now has a different address."""
+    idx = idx or catalog_load()
+    by_id = {e["id"]: e for e in idx["feeds"]}
+    try:
+        s = subs_load()
+    except ConfigError:
+        return []
+    out = []
+    for x in s:
+        if not isinstance(x, dict):
+            continue
+        e = by_id.get(norm_id(x.get("id")))
+        if e and not same_url(e["url"], x.get("url")):
+            out.append((x, e))
+    return out
+
+
+def catalog_check(entries, out=print, budget=None):
+    """Probe each feed, in order, so feeds on one host share a TLS session.
+    -> {id: result}. Stops before a probe it cannot afford."""
+    res = {}
+    for e in entries:
+        if budget is not None and NETSTAT["est"] + predict(8192, e["url"]) > budget:
+            out("  stopped: budget of %s reached" % kbs(budget))
+            break
+        if e.get("kind", "rss") != "rss":
+            p = {"ok": None, "why": "API feed, checked by reading it", "raw": None,
+                 "val": None, "gz": None, "ms": None, "title": ""}
+        else:
+            p = probe_feed(e["url"], discover=False)
+        res[e["id"]] = p
+        out(p, e)
+    return res
+
+
+def catalog_dump(obj):
+    """The index as a file: one feed per line, so a diff shows what changed."""
+    head = {k: obj[k] for k in obj if k != "feeds"}
+    lines = ['{' + ", ".join("%s: %s" % (json.dumps(k), json.dumps(v, ensure_ascii=False))
+                             for k, v in head.items()) + ',', ' "feeds": [']
+    fs = obj.get("feeds") or []
+    for n, f_ in enumerate(fs):
+        lines.append("  " + json.dumps(f_, ensure_ascii=False) + ("," if n < len(fs) - 1 else ""))
+    lines.append(" ]}")
+    return "\n".join(lines) + "\n"
+
+
+def utf_out():
+    """Can stdout carry non-ASCII? LANG=C and some pipes cannot."""
+    enc = (getattr(sys.stdout, "encoding", None) or "ascii").lower()
+    return "utf" in enc
+
+
+def clip(t, cols):
+    """Cut a line to `cols` visible characters. Colour codes take no room and
+    are kept whole, so a clipped line never leaves the terminal coloured."""
+    out, n, i, opened = [], 0, 0, False
+    while i < len(t):
+        if t[i] == "\033":
+            m = re.match(r"\033\[[0-9;]*m", t[i:])
+            if m:
+                out.append(m.group(0))
+                opened = m.group(0) != "\033[0m"
+                i += len(m.group(0))
+                continue
+        if n >= cols - 1:
+            break
+        out.append(t[i])
+        n += 1
+        i += 1
+    s_ = "".join(out)
+    return s_ + ("\033[0m" if opened and not s_.endswith("\033[0m") else "")
+
+
+def cmd_catalog(argv):
+    """lowpingnews catalog [update|list|add|remove|upgrade|check] ..."""
+    try:
+        return _cmd_catalog(argv)
+    except ConfigError as e:
+        # a damaged sources.json is reported, never overwritten, never a traceback
+        sys.exit("news: %s" % e)
+
+
+def _cmd_catalog(argv):
+    import urllib.parse
+    on = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and "--no-color" not in argv
+    P = pal(on)
+    D = P["d"]
+    asc = not utf_out() or "--ascii" in argv
+    STAR, DOT = ("*", "-") if asc else ("\u2605", "\u00b7")
+    nsa = argparse_ns({"ascii": asc})
+    if "--offline" in argv:
+        OFFLINE[0] = True
+    opts, pos, it = {}, [], iter([x for x in argv if x not in ("--no-color", "--offline", "--ascii")])
+    for x in it:
+        if x in ("--to", "--from", "--name", "--write", "--budget"):
+            opts[x[2:]] = next(it, "")
+        elif x in ("--yes", "-y"):
+            opts["yes"] = True
+        elif x.startswith("--"):
+            sys.exit("news: unknown option %s (see: lowpingnews catalog help)" % x)
+        else:
+            pos.append(x)
+    VERBS = ("update", "list", "add", "remove", "upgrade", "check", "export", "help",
+             "-h", "--help")
+    verb = pos[0] if pos else "list"
+    args = pos[1:]
+    if verb not in VERBS:                   # `catalog alerts` lists a category
+        verb, args = "list", pos
+    if verb == "export":                   # the shipped index, as catalog.json
+        seed = json.loads(CATALOG_SEED)
+        sys.stdout.write(catalog_dump(seed))
+        return
+    idx = catalog_load()
+    by_id = {e["id"]: e for e in idx["feeds"]}
+
+    def subs():
+        try:
+            return subs_load()
+        except ConfigError as e:
+            sys.exit("news: %s" % e)
+
+    def mine():
+        out = {}
+        for x in subs():
+            if isinstance(x, dict):
+                out[norm_id(x.get("id"))] = x
+        return out
+
+    def size_of(e):
+        if e.get("kb") is not None:
+            return "~%sK" % ("%g" % e["kb"])
+        if e.get("raw") is not None:
+            return "<%sK" % ("%g" % e["raw"])
+        return "  ?"
+
+    def mark(e, room=999):
+        """Status note cut to the room left on the line, then coloured."""
+        if room < 6:
+            return ""
+        if e.get("fail"):
+            return P["red"](("failed: " + e["fail"])[:room])
+        if not e.get("ok"):
+            return D("unverified"[:room])
+        return ""
+
+    if verb in ("help", "-h", "--help"):
+        print(__doc_catalog__)
+        return
+    if verb == "update":
+        state_, msg = catalog_update()
+        col = {"new": P["grn"], "same": D}.get(state_, P["yel"])
+        print("  " + col(msg) + D("  %s %s" % (bul_(nsa), spent())))
+        return
+    if verb == "list":
+        cats = list(idx["cats"]) or []
+        have = mine()
+        for e in idx["feeds"]:
+            for c in e["cats"]:
+                if c not in cats:
+                    cats.append(c)
+        for x in have.values():
+            for c in x.get("cats") or []:
+                c = norm_cat(c)
+                if c and c not in cats:
+                    cats.append(c)
+        want = [norm_cat(a_) for a_ in args] or cats
+        missing = [w_ for w_ in want if w_ not in cats]
+        if args and (missing or not any(w_ for w_ in want)):
+            sys.exit("news: no category %r. try: %s" % (
+                (missing or args)[0], ", ".join(cats)))
+        src = idx.get("updated") or "?"
+        cols = cols_()
+        pr = lambda t="": print(clip(t, cols))
+        pr(P["hdr"]("FEEDS") + D("  %d available%s" % (
+            len(idx["feeds"]), "" if src == "built-in" else ", index " + src)))
+        note_ = catalog_age_note(idx)          # own line: a narrow screen keeps it
+        pr((P["yel"] if "update" in note_ or "unknown" in note_ else D)("  " + note_))
+        for c in cats:
+            if c not in want:
+                continue
+            label = idx["cats"].get(c, "your category" if c not in
+                                   {z for e in idx["feeds"] for z in e["cats"]} else c)
+            pr("\n" + P["cyn"]("%s" % c) + D("  %s" % label))
+            shown = set()
+            rows = [e for e in idx["feeds"] if c in e["cats"]]
+            rows.sort(key=lambda e: (not starred(e), e.get("kb") or e.get("raw") or 999))
+            for x in have.values():                   # custom feeds in this category
+                if c in [norm_cat(z) for z in x.get("cats") or []] and \
+                        not any(same_url(x.get("url"), e["url"]) for e in rows):
+                    rows.append({"id": norm_id(x.get("id")), "name": x.get("name") or "?",
+                                 "url": x.get("url") or "", "cats": [c], "custom": True})
+            for e in rows:
+                if e["id"] in shown:
+                    continue
+                shown.add(e["id"])
+                x = have.get(e["id"])
+                on_ = bool(x) and c in [norm_cat(z) for z in x.get("cats") or []]
+                if not on_:
+                    on_ = any(same_url(y.get("url"), e["url"]) and
+                              c in [norm_cat(z) for z in y.get("cats") or []] for y in have.values())
+                host = (urllib.parse.urlsplit(e["url"]).hostname or "").replace("www.", "")
+                box = P["grn"]("[x]") if on_ else "[ ]"
+                star = P["yel"](STAR) if starred(e) else " "
+                if cols >= 72:
+                    pr("  %s %-9s %-17s %6s %s %-22s %s" % (
+                        box, e["id"][:9], e["name"][:17], size_of(e), star, host[:22],
+                        mark(e, cols - 67)))
+                else:
+                    # two lines on a phone: where a feed points is never the part cut
+                    pr("  %s %-*s %6s %s" % (box, max(8, cols - 16), e["name"][:max(8, cols - 16)],
+                                                size_of(e), star))
+                    tail = ("%s  %s" % (e["id"], host))[:max(10, cols - 8)]
+                    m_ = mark(e, cols - 9 - len(tail))
+                    pr(D("      " + tail) + (("  " + m_) if m_ else ""))
+        pr()
+        wrapout("add: catalog add ID [--to CATEGORY]  remove: catalog remove ID  "
+                "newest list: catalog update  " + STAR + " light and reliable", P, cols)
+        return
+    if verb == "add":
+        if not args:
+            sys.exit("news: catalog add ID-or-URL [--to CATEGORY] [--name NAME]")
+        to = opts.get("to")
+        if to is not None and not norm_cat(to):
+            sys.exit("news: %r cannot be a category name" % to)
+        failed = 0
+        for a_ in args:
+            e = by_id.get(norm_id(a_))
+            if e and not re.search(r"[:/.]", a_):
+                before = json.dumps(subs(), sort_keys=True)
+                print("  " + subscribe(e, to))
+                failed += json.dumps(subs(), sort_keys=True) == before
+                continue
+            if re.search(r"[:/.]", a_):        # an address, not a catalog id
+                url, why = feed_url(a_)
+                if why:
+                    print("  " + P["red"]("not added: " + why))
+                    failed += 1
+                    continue
+                print(D("  looking at %s ..." % url))
+                p = probe_feed(url)
+                ok, msg = add_custom(url, opts.get("name"), to, probe=p)
+                where = (" (found via %s)" % p["page"]) if p.get("page") else ""
+                print("  " + (P["grn"] if ok else P["red"])(msg) + D(where))
+                print(D("  " + ("checked for %s" % spent() if NETSTAT["est"]
+                                else "nothing was fetched")))
+                failed += not ok
+                continue
+            print("  " + P["red"]("no catalog feed %r - `lowpingnews catalog` lists them" % a_))
+            failed += 1
+        if failed:
+            sys.exit(1)                        # scripts can tell it did not happen
+        return
+    if verb == "remove":
+        if not args:
+            sys.exit("news: catalog remove ID [--from CATEGORY]")
+        failed = 0
+        for a_ in args:
+            before = json.dumps(subs(), sort_keys=True)
+            print("  " + unsubscribe(a_, opts.get("from")))
+            failed += json.dumps(subs(), sort_keys=True) == before
+        if failed:
+            sys.exit(1)
+        return
+    if verb == "upgrade":
+        moved = catalog_moved(idx)
+        if not moved:
+            print("  nothing to upgrade")
+            return
+        s = subs()
+        for x, e in moved:
+            i = sub_find(s, fid=norm_id(x.get("id")))
+            if i >= 0:
+                print("  %s: %s -> %s" % (x.get("id"), x.get("url"), e["url"]))
+                s[i]["url"] = e["url"]
+        subs_save(s)
+        return
+    if verb == "check":
+        scope = args[0].lower() if args else "subscribed"
+        have = mine()
+        if scope == "all":
+            todo = list(idx["feeds"])
+        elif scope == "subscribed":
+            todo = [by_id.get(i) or {"id": i, "name": x.get("name") or i, "url": x.get("url"),
+                                     "kind": x.get("kind") or "rss", "cats": x.get("cats") or []}
+                    for i, x in have.items()]
+        else:
+            c = norm_cat(scope)
+            todo = [e for e in idx["feeds"] if c in e["cats"]] + [
+                {"id": i, "name": x.get("name") or i, "url": x.get("url"), "kind": "rss",
+                 "cats": [c]} for i, x in have.items()
+                if c in [norm_cat(z) for z in x.get("cats") or []] and i not in by_id]
+            if not todo:
+                sys.exit("news: nothing in %r to check" % scope)
+        todo = [e for e in todo if e and e.get("url")]
+        est = sum(predict(8192, e["url"]) for e in todo if e.get("kind", "rss") == "rss")
+        budget = None
+        if opts.get("budget"):
+            try:
+                budget = max(1, int(opts["budget"])) * 1024
+            except ValueError:
+                sys.exit("news: --budget takes kilobytes")
+        print(P["hdr"]("CHECK") + D("  %d feed%s, up to ~%s"
+                                    % (len(todo), "" if len(todo) == 1 else "s", kbs(est))))
+        if est > 200 * 1024 and not opts.get("yes") and budget is None:
+            sys.exit("news: that is a lot of data - add --yes to go ahead, "
+                     "or --budget KB to cap it")
+        stats = {"ok": 0, "bad": 0, "skip": 0}
+
+        def show(p, e):
+            if p["ok"] is None:
+                stats["skip"] += 1
+                print("  %s %-9s %s" % (D("--"), e["id"][:9], D(p["why"])))
+                return
+            if p["ok"]:
+                stats["ok"] += 1
+                bits = ["%dms" % p["ms"] if p["ms"] is not None else "",
+                        ("%sK" % ("%g" % p["raw"])) if p["raw"] is not None else "size ?",
+                        "cheap refresh" if p["val"] else "no validators",
+                        ("moved" if not same_url(p["final"], e["url"]) else "")]
+                print("  %s %-9s %s" % (P["grn"]("ok"), e["id"][:9],
+                                        D("  ".join(b for b in bits if b))))
+            else:
+                stats["bad"] += 1
+                print("  %s %-9s %s" % (P["red"]("!!"), e["id"][:9], P["red"](p["why"])))
+        res = catalog_check(todo, out=lambda *x: show(*x) if len(x) == 2 else print(x[0]),
+                            budget=budget)
+        print(D("  %d ok, %d failed, %d skipped %s %s" % (
+            stats["ok"], stats["bad"], stats["skip"],
+            bul_(nsa), spent())))
+        path = opts.get("write")
+        if path:
+            path = os.path.expanduser(path)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    obj = json.load(fh)
+                catalog_validate(obj)
+            except Exception as e:
+                sys.exit("news: %s is not a feed index (%s)" % (path, str(e)[:40]))
+            month = time.strftime("%Y-%m")
+            n = 0
+            for f_ in obj["feeds"]:
+                p = res.get(norm_id(f_.get("id")))
+                if not p or p["ok"] is None:
+                    continue
+                n += 1
+                if p["ok"]:
+                    f_["ok"] = month
+                    f_.pop("fail", None)
+                    if p["raw"] is not None:
+                        f_["raw"] = p["raw"]
+                    f_["val"] = bool(p["val"])
+                else:
+                    f_["fail"] = p["why"][:40]
+                    f_.pop("ok", None)
+            if n:
+                obj["updated"] = time.strftime("%Y-%m-%d")   # new measurements are news
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(catalog_dump(obj))
+            os.replace(tmp, path)
+            print(D("  wrote %d result%s into %s" % (n, "" if n == 1 else "s", path)))
+        return
+    sys.exit("news: unknown catalog command %r (see: lowpingnews catalog help)" % verb)
+
+
+__doc_catalog__ = """\
+lowpingnews catalog                     list feeds you can subscribe to
+lowpingnews catalog CATEGORY            just one category
+lowpingnews catalog update              fetch the latest feed index (~10 KB)
+lowpingnews catalog add ID [--to CAT]   subscribe; --to puts it in any category,
+                                        new ones included
+lowpingnews catalog add URL [--name N]  any feed, or a site that advertises one
+lowpingnews catalog remove ID [--from CAT]
+lowpingnews catalog upgrade             take new addresses for feeds that moved
+lowpingnews catalog check [subscribed|all|CAT] [--budget KB] [--write FILE]
+                                        probe feeds: reachable, really a feed,
+                                        size, whether refreshes can be cheap
+
+In the reader, press f to do all of this from a menu."""
 
 
 BOOLF = {"--plain": "plain", "--tui": "tui", "-f": "fresh", "--fresh": "fresh", "--offline": "offline",
@@ -1893,6 +2841,8 @@ def main():
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     except Exception:
         pass
+    if sys.argv[1:2] and sys.argv[1] in ("catalog", "feeds"):
+        return cmd_catalog(sys.argv[2:])
     a = fastparse(sys.argv[1:])
     if a is not None:
         return run(a)
@@ -2223,6 +3173,247 @@ def tui_freshness(meta):
     return txt, (3 if stale else 2), stale
 
 
+def all_cats(a):
+    """Every category in use, in a stable order. sources() filters by a.cat,
+    so ask it for everything."""
+    was, a.cat = a.cat, "all"
+    try:
+        every = sources(a)
+    finally:
+        a.cat = was
+    return sorted({str(c).lower() for x in every for c in x.get("cats", [])}) or ["top"]
+
+
+def feeds_screen(scr, put, C, a):
+    """The feed manager: categories as sections, feeds as tick boxes. A tick
+    means "this feed appears in this category". -> True if anything changed."""
+    import curses
+    import urllib.parse
+    state_ = {"sel": 0, "top": 0, "msg": "", "changed": False}
+
+    def build():
+        idx = catalog_load()
+        try:
+            subs = [x for x in subs_load() if isinstance(x, dict)]
+        except ConfigError as e:
+            state_["msg"] = str(e)[:80]
+            subs = []
+        order = list(idx["cats"])
+        for e in idx["feeds"]:
+            for c in e["cats"]:
+                if c not in order:
+                    order.append(c)
+        for x in subs:
+            for c in x.get("cats") or []:
+                c = norm_cat(c)
+                if c and c not in order:
+                    order.append(c)
+        rows = []
+        for c in order:
+            label = idx["cats"].get(c) or ("your category" if not any(
+                c in e["cats"] for e in idx["feeds"]) else "")
+            rows.append(("hdr", c, label if label != c else ""))
+            cand = [e for e in idx["feeds"] if c in e["cats"]]
+            cand.sort(key=lambda e: (not starred(e), e.get("kb") or e.get("raw") or 999))
+            for x in subs:                      # yours in this category, not in the index
+                xc = [norm_cat(z) for z in x.get("cats") or []]
+                if c in xc and not any(same_url(x.get("url"), e["url"]) for e in cand):
+                    cand.append({"id": norm_id(x.get("id")), "name": x.get("name") or "?",
+                                 "url": x.get("url") or "", "cats": xc, "kind": "rss",
+                                 "custom": True})
+            for e in cand:
+                on = any(same_url(x.get("url"), e["url"]) and
+                         c in [norm_cat(z) for z in x.get("cats") or []] for x in subs)
+                rows.append(("feed", c, e, on))
+        return rows, idx
+
+    def prompt(label, initial=""):
+        """One line of input. Enter accepts, Esc cancels. Works with a phone
+        keyboard: printable characters, backspace, paste."""
+        h, w = scr.getmaxyx()
+        buf = list(initial)
+        scr.timeout(-1)
+        try:
+            curses.curs_set(1)
+        except Exception:
+            pass
+        try:
+            while True:
+                text = "".join(buf)
+                room = max(4, w - len(label) - 3)
+                shown = text[-room:]
+                put(h - 1, 0, (" " + label + shown).ljust(w - 1), w - 1, C(3, True))
+                try:
+                    scr.move(h - 1, min(w - 2, len(label) + 1 + len(shown)))
+                except curses.error:
+                    pass
+                scr.refresh()
+                try:
+                    ch = scr.get_wch()
+                except curses.error:
+                    continue
+                except KeyboardInterrupt:
+                    return None
+                if ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+                    # whatever else was pasted with this line must not become
+                    # the next prompt's text, or worse, menu commands
+                    try:
+                        curses.flushinp()
+                    except Exception:
+                        pass
+                    return text.strip()
+                if ch in ("\x1b", 27):
+                    try:
+                        curses.flushinp()
+                    except Exception:
+                        pass
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b", 127, 8):
+                    if buf:
+                        buf.pop()
+                    continue
+                if isinstance(ch, str) and ch.isprintable() and len(buf) < 400:
+                    buf.append(ch)
+        finally:
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+
+    def say(m):
+        state_["msg"] = str(m)[:120]
+
+    rows, idx = build()
+    # start on the first feed, not a heading
+    state_["sel"] = next((i for i, r in enumerate(rows) if r[0] == "feed"), 0)
+    while True:
+        scr.erase()
+        h, w = scr.getmaxyx()
+        n_on = len({r[2]["url"] for r in rows if r[0] == "feed" and r[3]})
+        head = " FEEDS  %d subscribed, %d in the index (%s) " % (
+            n_on, len(idx["feeds"]), catalog_age_note(idx))
+        put(0, 0, head.ljust(w - 1), w - 1, C(6, True))
+        body_h = max(1, h - 2)
+        sel = max(0, min(state_["sel"], len(rows) - 1))
+        if sel < state_["top"]:
+            state_["top"] = sel
+        if sel >= state_["top"] + body_h:
+            state_["top"] = sel - body_h + 1
+        for n in range(body_h):
+            i = state_["top"] + n
+            if i >= len(rows):
+                break
+            r = rows[i]
+            if r[0] == "hdr":
+                put(n + 1, 0, (" %s  %s" % (r[1], r[2])).ljust(w - 1), w - 1, C(6, True))
+                continue
+            e, on = r[2], r[3]
+            host = (urllib.parse.urlsplit(e["url"]).hostname or "").replace("www.", "")
+            size = ("~%gK" % e["kb"]) if e.get("kb") is not None else (
+                "<%gK" % e["raw"]) if e.get("raw") is not None else "?"
+            flag = ("\u2605" if utf_out() else "*") if starred(e) else ("!" if e.get("fail") else " ")
+            line = " %s %s %-*s %5s %s" % ("[x]" if on else "[ ]", flag, max(6, w - 32),
+                                           e["name"][:max(6, w - 32)], size, host[:14])
+            at = curses.A_REVERSE if i == sel else (C(2) if on else C(0))
+            put(n + 1, 0, line.ljust(w - 1), w - 1, at)
+        hint = state_["msg"] or (" space tick  a add URL  t to category  d delete  "
+                                 "u update list  q back")
+        put(h - 1, 0, hint.ljust(w - 1), w - 1, C(4))
+        scr.refresh()
+        scr.timeout(-1)
+        try:
+            c = scr.getch()
+        except KeyboardInterrupt:
+            break
+        state_["msg"] = ""
+        page = max(1, body_h - 1)
+        if c in (ord("q"), ord("b"), 27):
+            break
+        if c in (ord("j"), curses.KEY_DOWN):
+            state_["sel"] = min(len(rows) - 1, sel + 1)
+        elif c in (ord("k"), curses.KEY_UP):
+            state_["sel"] = max(0, sel - 1)
+        elif c in (curses.KEY_NPAGE,):
+            state_["sel"] = min(len(rows) - 1, sel + page)
+        elif c in (curses.KEY_PPAGE,):
+            state_["sel"] = max(0, sel - page)
+        elif c in (ord(" "), ord("\n"), 10, 13, curses.KEY_ENTER) and rows and rows[sel][0] == "feed":
+            _k, cat, e, on = rows[sel]
+            try:
+                if on:
+                    sub_ = [x for x in subs_load() if isinstance(x, dict)
+                            and same_url(x.get("url"), e["url"])]
+                    say(unsubscribe(sub_[0]["id"], cat) if sub_ else "not subscribed")
+                else:
+                    say(subscribe(e, cat))
+                state_["changed"] = True
+            except ConfigError as err:
+                say(err)
+            rows, idx = build()
+        elif c == ord("t") and rows and rows[sel][0] == "feed":
+            e = rows[sel][2]
+            name = prompt("add %s to category: " % e["name"][:16])
+            if name:
+                cat = norm_cat(name)
+                if not cat:
+                    say("%r cannot be a category name" % name)
+                else:
+                    try:
+                        say(subscribe(e, cat))
+                        state_["changed"] = True
+                    except ConfigError as err:
+                        say(err)
+                    rows, idx = build()
+        elif c == ord("a"):
+            cat0 = rows[sel][1] if rows else "top"
+            raw_url = prompt("feed or website address: ")
+            url, why_ = feed_url(raw_url) if raw_url else (None, None)
+            if why_:
+                say("not added: " + why_)
+            if url:
+                put(h - 1, 0, (" looking at %s ..." % url).ljust(w - 1), w - 1, C(3))
+                scr.refresh()
+                e0 = NETSTAT["est"]
+                p = probe_feed(url)
+                cost = kbs(NETSTAT["est"] - e0)
+                if not p["ok"]:
+                    say("not added: %s (~%s)" % (p["why"] or "not a feed", cost))
+                else:
+                    name = prompt("name: ", p["title"] or "")
+                    if name is not None:
+                        cat = prompt("category: ", cat0) or cat0
+                        try:
+                            ok, m_ = add_custom(url, name or None, cat, probe=p)
+                            say("%s (~%s)" % (m_, cost))
+                            state_["changed"] = state_["changed"] or ok
+                        except ConfigError as err:
+                            say(err)
+                        rows, idx = build()
+        elif c == ord("d") and rows and rows[sel][0] == "feed" and rows[sel][3]:
+            e = rows[sel][2]
+            yn = prompt("remove %s from every category? y/n " % e["name"][:20])
+            if yn and yn.lower().startswith("y"):
+                try:
+                    sub_ = [x for x in subs_load() if isinstance(x, dict)
+                            and same_url(x.get("url"), e["url"])]
+                    say(unsubscribe(sub_[0]["id"]) if sub_ else "not subscribed")
+                    state_["changed"] = True
+                except ConfigError as err:
+                    say(err)
+                rows, idx = build()
+        elif c == ord("u"):
+            if OFFLINE[0]:
+                say("offline - the index was not updated")
+            else:
+                put(h - 1, 0, " fetching the feed index ...".ljust(w - 1), w - 1, C(3))
+                scr.refresh()
+                e0 = NETSTAT["est"]
+                _st, m_ = catalog_update()
+                say("%s (~%s)" % (m_, kbs(NETSTAT["est"] - e0)))
+                rows, idx = build()
+    return state_["changed"]
+
+
 def tui_main(scr, a, cats, meter=None):
     import curses
     import threading
@@ -2252,6 +3443,10 @@ def tui_main(scr, a, cats, meter=None):
             pass
 
     scr.keypad(True)
+    try:
+        curses.set_escdelay(25)                 # Esc cancels now, not after a second
+    except Exception:
+        pass                                    # Python < 3.9
     # prefer repainting to hardware insert/delete-line, which emulators
     # implement unevenly (scroll regions are handled in adopt() instead)
     try:
@@ -2423,7 +3618,7 @@ def tui_main(scr, a, cats, meter=None):
                 if S["bscroll"] + n >= len(S["body"]):
                     break
                 put(n + 1, 0, S["body"][S["bscroll"] + n][:w - 1], w - 1)
-        keys = (" j/k move  enter read  s star  o open  r refresh  n/p cat  q quit"
+        keys = (" j/k  enter read  s star  o open  r refresh  n/p cat  f feeds  q quit"
                 if S["mode"] == "list" else
                 " j/k scroll  b back  s star  o open  q quit")
         msg = note["text"] if time.time() < note["until"] else ""
@@ -2553,6 +3748,18 @@ def tui_main(scr, a, cats, meter=None):
                 ci[0] = (ci[0] + (-1 if c == ord("p") else 1)) % len(cats)
                 a.cat = cats[ci[0]]
                 load_now(False, "loading %s..." % cats[ci[0]])
+            elif c == ord("f"):
+                changed = feeds_screen(scr, put, C, a)
+                try:
+                    scr.clearok(True)
+                except Exception:
+                    pass
+                if changed:
+                    cats[:] = all_cats(a)
+                    if (a.cat or "") not in cats:
+                        a.cat = cats[0]
+                    ci[0] = cats.index(a.cat)
+                    load_now(False, "loading %s..." % a.cat)
             elif c == ord("s") and rows:
                 toggle_star(rows[S["sel"]][0])
             elif c == ord("o") and rows:
@@ -2622,10 +3829,7 @@ def cmd_tui(a, P, D, explicit=True):
         sys.exit("news: --tui needs a terminal (this looks like a pipe)")
     import curses
     os.environ["LPN_NO_PROGRESS"] = "1"     # the progress bar would draw over us
-    was, a.cat = a.cat, "all"              # sources() filters by a.cat
-    every = sources(a)
-    a.cat = was
-    cats = sorted({str(c).lower() for x in every for c in x.get("cats", [])}) or ["top"]
+    cats = all_cats(a)
     a.cat = (a.cat or "top").lower()
     if a.cat not in cats:
         a.cat = cats[0]
@@ -2987,14 +4191,12 @@ def run(a):
         w = cols_()
         for x in allsrc:
             cats = ",".join(x["cats"])
-            if w >= 72:
-                print("  %-7s %-14s %-20s %s" % (x["id"], x["name"][:14], cats[:20],
-                                                 D(x["url"][:w - 46])))
-            else:
-                print("  %s %s %s" % (C("%-7s" % x["id"]), x["name"][:w - 22],
-                                      D(cats[:12])))
-                print(D("          " + x["url"][:max(10, w - 11)]))
-        print(D("\n  edit: %s" % CFG))
+            # categories in full: with custom ones, a truncated column hid them
+            print("  %s %s" % (C("%-9s" % x["id"][:9]), x["name"][:max(8, w - 13)]))
+            print(D("            %s" % cats[:max(10, w - 13)]))
+            print(D("            " + x["url"][:max(10, w - 13)]))
+        print(D("\n  manage: lowpingnews catalog   or press f in the reader"))
+        print(D("  edit:   %s" % CFG))
         return
 
     pick = a.open or a.read or a.star

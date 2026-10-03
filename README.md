@@ -483,17 +483,100 @@ same `.full` page. When full text still is not had, the reader says why:
   tried: 2026.09.20.677123v1.full HTTP 403
 ```
 
+## Choosing feeds
+
+Press **f** in the reader for the feed manager: every category is a section,
+and ticking a feed puts it in that category. Each row shows the feed's size
+and the host it points to. A ★ marks a recommended feed that a recorded check
+has found working and light; a recommended feed nobody has checked yet shows
+`unverified` instead, and gets its star once `catalog check` vouches for it.
+
+```
+ FEEDS  9 subscribed, 33 in the index (checked 2d ago)
+ alerts  Hazards and emergencies
+ [x]   USGS big quakes             ? earthquake.usgs.gov
+ [ ]   GDACS disasters             ? gdacs.org
+```
+
+  space  tick or untick for this category
+  t      add this feed to another category - type a new name to create one
+  a      add any feed by address, or a website that advertises one
+  d      remove a feed from every category
+  u      fetch the newest feed list
+
+The same from the command line, apt-style:
+
+```sh
+lowpingnews catalog update               # fetch the newest feed list
+lowpingnews catalog                      # what you can subscribe to
+lowpingnews catalog alerts               # one category
+lowpingnews catalog add quakes           # subscribe
+lowpingnews catalog add quakes --to "Survival Kit"   # any category, new ones too
+lowpingnews catalog add example.org/blog # a site: its advertised feed is found
+lowpingnews catalog remove quakes --from alerts
+lowpingnews catalog check                # are my feeds healthy?
+```
+
+**The feed list** is `catalog.json` in this repository: one gzipped file of
+about 1.6 KB, fetched only when you ask and only if it changed (an unchanged
+check costs a TLS handshake, ~7 KB). It is a list of suggestions — updating it
+never changes what you are subscribed to. Every field in it is treated as
+untrusted: addresses must be http(s), names are stripped of control
+characters, categories are normalised, and a malformed entry is dropped on its
+own while a malformed file is rejected whole, keeping the one you had. If a feed
+you follow moves, `catalog update` says so and `catalog upgrade` takes the new
+address.
+
+The whole list also ships inside the program, so a new install with no
+network can still offer every recommendation. Once a list has been fetched it
+is authoritative: a feed the published list drops — typically one that failed
+its checks — stops being offered, rather than living on from the built-in
+copy. The header always says how long ago your copy was checked, and nudges
+you after two weeks; a timestamp from a wrong clock reads as "age unknown".
+
+**Checking feeds.** `catalog check` asks each feed for its first 8 KB only, by
+range request, and reports whether it answered, whether it is really a feed,
+its size, and whether it sends validators (which make unchanged refreshes
+cheap). Servers that ignore range requests are cut off early with a small
+receive window: a probe that once received 129 KB for a 481 KB feed now
+receives about 30 KB. `check all` asks first if the total looks large, and
+`--budget KB` caps it. `--write catalog.json` records the results in the file,
+which is how entries get their `ok` date: run it on a phone and commit.
+
+**Adding by address** accepts what people actually type — `lwn.net/headlines`,
+a full URL, a host with a port — and refuses anything that cannot be a feed:
+other schemes (`ftp:`, `file:`, `javascript:`), an address with no host, and
+an address containing a user name or password, which would otherwise sit in
+`sources.json` in plain text. A feed found through a web page is named after
+the feed itself, or the name the page gave it — never after its first article.
+Pasting several lines at a prompt takes the first and discards the rest, so
+leftover text can never reach the next prompt or act as menu keys. Failed
+`add` and `remove` commands exit non-zero, so scripts can tell.
+
+**Verification status of the shipped list.** The fifteen defaults were checked
+by real fetches from a phone; the project's own release feed was checked from
+the build machine. The other recommendations — including the hazard feeds —
+have not been checked from a real connection yet, which is why they carry no
+star. `lowpingnews catalog check all --write catalog.json` on a phone, then a
+release, is how that changes.
+
+Categories are yours to make: any word in any script (`été`, `日本`) except the
+few the command line already uses (`all`, `weather`, `signal`, `saved`...).
+Every edit keeps the previous `sources.json` as `sources.json.bak`, a damaged
+`sources.json` is reported rather than overwritten, and the last feed cannot be
+removed, since an empty list would quietly bring the defaults back.
+
 ## Interactive mode (the default)
 
 In a terminal, `lowpingnews` opens the interactive reader:
 
 ```
- LowPingNews 6.3  BIO  40 items            ▂▃▂▁▂ 38ms good
+ LowPingNews 6.7  BIO  40 items            ▂▃▂▁▂ 38ms good
  • bioRxiv plant  3d   BSA101: Unlocking Historical Mutant...
 ```
 
   j/k move    enter read    b back    s star    o open
-  n/p category    r refresh    q quit
+  n/p category    r refresh    f feeds    q quit
 
 The classic list is still there, and is what you get whenever the invocation
 asks for it: `--plain`, any list-shaping flag (`-t`, `-u`, `-n`, `-q`,

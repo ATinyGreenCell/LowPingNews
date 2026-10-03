@@ -782,14 +782,14 @@ def t_tui_is_default_only_in_a_plain_terminal_session(env, srv):
     sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
                    "url": srv.url("/f")}])
     e = dict(env); e["LPN_NO_PING"] = "1"
-    tui = lambda o: "j/k move" in o
+    tui = lambda o: "enter read" in o
     assert tui(_drive_tui(e, [b"q"], args=())), "bare `news` did not open the TUI"
     assert not tui(_drive_tui(e, [b"q"], args=("-t",))), "-t should keep list output"
     assert not tui(_drive_tui(e, [b"q"], args=("--plain",))), "--plain ignored"
     d = dict(e); d["TERM"] = "dumb"
     assert not tui(_drive_tui(d, [b"q"], args=())), "TUI on a dumb terminal"
     out, _, _ = run(env)                               # piped
-    assert "j/k move" not in out and out.strip(), "a pipe got the TUI"
+    assert "enter read" not in out and out.strip(), "a pipe got the TUI"
 
 
 @test
@@ -1262,6 +1262,402 @@ def t_update_installs_a_newer_build(env, srv):
     m, copy, _r = _update_fixture(srv, env, "999.0")
     out, v = _update(env, copy, srv.url("/news"))
     assert v.endswith("999.0"), "a newer build was not installed:\n%s" % out
+
+
+# ---------------------------------------------------------------- catalog
+def _cat(env, srv, obj, et='"c1"', status=200, raw=None):
+    """Serve a feed index; honours If-None-Match like a real server."""
+    env["LPN_CATALOG_URL"] = srv.url("/catalog.json")
+    body = raw if raw is not None else gzip.compress(json.dumps(obj).encode())
+
+    def h(req):
+        if req.headers.get("If-None-Match") == et:
+            req.send_response(304)
+            req.send_header("Content-Length", "0")
+            req.end_headers()
+            return
+        req.send_response(status)
+        if raw is None:
+            req.send_header("Content-Encoding", "gzip")
+        req.send_header("ETag", et)
+        req.send_header("Content-Length", str(len(body)))
+        req.end_headers()
+        req.wfile.write(body)
+    srv.routes["/catalog.json"] = h
+
+
+def _feedpage(srv, path, title="A feed", ranged=True, items=30):
+    body = ('<?xml version="1.0"?><rss version="2.0"><channel><title>%s</title>%s'
+            '</channel></rss>' % (title, "".join(
+                "<item><title>Story %d</title><link>http://e.invalid/%d</link>"
+                "<description>d</description></item>" % (i, i) for i in range(items)))).encode()
+
+    def h(req):
+        rg = req.headers.get("Range")
+        b, st = body, 200
+        if ranged and rg and rg.startswith("bytes=0-"):
+            b, st = body[:int(rg.split("-")[1]) + 1], 206
+        req.send_response(st)
+        if st == 206:
+            req.send_header("Content-Range", "bytes 0-%d/%d" % (len(b) - 1, len(body)))
+        req.send_header("Content-Length", str(len(b)))
+        req.end_headers()
+        try:
+            req.wfile.write(b)
+        except Exception:
+            pass
+    srv.routes[path] = h
+
+
+def _cl(env, *args):
+    p = subprocess.run([NEWS, "catalog"] + list(args), stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=env)
+    out = re.sub(r"\x1b\[[0-9;]*m", "", (p.stdout + p.stderr).decode("utf-8", "replace"))
+    assert "Traceback" not in out, out[-400:]
+    return out, p.returncode
+
+
+def _subs(env):
+    p = os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "sources.json")
+    return json.load(io.open(p, encoding="utf-8"))
+
+
+@test
+def t_shipped_catalog_is_valid_in_full(env, srv):
+    """A typo in catalog.json would silently drop a feed for every user."""
+    m = load()
+    raw = json.load(io.open(os.path.join(HERE, "catalog.json"), encoding="utf-8"))
+    idx = m.catalog_validate(raw)
+    assert len(idx["feeds"]) == len(raw["feeds"]), "entries dropped by validation"
+    ids = [f["id"] for f in raw["feeds"]]
+    assert len(ids) == len(set(ids)), "duplicate ids"
+    for f in raw["feeds"]:
+        assert f["url"].startswith("https://"), "%s is not https" % f["id"]
+
+
+@test
+def t_hostile_catalog_entries_are_dropped_one_by_one(env, srv):
+    m = load()
+    idx = m.catalog_validate({"feeds": [
+        {"id": "ok", "name": "Fine", "url": "https://ok.invalid/r", "cats": ["world"]},
+        {"id": "../../etc", "name": "x", "url": "https://a.invalid/", "cats": ["x"]},
+        {"id": "js", "name": "x", "url": "javascript:alert(1)", "cats": ["x"]},
+        {"id": "file", "name": "x", "url": "file:///etc/passwd", "cats": ["x"]},
+        {"id": "esc", "name": "Evil\u001b[31m\u0007", "url": "https://e.invalid/", "cats": ["x"]},
+        {"id": "nan", "name": "n", "url": "https://n.invalid/", "cats": ["x"], "kb": float("nan")},
+        {"id": "res", "name": "r", "url": "https://r.invalid/", "cats": ["weather", "all"]},
+        {"id": "ok", "name": "Duplicate", "url": "https://dup.invalid/", "cats": ["x"]},
+        "not a dict", None, 42]})
+    ids = [f["id"] for f in idx["feeds"]]
+    assert ids == ["ok", "etc", "esc", "nan"], ids
+    esc = [f for f in idx["feeds"] if f["id"] == "esc"][0]
+    assert "\x1b" not in esc["name"] and "\x07" not in esc["name"]
+    assert "kb" not in [f for f in idx["feeds"] if f["id"] == "nan"][0]
+    for bad in ({}, {"feeds": "x"}, {"feeds": [{"id": "x"}]}, [], "junk"):
+        try:
+            m.catalog_validate(bad)
+            raise AssertionError("accepted an unusable index: %r" % (bad,))
+        except ValueError:
+            pass
+
+
+@test
+def t_catalog_update_is_conditional_and_keeps_the_old_on_failure(env, srv):
+    good = {"updated": "2026-09-28", "feeds": [
+        {"id": "quakes", "name": "Quakes", "url": "https://q.invalid/a", "cats": ["alerts"]}]}
+    _cat(env, srv, good)
+    out, _ = _cl(env, "update")
+    assert "1 feeds" in out, out
+    out, _ = _cl(env, "update")
+    assert "unchanged" in out, "second update was not conditional: " + out
+    for bad, why in ((b"{not json", "rejected"), (b'{"feeds": []}', "rejected"),
+                     (gzip.compress(b'{"feeds": [') , "rejected")):
+        _cat(env, srv, None, et='"other"', raw=bad)
+        out, _ = _cl(env, "update")
+        assert "kept the one you had" in out, out
+        out, _ = _cl(env, "alerts")
+        assert "Quakes" in out, "a bad index replaced the good one"
+    _cat(env, srv, good, status=404, et='"x"')
+    out, _ = _cl(env, "update")
+    assert "kept" in out or "no feed index published" in out, out
+
+
+@test
+def t_catalog_update_offline_spends_nothing(env, srv):
+    _cat(env, srv, {"feeds": [{"id": "a", "name": "A", "url": "https://a.invalid/",
+                               "cats": ["x"]}]})
+    before = len(srv.seen)
+    out, _ = _cl(env, "update", "--offline")
+    assert len(srv.seen) == before and "offline" in out, out
+
+
+@test
+def t_subscribe_is_idempotent_and_never_clobbers_a_broken_config(env, srv):
+    _feedpage(srv, "/q.xml")
+    _cat(env, srv, {"feeds": [{"id": "quakes", "name": "Quakes", "url": srv.url("/q.xml"),
+                               "cats": ["alerts"]}]})
+    _cl(env, "update")
+    _cl(env, "add", "quakes")
+    _cl(env, "add", "quakes")
+    s = [x for x in _subs(env) if x["id"] == "quakes"]
+    assert len(s) == 1 and s[0]["cats"] == ["alerts"], s
+    out, _ = _cl(env, "add", "quakes", "--to", "Survival Kit")
+    assert [x for x in _subs(env) if x["id"] == "quakes"][0]["cats"] == ["alerts", "survival-kit"]
+    out, rc = _cl(env, "add", "quakes", "--to", "weather")
+    assert rc != 0 and "cannot be a category" in out, "a reserved word became a category"
+    cfg = os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "sources.json")
+    io.open(cfg, "w").write("{ this is not json")
+    out, _ = _cl(env, "add", "quakes", "--to", "elsewhere")
+    assert "unreadable" in out and io.open(cfg).read() == "{ this is not json", \
+        "a damaged config was overwritten"
+
+
+@test
+def t_the_last_feed_cannot_be_removed(env, srv):
+    sources(env, [{"id": "only", "name": "Only", "kind": "rss", "cats": ["top"],
+                   "url": "https://o.invalid/"}])
+    out, _ = _cl(env, "remove", "only")
+    assert "only feed left" in out, out
+    assert [x["id"] for x in _subs(env)] == ["only"]
+
+
+@test
+def t_probe_finds_feeds_and_refuses_what_is_not(env, srv):
+    m = load()
+    _feedpage(srv, "/f.xml", title="Real &amp; Feed")
+    _page(srv, "/site", '<!doctype html><html><head><link rel="stylesheet" href="s.css">'
+          '<link rel="alternate icon" href="i.png"><LINK REL=alternate '
+          'TYPE="application/rss+xml" HREF="/f.xml"></head></html>')
+    _page(srv, "/plain", "<!doctype html><html><head></head><body>no feed</body></html>")
+    _page(srv, "/empty", "")
+    p = m.probe_feed(srv.url("/f.xml"))
+    assert p["ok"] and p["title"] == "Real & Feed", p
+    p = m.probe_feed(srv.url("/site"))
+    assert p["ok"] and p["final"].endswith("/f.xml") and p.get("page"), p
+    assert not m.probe_feed(srv.url("/plain"))["ok"]
+    assert not m.probe_feed(srv.url("/empty"))["ok"]
+    assert m.probe_feed(srv.url("/missing"))["why"] == "HTTP 404"
+    assert not m.probe_feed("javascript:alert(1)")["ok"]
+
+
+@test
+def t_probe_cost_is_bounded_when_range_is_ignored(env, srv):
+    """Measured before the fix: 129 KB received for a probe meant to read 16."""
+    m = load()
+    _feedpage(srv, "/big.xml", ranged=False, items=12000)
+    p = m.probe_feed(srv.url("/big.xml"))
+    assert p["ok"]
+    # what it keeps plus what is in flight when it stops - not the whole feed
+    bound = m.PROBECAP + m.PROBEWIN + 1024
+    assert m.NETSTAT["body"] <= bound, "probe billed %d bytes" % m.NETSTAT["body"]
+
+
+@test
+def t_adding_a_site_twice_does_not_duplicate_it(env, srv):
+    _feedpage(srv, "/f.xml", title="Little Blog")
+    _page(srv, "/site", '<html><head><link rel="alternate" type="application/rss+xml" '
+          'href="/f.xml"></head></html>')
+    _cl(env, "add", srv.url("/site"), "--to", "reading")
+    _cl(env, "add", srv.url("/f.xml"), "--to", "evenings")
+    mine = [x for x in _subs(env) if x["url"].endswith("/f.xml")]
+    assert len(mine) == 1 and mine[0]["cats"] == ["reading", "evenings"], mine
+    assert mine[0]["id"] == "little-blog", mine[0]["id"]
+
+
+@test
+def t_check_reports_respects_budget_and_writes_results(env, srv):
+    _feedpage(srv, "/ok.xml")
+    idx = {"updated": "2026-09-28", "cats": {"x": "X"}, "feeds": [
+        {"id": "good", "name": "Good", "url": srv.url("/ok.xml"), "cats": ["x"]},
+        {"id": "gone", "name": "Gone", "url": srv.url("/nope.xml"), "cats": ["x"], "ok": "2026-01"},
+        {"id": "api", "name": "API", "url": srv.url("/api"), "cats": ["x"], "kind": "hn"}]}
+    _cat(env, srv, idx)
+    _cl(env, "update")
+    os.makedirs(env["XDG_DATA_HOME"], exist_ok=True)
+    path = os.path.join(env["XDG_DATA_HOME"], "catalog.json")
+    io.open(path, "w", encoding="utf-8").write(json.dumps(idx))
+    out, _ = _cl(env, "check", "x", "--write", path)
+    assert "1 ok, 1 failed, 1 skipped" in out, out
+    res = {f["id"]: f for f in json.load(io.open(path, encoding="utf-8"))["feeds"]}
+    assert res["good"].get("ok") and res["good"].get("raw") is not None
+    assert res["gone"].get("fail") == "HTTP 404" and "ok" not in res["gone"]
+    lines = io.open(path, encoding="utf-8").read().count("\n")
+    assert lines >= 5, "written index is not one feed per line"
+    out, _ = _cl(env, "check", "x", "--budget", "1")
+    assert "budget" in out, out
+
+
+@test
+def t_catalog_listing_fits_any_width(env, srv):
+    _cat(env, srv, {"feeds": [
+        {"id": "longid12345", "name": "A very long feed name indeed", "cats": ["x"],
+         "url": "https://a-very-long-hostname.example.org/feed", "fail": "HTTP 404 Not Found"},
+        {"id": "s", "name": "S", "url": "https://s.invalid/", "cats": ["x"], "rec": True}]})
+    _cl(env, "update")
+    for cols in ("20", "40", "46", "80"):
+        e = dict(env); e["COLUMNS"] = cols
+        out, _ = _cl(e, "x")
+        over = [l for l in out.split("\n") if len(l) > int(cols)]
+        assert not over, "%s cols: %r" % (cols, over[0])
+
+
+@test
+def t_feed_manager_ticks_and_creates_categories(env, srv):
+    _feedpage(srv, "/g.xml")
+    _cat(env, srv, {"cats": {"alerts": "Hazards"}, "feeds": [
+        {"id": "gdacs", "name": "GDACS disasters", "url": srv.url("/g.xml"), "cats": ["alerts"]}]})
+    _cl(env, "update")
+    sources(env, [{"id": "a", "name": "Alpha", "kind": "rss", "cats": ["top"],
+                   "url": "https://a.invalid/"}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    keys = [b"f", b" ", b"t"] + [bytes([ch]) for ch in b"Survival Kit"] + [b"\r", b"q", b"q"]
+    _drive_tui(e, keys, cols=60, settle=0.5)
+    g = [x for x in _subs(env) if x["id"] == "gdacs"]
+    assert g and g[0]["cats"] == ["alerts", "survival-kit"], _subs(env)
+
+
+@test
+def t_release_tooling_allows_the_catalog(env, srv):
+    """test.py was once missing from this list; every release after it was
+    silently rejected and a stale build shipped in its place."""
+    tool = io.open(os.path.join(HERE, "lowpingnews"), encoding="utf-8").read()
+    owned = re.search(r'^OWNED="([^"]*)"', tool, re.M).group(1).split()
+    allow = re.search(r"\n\s*(news\|[^)]*)\)", tool).group(1).split("|")
+    for f in ("news", "test.py", "catalog.json", "README.md", "lowpingnews", "install.sh"):
+        assert f in owned, "%s not in OWNED" % f
+        assert f in allow, "%s would make sync reject the tarball" % f
+
+
+# ---------------------------------------------------------------- catalog audit
+@test
+def t_added_feed_is_named_after_the_feed_not_an_article(env, srv):
+    m = load()
+    _page(srv, "/chan", '<?xml version="1.0"?><rss version="2.0"><channel><title>Real '
+          'Channel</title><item><title>Some article</title></item></channel></rss>')
+    _page(srv, "/bare", '<?xml version="1.0"?><rss version="2.0"><channel>'
+          '<item><title>Some article</title></item></channel></rss>')
+    _page(srv, "/site", '<html><head><link rel="alternate" type="application/rss+xml" '
+          'title="Site feed" href="/bare"></head><body>x</body></html>')
+    assert m.probe_feed(srv.url("/chan"))["title"] == "Real Channel"
+    assert m.probe_feed(srv.url("/bare"))["title"] == "", "named a feed after an article"
+    assert m.probe_feed(srv.url("/site"))["title"] == "Site feed", "ignored the page's name"
+
+
+@test
+def t_feed_addresses_are_checked_before_use(env, srv):
+    m = load()
+    assert m.feed_url("lwn.net/headlines/rss")[0] == "https://lwn.net/headlines/rss"
+    assert m.feed_url("example.org:8080/feed")[0] == "https://example.org:8080/feed"
+    for bad in ("ftp://x.org/f", "javascript:alert(1)", "file:///etc/passwd", "http://",
+                "", "https://user:pw@x.org/f", "mailto:a@b.c"):
+        u, why = m.feed_url(bad)
+        assert u is None and why, "accepted %r as %r" % (bad, u)
+
+
+@test
+def t_failed_catalog_changes_exit_nonzero(env, srv):
+    env = dict(env); env["LPN_CATALOG_URL"] = srv.url("/none")
+    for args in (["catalog", "add", "ftp://x.org/f"], ["catalog", "add", "nosuchfeed"],
+                 ["catalog", "remove", "nosuchfeed"]):
+        p = subprocess.run([NEWS] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        assert p.returncode != 0, "%s failed but exited 0" % " ".join(args)
+
+
+@test
+def t_catalog_says_how_old_the_local_index_is(env, srv):
+    m = load()
+    for t, want in ((time.time() - 40 * 86400, "40d"), (time.time() + 30 * 86400, "unknown")):
+        note = m.catalog_age_note({"updated": "2026-10-03", "fetched": t, "feeds": []})
+        assert want in note, "an index checked long ago looked current: %r" % note
+    assert "built-in" in m.catalog_age_note({"updated": "built-in", "feeds": []})
+
+
+@test
+def t_offline_install_offers_the_whole_catalog(env, srv):
+    m = load()
+    seed = json.loads(m.CATALOG_SEED)
+    assert len(m.catalog_builtin()["feeds"]) >= len(seed["feeds"]) > len(m.DEFAULTS)
+    p = subprocess.run([NEWS, "catalog", "export"], stdout=subprocess.PIPE, env=env)
+    exported = json.loads(p.stdout.decode("utf-8"))
+    assert m.catalog_validate(exported)["feeds"], "export is not a valid index"
+    shipped = os.path.join(HERE, "catalog.json")
+    if os.path.exists(shipped):
+        assert io.open(shipped, encoding="utf-8").read() == p.stdout.decode("utf-8"), \
+            "catalog.json and the built-in index have drifted apart"
+
+
+@test
+def t_pasted_lines_do_not_leak_into_the_next_prompt(env, srv):
+    """Pasting two lines left the second as text in the next prompt - or as
+    menu commands, where d then y deletes a feed."""
+    _page(srv, "/site", '<html><head><link rel="alternate" type="application/rss+xml" '
+          'title="Site feed" href="/feed"></head><body>x</body></html>')
+    srv.feed("/feed", [item("Post")])
+    srv.feed("/f", [item("Story")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"; e["LPN_CATALOG_URL"] = srv.url("/none")
+    burst = (srv.url("/site") + "\nddyy tttq").encode()          # one write, like a paste
+    out = _drive_tui(e, [b"f", b"a", burst, b"\x1b", b"\x1b", b"q", b"q"],
+                     cols=80, settle=1.5)
+    assert "Site feedddyy" not in out and "feedddyy" not in out, "the paste leaked"
+    assert "Site feed" in out
+
+
+@test
+def t_a_feed_pruned_from_the_index_stops_being_offered(env, srv):
+    m = load()
+    seed_ids = {e["id"] for e in json.loads(m.CATALOG_SEED)["feeds"]}
+    extra = sorted(seed_ids - {d["id"] for d in m.DEFAULTS})[0]   # not a default
+    _cat(env, srv, {"feeds": [{"id": "only", "name": "Only", "cats": ["world"],
+                               "url": "https://example.org/only"}]})
+    _cl(env, "update")
+    out, _, _ = run(env, "catalog")
+    assert "Only" in out
+    names = {e["id"]: e["name"] for e in json.loads(m.CATALOG_SEED)["feeds"]}
+    assert names[extra] not in out, "%s was pruned but is still offered" % extra
+
+
+@test
+def t_star_needs_a_recorded_check(env, srv):
+    m = load()
+    assert not m.starred({"rec": True}), "a picked but never-checked feed got a star"
+    assert m.starred({"rec": True, "ok": "2026-10"})
+    assert not m.starred({"rec": True, "ok": "2026-09", "fail": "HTTP 404"})
+    assert not m.starred({"ok": "2026-10"})
+
+
+@test
+def t_catalog_only_changes_can_be_released(env, srv):
+    """Publishing `catalog check --write` results changes only catalog.json;
+    a guard that compared news alone refused it as a version-only bump."""
+    tool = io.open(os.path.join(HERE, "lowpingnews"), encoding="utf-8").read()
+    fn = re.search(r"^release_has_changes\(\) \{.*?^\}", tool, re.S | re.M).group(0)
+    d = tempfile.mkdtemp()
+    try:
+        g = lambda *a: subprocess.run(["git", "-C", d] + list(a), stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+        g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        for f in ("news", "catalog.json"):
+            src = os.path.join(HERE, f)
+            if not os.path.exists(src):
+                return                                   # nothing to compare yet
+            shutil.copy(src, d)
+        g("add", "-A"); g("commit", "-qm", "base"); g("tag", "v1")
+
+        def allowed():
+            p = subprocess.run(["bash", "-c", "REPO=%s; %s\nrelease_has_changes" % (d, fn)])
+            return p.returncode == 0
+        news_p = os.path.join(d, "news")
+        src = io.open(news_p, encoding="utf-8").read()
+        io.open(news_p, "w", encoding="utf-8").write(
+            re.sub(r'^VERSION = "[^"]+"', 'VERSION = "999.0"', src, count=1, flags=re.M))
+        assert not allowed(), "a bare version bump was allowed"
+        with io.open(os.path.join(d, "catalog.json"), "a", encoding="utf-8") as fh:
+            fh.write("\n")
+        assert allowed(), "a catalog-only change was refused"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 @test
