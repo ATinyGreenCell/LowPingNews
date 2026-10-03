@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "6.1"
+VERSION = "6.5"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -244,27 +244,69 @@ KINDNOTE = {
 }
 
 
-def kind_note(how):
-    return KINDNOTE.get(how, (how, "d"))
+def kind_note(how, it=None):
+    """Label for what a read produced; a saved copy also says how old it is."""
+    note, col = KINDNOTE.get(how, (how, "d"))
+    if it is not None and str(how).startswith("offline-"):
+        try:
+            a_ = age_of(os.path.getmtime(apath(key(it["ti"]))))
+        except OSError:
+            a_ = None
+        if a_ is not None:
+            note += ", age unknown" if a_ == float("inf") else ", saved %s" % ago(int(a_))
+    return note, col
+
+
+LISTOLD = 3600                 # -r/-o/-S on a list older than this gets a note
+
+
+def list_age_note():
+    """-r 3 means "item 3 of the last list you saw". If that list is old, the
+    reader should know it is not today's item 3."""
+    try:
+        a_ = age_of(os.path.getmtime(LAST))
+    except OSError:
+        return ""
+    if a_ == float("inf"):
+        return "from a list of unknown age - run lowpingnews to refresh"
+    if a_ > LISTOLD:
+        return "from a list shown %s - run lowpingnews to refresh" % ago(int(a_))
+    return ""
+
+
+def preprint_id(u):
+    """bioRxiv/medRxiv id from any link shape they use.
+
+    Feeds have linked as /cgi/content/short/<id>?rss=1 as well as
+    /content/10.1101/<id>; both carry the same id, and the full paper always
+    lives at /content/10.1101/<id>.full on the matching host.
+    """
+    lu = (u or "").lower()
+    host = ("medrxiv" if "medrxiv" in lu else
+            "biorxiv" if "biorxiv" in lu else None)
+    m = re.search(r"(\d{4}\.\d{2}\.\d{2}\.\d{5,}v\d+|(?<![\d.])\d{6}v\d+)", u or "")
+    if not m:
+        return None, None
+    # hostname, or either path shape these servers use, marks a preprint
+    if host is None and not re.search(r"/content/10\.\d+/|/cgi/content/short/", lu):
+        return None, None
+    return host or "biorxiv", m.group(1)
 
 
 def full_text_urls(u):
-    """Where a site keeps the whole article, best first.
-
-    bioRxiv and medRxiv serve an abstract at the bare link and the complete
-    paper at the same URL plus `.full`; asking for the bare link and calling
-    the result "the article" would be wrong.
-    """
-    lu = (u or "").lower()
+    """Where a site keeps the whole article, best first."""
     base = (u or "").split("?")[0].split("#")[0].rstrip("/")
-    # bioRxiv and medRxiv use a DOI path ending in a version: .../10.1101/...v1
-    # Match the shape, not just the hostname, so mirrors work too.
-    if re.search(r"/content/10\.\d+/\S+v\d+$", base) or \
-       "biorxiv.org/content/" in lu or "medrxiv.org/content/" in lu:
-        if base.endswith(".full"):
-            return [base]
-        return [base + ".full", base]
-    if "europepmc.org/article/" in lu:
+    host, pid = preprint_id(u)
+    if pid:
+        if host in ("biorxiv", "medrxiv") and ("%s.org" % host) in (u or "").lower():
+            root = "https://www.%s.org" % host
+        else:                                  # mirror or test server: same origin
+            m = re.match(r"(https?://[^/]+)", base)
+            root = m.group(1) if m else "https://www.biorxiv.org"
+        full = "%s/content/10.1101/%s.full" % (root, pid)
+        abstract = "%s/content/10.1101/%s" % (root, pid)
+        return [full, abstract] if base != full else [full]
+    if "europepmc.org/article/" in (u or "").lower():
         return [base + "#free-full-text", base]
     return [base or u]
 
@@ -291,43 +333,56 @@ def looks_complete(txt, url):
     return len(txt) > 1200 and len(paras) >= 4
 
 
-def fetch_article(it):
-    """-> (text, bytes_over_wire, source). Feed body and offline copies are free.
+def fetch_article(it, want_full=True):
+    """-> (text, bytes_over_wire, source). Feed body and saved copies are free.
 
-    source is one of: feed, offline-full, offline-abstract, full, abstract,
-    nolink. The caller shows the reader which one they got.
+    source: full, abstract, feed, nolink, or offline-<kind>. A saved abstract is
+    not the end of the road: if a full-text address exists, it is tried first,
+    and the saved copy is only the fallback.
     """
+    LAST_WHY[:] = []                       # never show a previous read's reasons
     k = key(it["ti"])
+    saved_kind, saved = None, ""
     if have(k):
         try:
-            blob = open(apath(k), encoding="utf-8").read()
+            saved_kind, saved = _split_kind(open(apath(k), encoding="utf-8").read())
         except OSError:
-            blob = ""
-        if blob:
-            kind, txt = _split_kind(blob)
-            return txt, 0, "offline-" + kind
+            saved = ""
+    if saved and (saved_kind == "full" or not want_full or OFFLINE[0]):
+        return saved, 0, "offline-" + saved_kind
     if not it.get("u"):
-        if it.get("c"):
-            return it["c"], 0, "feed"
-        return "", 0, "nolink"
-    best, best_url, wire_tot = "", "", 0
-    for u in full_text_urls(it["u"]):
+        if saved:
+            return saved, 0, "offline-" + saved_kind
+        return (it["c"], 0, "feed") if it.get("c") else ("", 0, "nolink")
+    urls = full_text_urls(it["u"])
+    best, best_url, wire_tot, why = "", "", 0, []
+    for u in urls:
         try:
             raw, _, wire, _p = get(u, 20, cap=PAGECAP)
-        except Exception:
+        except Exception as e:
+            code = getattr(e, "code", None)
+            why.append("%s %s" % (u.rsplit("/", 1)[-1][:28],
+                                  "HTTP %s" % code if code else str(e)[:24]))
             continue
         wire_tot += wire
         txt = extract(raw)[:ARTMAX]
         if len(txt) > len(best):
             best, best_url = txt, u
         if looks_complete(txt, u):
-            break                          # got the paper; stop paying for more
-    if not best and it.get("c"):
-        return it["c"], wire_tot, "feed"
+            break                              # got the paper; stop paying
+        why.append("%s gave %d chars" % (u.rsplit("/", 1)[-1][:28], len(txt)))
+    if not best:
+        if saved:
+            return saved, wire_tot, "offline-" + saved_kind
+        if it.get("c"):
+            return it["c"], wire_tot, "feed"
     kind = "full" if looks_complete(best, best_url) else "abstract"
     if best:
         store_article(k, best, kind)
+    LAST_WHY[:] = why if kind != "full" else []
     return best, wire_tot, kind
+
+
 
 
 def _split_kind(blob):
@@ -411,15 +466,162 @@ def extract(raw):
     return out
 
 
+SKEW = 300                 # clocks disagree by this much without it meaning anything
+
+
+def age_of(t):
+    """Seconds since t. A stamp in the future means the clock was wrong when
+    it was written; `now - t < ttl` would then call it fresh forever, so a
+    future stamp counts as infinitely old instead. Missing or junk: same."""
+    try:
+        t = float(t or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+    if t <= 0:
+        return float("inf")
+    a = time.time() - t
+    if a < -SKEW:
+        return float("inf")
+    return max(0.0, a)
+
+
+def age_secs(t):
+    """age_of() as an int for display; -3 means "age unknown"."""
+    a = age_of(t)
+    return -3 if a == float("inf") else int(a)
+
+
+LAST_WHY = []              # why the last read got less than full text
+OFFLINE = [False]          # set once from --offline; get() refuses while it holds
+
+# What a request really costs. A body is the smallest part of it: every new
+# connection pays a TCP handshake and a TLS handshake carrying the server's
+# certificate chain. Measured against a live HTTPS server, a 304 with an empty
+# body cost 6.7 KB on the wire with a fresh handshake and 3.8 KB with a resumed
+# TLS session; of that, headers were ~0.8 KB and the rest was TCP+TLS. Bodies
+# also pay packet framing: IP/TCP headers plus the ACKs sent back, ~6%.
+# These are estimates - certificate chains and paths vary - so the app says "~".
+EST_TLS_FULL = 5900
+EST_TLS_RESUMED = 3000
+EST_TCP_PLAIN = 900
+EST_FRAMING = 0.05
+NETSTAT = {"full": 0, "resumed": 0, "plain": 0, "est": 0, "body": 0}
+TLS_SESS = {}              # host -> ssl session: a repeat connection resumes
+_OPENER = [None]
+
+
+def _opener():
+    """One TLS context for the whole process: a session can only be resumed
+    with the context that created it, and urllib's default makes a new one
+    per request, so nothing was ever resumed."""
+    if _OPENER[0] is not None:
+        return _OPENER[0]
+    import http.client, ssl, urllib.request
+    ctx = ssl.create_default_context()
+
+    class Resuming(http.client.HTTPSConnection):
+        def connect(self):
+            http.client.HTTPConnection.connect(self)      # also handles proxies
+            host = getattr(self, "_tunnel_host", None) or self.host
+            sess = TLS_SESS.get(host)
+            try:
+                self.sock = self._context.wrap_socket(self.sock, server_hostname=host,
+                                                      session=sess)
+            except (TypeError, ValueError):               # stale session or old Python
+                self.sock = self._context.wrap_socket(self.sock, server_hostname=host)
+            self._lpn_host = host
+            NETSTAT["resumed" if getattr(self.sock, "session_reused", False)
+                    else "full"] += 1
+
+        def close(self):
+            # called once the response headers are in: under TLS 1.3 the
+            # resumption ticket arrives after the handshake, so take it now
+            sk = self.sock
+            if sk is not None and getattr(self, "_lpn_host", None):
+                try:
+                    if sk.session is not None:
+                        TLS_SESS[self._lpn_host] = sk.session
+                except Exception:
+                    pass
+            http.client.HTTPSConnection.close(self)
+
+    class Handler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(Resuming, req, context=self._context)
+
+    class Plain(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            NETSTAT["plain"] += 1
+            return urllib.request.HTTPHandler.http_open(self, req)
+
+    _OPENER[0] = urllib.request.build_opener(Handler(context=ctx), Plain())
+    return _OPENER[0]
+
+
+def vkey(v):
+    """'6.10' sorts after '6.9'; anything unparseable sorts first."""
+    try:
+        return tuple(int(p) for p in str(v).split("."))
+    except ValueError:
+        return (-1,)
+
+
+def spent():
+    """What this run actually cost the data plan, estimated, for footers."""
+    e = NETSTAT["est"]
+    return "0B, cached" if not e else "~%s" % kbs(e)
+
+
+def predict(body_bytes, url=None):
+    """Cost of one request on a fresh connection: the handshake is paid even if
+    the server answers 304; the body only if it changed."""
+    kind = "plain" if (url or "").lower().startswith("http://") else "full"
+    return est_wire(body_bytes or 0, 300, 500, kind)
+
+
+def est_wire(body_bytes, req_hdr, resp_hdr, kind):
+    """Estimated bytes on the wire for one request."""
+    base = {"full": EST_TLS_FULL, "resumed": EST_TLS_RESUMED,
+            "plain": EST_TCP_PLAIN}.get(kind, EST_TLS_FULL)
+    return int(base + req_hdr + resp_hdr + body_bytes * (1 + EST_FRAMING))
+
+
+class OfflineError(OSError):
+    pass
+
+
 def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
     """-> (body, headers, wire_bytes, partial). Raises HTTPError(304) when unchanged."""
+    if OFFLINE[0]:
+        # one choke point: a caller that forgets --offline cannot reach the net
+        raise OfflineError("offline")
     h = {"Accept-Encoding": "gzip, deflate", "User-Agent": UA}
     h.update(extra or {})
-    import urllib.parse, urllib.request, zlib
+    import urllib.error, urllib.parse, urllib.request, zlib
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         raise ValueError("refusing non-http url")
     r = urllib.request.Request(url, headers=h)
-    with urllib.request.urlopen(r, timeout=t) as f:
+    before = (NETSTAT["full"], NETSTAT["resumed"], NETSTAT["plain"])
+    req_hdr = len(url) + 20 + sum(len(k) + len(v) + 4 for k, v in h.items())
+
+    def account(body_len, resp_headers):
+        now_ = (NETSTAT["full"], NETSTAT["resumed"], NETSTAT["plain"])
+        kind = ("full" if now_[0] > before[0] else "resumed" if now_[1] > before[1]
+                else "plain" if now_[2] > before[2] else "full")
+        try:
+            rh = 30 + sum(len(k) + len(v) + 4 for k, v in resp_headers.items())
+        except Exception:
+            rh = 500
+        e = est_wire(body_len, req_hdr, rh, kind)
+        NETSTAT["est"] += e
+        NETSTAT["body"] += body_len
+        return e
+    try:
+        f = _opener().open(r, timeout=t)
+    except urllib.error.HTTPError as he:
+        account(0, he.headers or {})              # a 304 is not free: it paid a handshake
+        raise
+    with f:
         # Read in chunks and keep whatever arrived. On a dying link the useful
         # question is not "did it finish" but "how much of it is usable".
         import http.client
@@ -446,7 +648,8 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None):
                 raise                            # nothing arrived: a real failure
             partial = True
         b = bytes(buf)
-        wire = len(b)                     # compressed: what the data plan is billed
+        wire = len(b)                     # compressed body; the full cost is est_wire()
+        account(wire, f.headers)
         ce = (f.headers.get("Content-Encoding") or "").lower()
         if ce in ("gzip", "deflate", "x-gzip"):
             for wbits in ((16 + zlib.MAX_WBITS,) if "gzip" in ce
@@ -576,43 +779,49 @@ def load(src, fresh, bag):
     """Fetch or reuse one source. Never raises - records the failure instead."""
     cf = "%s/%s.json" % (CD, src["id"])
     ttl = src.get("ttl") or TTL
-    if not fresh and os.path.exists(cf):
-        try:
-            c = json.load(open(cf, encoding="utf-8"))
-            if time.time() - c.get("t", 0) < ttl:
-                bag[src["id"]] = (c["items"], 0, 0, 0, 0)
-                return
-        except Exception:
-            pass
+    c = jread(cf, {})                      # once: it decides freshness and validators
+    if not isinstance(c.get("items"), list):
+        c = None
+    if c is not None and not fresh and age_of(c.get("t")) < ttl:
+        bag[src["id"]] = (c["items"], 0, 0, 0, 0)     # a future stamp is not fresh
+        return
     import urllib.error
-    c = None
-    try:
-        c = json.load(open(cf, encoding="utf-8"))
-    except Exception:
-        pass
     val = {}
     if c:                                  # conditional GET: 304 costs ~0 bytes
         if c.get("et"):
             val["If-None-Match"] = c["et"]
         if c.get("lm"):
             val["If-Modified-Since"] = c["lm"]
-        elif c.get("t"):                   # no server validator: ask with our own
+        elif age_of(c.get("t")) != float("inf"):
+            # no server validator: ask with our own - but never a future date,
+            # which invites a 304 and freezes the cache even under -f
             import email.utils
-            val["If-Modified-Since"] = email.utils.formatdate(c["t"], usegmt=True)
+            val["If-Modified-Since"] = email.utils.formatdate(
+                min(float(c["t"]), time.time()), usegmt=True)
     t_start = time.time()
     tapper = lambda n: PROG.__setitem__(src["id"], n)
     PROG.setdefault(src["id"], 0)
     try:
         try:
-            try:
-                raw, rh, wire, part = get(src["url"], extra=val,
-                                          tap=tapper, t=src.get("timeout") or 10)
-            except urllib.error.HTTPError:
-                raise                      # a real HTTP answer: do not retry
-            except Exception:
-                time.sleep(0.4)            # transient drop on a weak signal
-                raw, rh, wire, part = get(src["url"], extra=val,
-                                          tap=tapper, t=src.get("timeout") or 10)
+            trim = c.get("trim", 2) if c else 2
+            probe = dict(c or {}, trim=trim)
+            while True:
+                try:
+                    raw, rh, wire, part = get(request_url(src, probe), extra=val,
+                                              tap=tapper, t=src.get("timeout") or 10)
+                    break
+                except urllib.error.HTTPError as he_:
+                    # a server that rejects the trimmed query: step down once
+                    if he_.code == 400 and src.get("kind") == "hn" and probe["trim"] > 0:
+                        probe["trim"] -= 1
+                        continue
+                    raise                  # a real HTTP answer: do not retry
+                except Exception:
+                    time.sleep(0.4)        # transient drop on a weak signal
+                    raw, rh, wire, part = get(request_url(src, probe), extra=val,
+                                              tap=tapper, t=src.get("timeout") or 10)
+                    break
+            trim = probe["trim"]
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
@@ -636,6 +845,8 @@ def load(src, fresh, bag):
         if not items:
             raise ValueError("no items parsed")
         rec = {"t": int(time.time()), "items": items, "w": wire}
+        if src.get("kind") == "hn":
+            rec["trim"] = trim             # remember what this server accepts
         if part:
             # Never store validators for a truncated body: a later 304 would
             # confirm a copy we never fully received. Also expire it quickly.
@@ -655,7 +866,7 @@ def load(src, fresh, bag):
         if os.path.exists(cf):                      # offline: stale beats nothing
             try:
                 c = json.load(open(cf, encoding="utf-8"))
-                bag[src["id"]] = (c["items"], 0, int(time.time() - c.get("t", 0)), 0, 0)
+                bag[src["id"]] = (c["items"], 0, max(1, age_secs(c.get("t"))) if age_secs(c.get("t")) >= 0 else -3, 0, 0)
                 DONE.add(src["id"])
                 bag.setdefault("_net", []).append(      # still a failed request:
                     (False, (time.time() - t_start) * 1000, 0))   # count it as one
@@ -838,11 +1049,11 @@ def cat_cost(cat):
     due, unknown = 0, 0
     for x in srcs:
         c = jread("%s/%s.json" % (CD, x["id"]), {})
-        w, t0 = c.get("w"), c.get("t") or 0
+        w = c.get("w")
         if w is None:
             unknown += 1
-        elif time.time() - t0 >= (x.get("ttl") or TTL):
-            due += w
+        elif age_of(c.get("t")) >= (x.get("ttl") or TTL):
+            due += predict(w)                  # a 304 still pays the handshake
     return due, unknown
 
 
@@ -1101,7 +1312,7 @@ def wx_locate(a):
         d = {}
 
     pinned = d.get("via") in ("pinned", "place")
-    stale = (time.time() - (d.get("t") or 0)) > LOCTTL
+    stale = age_of(d.get("t")) > LOCTTL
     if d and (pinned or not stale):
         return d                                       # good enough, spend nothing
 
@@ -1122,12 +1333,12 @@ def wx_fetch(loc, unit, fresh):
     """One gzipped Open-Meteo call, cached like any feed."""
     c = jread(WXC, {})
     fresh_enough = (not fresh and c.get("t")
-                    and time.time() - c["t"] < WXTTL
+                    and age_of(c.get("t")) < WXTTL
                     and c.get("u") == unit
                     and abs((c.get("lat") or 999) - loc["lat"]) < .03
                     and abs((c.get("lon") or 999) - loc["lon"]) < .03)
     if fresh_enough:
-        return c["d"], 0, int(time.time() - c["t"]), False
+        return c["d"], 0, age_secs(c.get("t")), False
     q = ("latitude=%s&longitude=%s&current=temperature_2m,apparent_temperature,"
          "weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m,"
          "relative_humidity_2m,is_day"
@@ -1152,7 +1363,7 @@ def wx_fetch(loc, unit, fresh):
     except Exception as e:
         if c.get("d"):                     # offline: stale beats nothing
             net_log([(False, 0, 0)])
-            return c["d"], 0, int(time.time() - c["t"]), True
+            return c["d"], 0, age_secs(c.get("t")), True
         sys.exit("news: no forecast and no cache (%s)" % str(e)[:60])
 
 
@@ -1305,29 +1516,81 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     if rest is not None and (rest != (dy["precipitation_probability_max"][0] or 0)
                              or rest_code != int(dy["weather_code"][0] or 0)):
         print(D("  * today = hours remaining"))
-    foot = ("offline, cached %s" % ago(age_s) if stale
-            else kbs(wire) if wire
-            else "0B, cached" if age_s < 60 else "0B, cached %s" % ago(age_s))
+    if age_s == -3:                    # the cache's clock is unusable: say so
+        foot = ("offline, cached, age unknown" if stale else "0B, cached, age unknown")
+    else:
+        foot = ("offline, cached %s" % ago(age_s) if stale
+                else spent() if NETSTAT["est"]
+                else "0B, cached" if age_s < 60 else "0B, cached %s" % ago(age_s))
     print(D("\n  " + foot))
+
+
+# Hacker News via Algolia returns highlighting metadata, tags and more that the
+# parser never reads. Ask for the fields it uses. Applied at request time, so it
+# reaches configs written before this existed. Unmeasured against the live API
+# (not reachable from the build machine), so it steps down if rejected:
+# level 2 = fields + no highlighting, 1 = fields only, 0 = the plain request.
+HN_TRIM = {
+    2: "attributesToRetrieve=title,story_title,url,points,num_comments,created_at_i"
+       "&attributesToHighlight=",
+    1: "attributesToRetrieve=title,story_title,url,points,num_comments,created_at_i",
+}
+
+
+def request_url(src, c):
+    u = src["url"]
+    if src.get("kind") != "hn" or "attributesToRetrieve" in u:
+        return u
+    lvl = c.get("trim", 2)
+    if lvl in HN_TRIM:
+        u += ("&" if "?" in u else "?") + HN_TRIM[lvl]
+    return u
+
+
+def host_units(srcs):
+    """Feeds on the same host share one worker and run in turn, so the second
+    resumes the first's TLS session instead of paying a fresh handshake
+    (measured: 3.8 KB instead of 6.7 KB for a 304). Order is preserved."""
+    import urllib.parse
+    units, pos = [], {}
+    for x in srcs:
+        try:
+            h = urllib.parse.urlsplit(x.get("url") or "").hostname or x["id"]
+        except Exception:
+            h = x["id"]
+        if h in pos:
+            units[pos[h]].append(x)
+        else:
+            pos[h] = len(units)
+            units.append([x])
+    return units
 
 
 def gather(srcs, fresh, on_feed=None):
     import threading
     want_total = expected(srcs)            # before any cache file is rewritten
-    slowest = max([x.get("timeout") or 10 for x in srcs] or [10])
-    batches = (len(srcs) + MAXPAR - 1) // MAXPAR
+    units = host_units(srcs)
+    # a unit runs its feeds in turn, so its worst case is the sum of theirs
+    slowest = max([sum(x.get("timeout") or 10 for x in u) for u in units] or [10])
+    batches = (len(units) + MAXPAR - 1) // MAXPAR
     # per-batch budget, not a single global one: with many feeds a fixed 20s
     # silently drops whole batches and the footer still looks complete
     deadline = min(HARDCAP, batches * max(DEADLINE, slowest * 2 + 6))
     os.makedirs(CD, exist_ok=True)
     bag = {}
     end = time.time() + deadline
-    for i in range(0, len(srcs), MAXPAR):       # batches: 40 feeds != 40 sockets
+    def run_unit(unit):
+        for s_ in unit:
+            if time.time() >= end:
+                return                     # deadline: the rest are "not reached"
+            load(s_, fresh, bag)
+
+    for i in range(0, len(units), MAXPAR):      # batches: 40 feeds != 40 sockets
         if time.time() >= end:
             break
         ths = []
-        for s in srcs[i:i + MAXPAR]:
-            t = threading.Thread(target=load, args=(s, fresh, bag), daemon=True)
+        for u in units[i:i + MAXPAR]:
+            t = threading.Thread(target=run_unit, args=(u,), daemon=True)
             t.start()
             ths.append(t)
         show_prog = sys.stderr.isatty() and not os.environ.get("LPN_NO_PROGRESS")
@@ -1358,6 +1621,24 @@ def gather(srcs, fresh, on_feed=None):
         bag.setdefault(x["id"], ([], 0, -2, 0, 0))
     net_log(bag.pop("_net", []))
     return bag
+
+
+def stale_note(entries, a):
+    """Footer phrase for data served from cache after a failed refresh, or ""
+    when everything is current. entries: the bag's 5-tuples. -3 means the
+    cache's own timestamp is unusable, which must be said, not hidden."""
+    worst, unknown = 0, False
+    for e in entries:
+        sta = e[2]
+        if sta == -3:
+            unknown = True
+        elif sta > 0:
+            worst = max(worst, sta)
+    if unknown:
+        return " %s stale, age unknown" % bul_(a)
+    if worst:
+        return " %s stale %s" % (bul_(a), ago(worst))
+    return ""
 
 
 def ago(sec):
@@ -1539,7 +1820,7 @@ def sources(a):
     return sel
 
 
-BOOLF = {"--tui": "tui", "-f": "fresh", "--fresh": "fresh", "--offline": "offline",
+BOOLF = {"--plain": "plain", "--tui": "tui", "-f": "fresh", "--fresh": "fresh", "--offline": "offline",
          "--stream": "stream", "-g": "gps", "--gps": "gps", "--ip": "iploc",
          "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
@@ -1554,7 +1835,7 @@ VALF = {"-p": ("place", str), "--place": ("place", str),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"tui": False, "place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
+DEFAULTS_NS = {"plain": False, "tui": False, "place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
                "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
@@ -1626,7 +1907,9 @@ def main():
     p.add_argument("--ip", dest="iploc", action="store_true",
                    help="locate by IP address (city-level, tells a third party)")
     p.add_argument("--tui", action="store_true",
-                   help="interactive reader (curses; POSIX only)")
+                   help="interactive reader (the default in a terminal)")
+    p.add_argument("--plain", action="store_true",
+                   help="classic list output instead of the interactive reader")
     p.add_argument("-p", "--place", metavar="NAME",
                    help="locate by town or city name")
     p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
@@ -1671,13 +1954,168 @@ def open_url(u):
         return False
     import shutil, subprocess
     if shutil.which("termux-open-url"):
-        subprocess.run(["termux-open-url", u])
+        subprocess.run(["termux-open-url", u], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
         return True
     try:
         import webbrowser
         return bool(webbrowser.open(u))
     except Exception:
         return False
+
+
+class PingMeter(object):
+    """Round-trip time to the nearest point of presence, measured as a TCP
+    handshake (the same reasoning as probe(): ICMP is dropped by carriers
+    independently of real traffic, and ping is absent on most Termux installs).
+
+    The references are anycast addresses: the network itself routes each one
+    to its closest site, so "nearest to where you are" needs no location
+    lookup. All three are tried once and the fastest is kept, then sampled
+    every `every` seconds. Connecting to an IP literal skips DNS, so this is
+    link latency, not resolver latency. A handshake costs roughly 300 bytes.
+    """
+    REFS = (("1.1.1.1", 443, "cf"), ("8.8.8.8", 443, "g"), ("9.9.9.9", 443, "q9"))
+
+    def __init__(self, every=300, refs=None):
+        import threading
+        self.every = max(5, int(every))
+        self.refs = refs or self._env_refs() or self.REFS
+        self.samples = []                      # ms, or None for a failed attempt
+        self.stamps = []                       # when each sample was taken
+        self.ref = None
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.active_until = float("inf")       # the TUI moves this on each key
+        self.tried = {}                        # reference -> best ms seen
+
+    @staticmethod
+    def _env_refs():
+        # LPN_PING_REFS=host:port,host:port  (tests, or a preferred reference)
+        v = os.environ.get("LPN_PING_REFS", "").strip()
+        out = []
+        for part in v.split(","):
+            h, _, p = part.strip().rpartition(":")
+            if h and p.isdigit():
+                out.append((h, int(p), h.split(".")[0][:3]))
+        return tuple(out)
+
+    def start(self):
+        self.t.start()
+        return self
+
+    def _rtt(self, host, port):
+        import socket, struct
+        t0 = time.time()
+        try:
+            c = socket.create_connection((host, port), timeout=3)
+        except Exception:
+            return None
+        ms = (time.time() - t0) * 1000.0
+        try:
+            # abortive close: one RST instead of the FIN/ACK exchange. Measured
+            # 796 B per probe on the wire instead of 928 B.
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        except Exception:
+            pass
+        try:
+            c.close()
+        except Exception:
+            pass
+        return ms
+
+    def _pick(self):
+        """Try every reference once; keep the fastest. None if all fail."""
+        best = None
+        for h, p, tag in self.refs:
+            if self.stop.is_set():
+                return None
+            ms = self._rtt(h, p)
+            if ms is not None and (best is None or ms < best[0]):
+                best = (ms, h, p, tag)
+        return best
+
+    def _add(self, ms):
+        with self.lock:
+            self.samples.append(ms)
+            self.stamps.append(time.time())
+            del self.samples[:-16]
+            del self.stamps[:-16]
+
+    def _run(self):
+        # a loop, not recursion: offline for hours must not exhaust the stack
+        while not self.stop.is_set():
+            try:
+                self._cycle()
+            except Exception:
+                self._add(None)                # never let the sampler die quietly
+            if self.stop.wait(self.every):
+                return
+
+    def _cycle(self):
+        """One probe per cycle, never a burst. Until every reference has been
+        tried once, each cycle tries the next one, so choosing the nearest
+        costs one probe per cycle instead of three at once."""
+        if time.time() > self.active_until:
+            return                             # nobody is looking: spend nothing
+        untried = [r for r in self.refs if (r[0], r[1]) not in self.tried]
+        target = untried[0] if untried else None
+        if target is None:
+            if self.ref is None:               # everything failed last round
+                self.tried.clear()
+                target = self.refs[0]
+            else:
+                target = next((r for r in self.refs if r[:2] == self.ref[:2]), self.refs[0])
+        k = (target[0], target[1])             # host AND port: one host, many services
+        ms = self._rtt(target[0], target[1])
+        if ms is None:
+            self.tried[k] = None
+        else:
+            prev = self.tried.get(k)
+            self.tried[k] = ms if prev is None else min(prev, ms)
+        live = [(v, r) for r in self.refs for kk, v in self.tried.items()
+                if kk == (r[0], r[1]) and v is not None]
+        with self.lock:
+            self.ref = min(live)[1] if live else None
+        self._add(ms)
+
+    def reading(self):
+        """-> (latest ms or None, recent samples, reference tag, state).
+
+        A sample older than a few cycles is history, not the current link: if
+        the sampler has stalled or died, say "stale" rather than show it."""
+        with self.lock:
+            smp = list(self.samples)
+            ref = self.ref
+            last_t = self.stamps[-1] if self.stamps else None
+        if not smp:
+            return None, [], None, "measuring"
+        if time.time() > self.active_until and (last_t is None or
+                                               age_of(last_t) > self.every):
+            return None, smp, ref and ref[2], "paused"
+        if last_t is None or age_of(last_t) > max(3 * self.every, 90):
+            return None, smp, ref and ref[2], "stale"
+        last = smp[-1]
+        if last is None:
+            return None, smp, ref and ref[2], "no route"
+        return last, smp, ref and ref[2], "ok"
+
+    def close(self):
+        self.stop.set()
+
+
+def ping_label(ms):
+    """Plain-language band, matching what the signal view calls good."""
+    if ms is None:
+        return "down"
+    if ms < 60:
+        return "good"
+    if ms < 150:
+        return "fair"
+    if ms < 400:
+        return "slow"
+    return "poor"
 
 
 def tui_available():
@@ -1692,26 +2130,66 @@ def tui_available():
         return False, "curses is unavailable here (%s)" % str(e)[:50]
 
 
+TUIRETRY = 120                 # after a background refresh FAILS, wait this long
+
+
+
+def _envint(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# data younger than this is never called stale, whatever a feed's ttl says, so a
+# silly ttl in sources.json cannot make the reader hammer a server
+TUIMINAGE = _envint("LPN_TUI_MINAGE", 60)
+# network work (background refresh, ping samples) only this long after a key:
+# an idle reader shows its data's age and spends nothing
+TUIACTIVE = _envint("LPN_TUI_ACTIVE", 300)
+
+
 def _tui_rows(a, fresh):
-    """Same fetch path the list view uses: gather() fills a bag of 5-tuples,
-    then stale cache backfills anything the deadline missed."""
+    """-> (rows, meta). Same fetch path as the list view: gather() fills a bag
+    of 5-tuples, then cache backfills anything the deadline missed.
+
+    meta says how current the rows are, so the screen never has to guess:
+      t        fetch time of the OLDEST source shown (epoch), None if unknown
+      unknown  a source's cache carries an unusable timestamp
+      ttl      shortest refresh interval among this category's sources
+      failed   sources that could not be refreshed this time
+      cat      the category these rows belong to
+    """
     want = sources(a)                      # already filtered by a.cat
+    meta = {"t": None, "unknown": False, "failed": [],
+            "ttl": min([x.get("ttl") or TTL for x in want] or [TTL]),
+            "cat": (a.cat or "top").lower()}
     if not want:
-        return []
+        return [], meta
     bag = gather(want, fresh)
-    for x in want:
-        got = bag.get(x["id"])
-        if got is not None and got[2] not in (-1, -2):
-            continue
-        c_ = jread("%s/%s.json" % (CD, x["id"]), {})
-        if c_.get("items"):
-            bag[x["id"]] = (c_["items"], 0,
-                            max(1, int(time.time() - (c_.get("t") or 0))), 0, 0)
+    oldest = None
     out = []
     for x in want:
-        items = (bag.get(x["id"]) or ([],))[0]
-        for it in items:
+        got = bag.get(x["id"])
+        c_ = jread("%s/%s.json" % (CD, x["id"]), {})
+        if got is None or got[2] in (-1, -2):
+            meta["failed"].append(x["name"])
+            if not c_.get("items"):
+                continue
+            got = (c_["items"], 0, 1, 0, 0)
+        elif got[2] != 0:                  # served from cache after a failure
+            meta["failed"].append(x["name"])
+        if not got[0]:
+            continue
+        a_ = age_of(c_.get("t"))
+        if a_ == float("inf"):
+            meta["unknown"] = True
+        else:
+            oldest = a_ if oldest is None else max(oldest, a_)
+        for it in got[0]:
             out.append((it, x))
+    if oldest is not None:
+        meta["t"] = time.time() - oldest
     out.sort(key=lambda r: -when_sort(r[0]))
     seen, rows = set(), []
     for it, x in out:
@@ -1720,16 +2198,71 @@ def _tui_rows(a, fresh):
             continue
         seen.add(k)
         rows.append((it, x))
-    return rows[:STORECAP]
+    return rows[:STORECAP], meta
 
 
-def tui_main(scr, a, cats):
+def tui_freshness(meta):
+    """-> (text, colour, stale?) for the banner. Colour: 2 green, 3 yellow."""
+    if OFFLINE[0]:
+        base = "offline"
+        if meta.get("t"):
+            base += ", cache " + ago(int(age_of(meta["t"])))
+        return base, 3, True
+    if meta.get("unknown"):
+        return "age unknown", 3, True
+    t = meta.get("t")
+    if t is None:
+        return "no data", 3, True
+    a_ = age_of(t)
+    stale = a_ >= max(meta.get("ttl") or TTL, TUIMINAGE)
+    if stale:
+        # never "stale just now": under a minute, say so in minutes
+        txt = "stale " + (ago(int(a_)) if a_ >= 60 else "<1m")
+    else:
+        txt = ago(int(a_))
+    return txt, (3 if stale else 2), stale
+
+
+def tui_main(scr, a, cats, meter=None):
     import curses
-    curses.curs_set(0)
+    import threading
+    import unicodedata
+    try:
+        curses.curs_set(0)
+    except Exception:
+        pass                                   # some terminals cannot hide it
+
+    def put(y, x, text, n, attr=0):
+        """addnstr that cannot crash: a CJK or emoji title is two cells per
+        character, and writing into the bottom-right cell raises."""
+        h_, w_ = scr.getmaxyx()
+        if y < 0 or y >= h_ or x >= w_ - 1 or n <= 0:
+            return
+        room = min(n, w_ - 1 - x)
+        out, used = [], 0
+        for ch in text:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if used + cw > room:
+                break
+            out.append(ch)
+            used += cw
+        try:
+            scr.addstr(y, x, "".join(out), attr)
+        except curses.error:
+            pass
+
     scr.keypad(True)
+    # prefer repainting to hardware insert/delete-line, which emulators
+    # implement unevenly (scroll regions are handled in adopt() instead)
+    try:
+        scr.idlok(False)
+        scr.idcok(False)
+    except Exception:
+        pass
     colour = False
     try:
-        if curses.has_colors():
+        if getattr(a, "color", True) and not os.environ.get("NO_COLOR") \
+                and curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
             for i in range(1, 7):
@@ -1744,50 +2277,157 @@ def tui_main(scr, a, cats):
         at = curses.color_pair(n)
         return at | curses.A_BOLD if bold else at
 
-    ci = cats.index(a.cat) if (a.cat or "") in cats else 0
-    rows = _tui_rows(a, False)
-    st = state()
-    sel, top, mode, body, bscroll, msg = 0, 0, "list", [], 0, ""
+    # ---- state -----------------------------------------------------------
+    S = {"rows": [], "meta": {}, "st": state(), "sel": 0, "top": 0,
+         "mode": "list", "body": [], "bscroll": 0, "reading": None}
+    note = {"text": "", "until": 0.0}          # transient status line
+    act = {"last": time.time()}                 # opening the reader counts as use
+    bg = {"thread": None, "result": None, "gen": 0, "last_try": 0.0}
+    ci = [cats.index(a.cat) if (a.cat or "") in cats else 0]
 
+    def flash(text, secs=2.5):
+        """A message that expires. Work-in-progress messages are replaced by
+        the outcome when the work ends, so none outlives what it describes."""
+        note["text"], note["until"] = text, time.time() + secs
+
+    def adopt(rows, meta, keep_sel=True):
+        """Install a new list, keep the cursor on the same story if it is
+        still there, and make -r/-o/-S numbering match what is on screen."""
+        cur = None
+        if keep_sel and S["rows"] and 0 <= S["sel"] < len(S["rows"]):
+            cur = key(S["rows"][S["sel"]][0]["ti"])
+        S["rows"], S["meta"] = rows, meta
+        S["st"] = state()                      # read/star may have changed elsewhere
+        S["sel"] = 0
+        if cur is not None:
+            for i, (it, _x) in enumerate(rows):
+                if key(it["ti"]) == cur:
+                    S["sel"] = i
+                    break
+        S["top"] = min(S["top"], S["sel"])
+        # a new list moves lines around; left to itself curses shifts them with
+        # scroll regions, which some emulators drop. One full repaint instead.
+        try:
+            scr.clearok(True)
+        except Exception:
+            pass
+        try:
+            jwrite(LAST, [dict(it, src=x["name"]) for it, x in rows])
+        except Exception:
+            pass
+
+    def load_now(fresh, label):
+        flash(label, 3600)
+        draw()
+        bg["gen"] += 1                          # anything in flight is now obsolete
+        rows, meta = _tui_rows(a, fresh)
+        adopt(rows, meta, keep_sel=False)
+        S["top"] = 0
+        txt, _c, stale = tui_freshness(meta)
+        flash(("refreshed" if not stale else "could not refresh: " + txt), 2.5)
+
+    def want_background():
+        """Refresh on our own when the data has aged past its TTL, cheaply:
+        load() refetches only expired feeds and uses conditional GETs."""
+        if OFFLINE[0] or bg["thread"] is not None:
+            return False
+        if time.time() - act["last"] > TUIACTIVE:
+            return False                        # idle: show the age, spend nothing
+        if time.time() - bg["last_try"] < TUIRETRY:
+            return False
+        if meter is not None and meter.reading()[3] in ("no route",):
+            return False
+        return tui_freshness(S["meta"])[2]
+
+    def start_background():
+        gen, cat = bg["gen"], a.cat
+
+        def work():
+            try:
+                r = _tui_rows(a, False)
+            except Exception:
+                r = None
+            bg["result"] = (gen, cat, r)
+        t = threading.Thread(target=work, daemon=True)
+        bg["thread"] = t
+        t.start()
+
+    def collect_background():
+        if bg["thread"] is None or bg["thread"].is_alive():
+            return
+        gen, cat, r = bg["result"] or (None, None, None)
+        bg["thread"], bg["result"] = None, None
+        if r is None:
+            bg["last_try"] = time.time()        # it failed: back off before retrying
+            return
+        if gen != bg["gen"] or cat != a.cat:
+            return                              # category changed meanwhile: drop it
+        rows, meta = r
+        if tui_freshness(meta)[2]:
+            bg["last_try"] = time.time()        # still stale: the source is down
+        if rows or not S["rows"]:
+            adopt(rows, meta)
+
+    # ---- drawing ---------------------------------------------------------
     def draw():
         scr.erase()
         h, w = scr.getmaxyx()
-        hdr = " %s  %d items " % (cats[ci].upper(), len(rows))
-        scr.addnstr(0, 0, hdr.ljust(w - 1), w - 1, C(6, True))
-        if mode == "list":
+        rows = S["rows"]
+        hdr = " LowPingNews %s  %s  %d item%s " % (
+            VERSION, cats[ci[0]].upper(), len(rows), "" if len(rows) == 1 else "s")
+        fresh_txt, fresh_col, _st = tui_freshness(S["meta"]) if S["meta"] else ("", 2, False)
+        if bg["thread"] is not None:
+            fresh_txt, fresh_col = "refreshing", 3
+        put(0, 0, hdr.ljust(w - 1), w - 1, C(6, True))
+        x_f = len(hdr)
+        if fresh_txt and x_f + len(fresh_txt) + 1 < w - 1:
+            put(0, x_f, fresh_txt, len(fresh_txt) + 1, C(fresh_col, True))
+            x_f += len(fresh_txt) + 1
+        if meter is not None:
+            ms, smp, ref, state_ = meter.reading()
+            vals = [x for x in smp if x is not None]
+            band = ping_label(ms) if state_ == "ok" else state_
+            txt = ("%dms %s" % (round(ms), band)) if ms is not None else band
+            if len(vals) >= 2 and w >= 60:     # the trend matters more than a number
+                txt = spark(vals[-8:], False) + " " + txt
+            colr = {"good": 2, "fair": 3, "slow": 3, "poor": 1}.get(band, 1)
+            x0 = w - 2 - len(txt)
+            if x0 > x_f + 1:                   # never over the title or the age
+                put(0, x0, txt, len(txt) + 1, C(colr, True))
+        # widest name that still tells sources apart, capped so titles keep room
+        nw = min(14, max([len(x["name"]) for _i, x in rows] or [4]))
+        nw = max(4, min(nw, w // 4))
+        st = S["st"]
+        stars = {key(x["ti"]) for x in st["star"]}
+        if S["mode"] == "list":
             if not rows:
-                scr.addnstr(2, 2, "nothing to show - press r to refresh",
-                            max(1, w - 3), C(4))
+                put(2, 2, "nothing to show - press r to refresh", max(1, w - 3), C(4))
             for n in range(h - 2):
-                idx = top + n
+                idx = S["top"] + n
                 if idx < 0 or idx >= len(rows):
                     break
                 it, s_ = rows[idx]
-                rd = key(it["ti"]) in st["read"]
-                sd = any(key(x["ti"]) == key(it["ti"]) for x in st["star"])
-                secs = int(time.time()) - (it.get("d") or 0)
-                if not it.get("d") or secs < -3600:
-                    stamp = "?"
-                elif secs < 0:
-                    stamp = "just now"
-                else:
-                    stamp = age(secs)
-                mark = "*" if sd else (" " if rd else "\u2022")
-                line = "%s %-9s %-7s %s" % (mark, s_["name"][:9], stamp[:7],
-                                            it["ti"])
+                k = key(it["ti"])
+                rd = k in st["read"]
+                # recomputed on every draw, so ages advance while the screen is open
+                sec = age_secs(it.get("d")) if it.get("d") else -3
+                stamp = "?" if sec < 0 else ("now" if sec < 60 else age(sec)[:4])
+                mark = "*" if k in stars else (" " if rd else "\u2022")
+                line = "%s %-*s %-4s %s" % (mark, nw, s_["name"][:nw], stamp, it["ti"])
                 at = C(0) if rd else C(7 if not colour else 0, not rd)
-                if idx == sel:
+                if idx == S["sel"]:
                     at = curses.A_REVERSE
-                scr.addnstr(n + 1, 0, line.ljust(w - 1), w - 1, at)
+                put(n + 1, 0, line.ljust(w - 1), w - 1, at)
         else:
             for n in range(h - 2):
-                if bscroll + n >= len(body):
+                if S["bscroll"] + n >= len(S["body"]):
                     break
-                scr.addnstr(n + 1, 0, body[bscroll + n][:w - 1], w - 1)
+                put(n + 1, 0, S["body"][S["bscroll"] + n][:w - 1], w - 1)
         keys = (" j/k move  enter read  s star  o open  r refresh  n/p cat  q quit"
-                if mode == "list" else
+                if S["mode"] == "list" else
                 " j/k scroll  b back  s star  o open  q quit")
-        scr.addnstr(h - 1, 0, (msg or keys).ljust(w - 1), w - 1, C(4))
+        msg = note["text"] if time.time() < note["until"] else ""
+        put(h - 1, 0, (" " + msg if msg else keys).ljust(w - 1), w - 1, C(4))
         scr.refresh()
 
     def wrap_article(it):
@@ -1803,7 +2443,9 @@ def tui_main(scr, a, cats):
             txt = it.get("s") or "(no text available)"
             if how in ("full", "abstract"):
                 how = "feed"
-        out.append("[%s]" % kind_note(how)[0])
+        out.append("[%s]" % kind_note(how, it)[0])
+        if LAST_WHY and not str(how).endswith("full"):
+            out.append("tried: " + "; ".join(LAST_WHY))
         out.append("")
         for para in txt.split("\n"):
             if not para.strip():
@@ -1820,92 +2462,163 @@ def tui_main(scr, a, cats):
         out += ["", it.get("u") or ""]
         return out
 
+    def toggle_star(it):
+        st = S["st"]
+        k = key(it["ti"])
+        keep = [x for x in st["star"] if key(x["ti"]) != k]
+        on = len(keep) == len(st["star"])
+        if on:
+            keep.append(it)
+        st["star"] = keep[-STARCAP:]
+        state(st)
+        flash("starred" if on else "unstarred")
+
+    def open_it(it):
+        u = it.get("u")
+        if not u:
+            flash("no link")
+            return
+        curses.def_prog_mode()
+        curses.endwin()                         # a text browser needs the terminal
+        try:
+            ok = open_url(u)
+        finally:
+            curses.reset_prog_mode()
+            scr.refresh()
+        flash("opened" if ok else "no browser: " + u[:60], 4)
+
+    # ---- first load, then the loop --------------------------------------
+    rows, meta = _tui_rows(a, bool(getattr(a, "fresh", False)))
+    adopt(rows, meta, keep_sel=False)
+    act["last"] = time.time()                   # idle is measured from a usable screen
     while True:
+        collect_background()
+        if want_background():
+            start_background()
+        if meter is not None:
+            meter.active_until = act["last"] + TUIACTIVE
+        # tick fast only while something is moving; otherwise every 15 s is
+        # enough for minute-granular ages, and the CPU can sleep
+        busy = bg["thread"] is not None or time.time() < note["until"]
+        wait = 1.0 if busy else 15.0
+        m_ = S["meta"]
+        if m_.get("t") and not OFFLINE[0]:     # wake exactly when data goes stale
+            due = m_["t"] + max(m_.get("ttl") or TTL, TUIMINAGE) - time.time()
+            if due > 0:
+                wait = min(wait, due + 0.2)
+        scr.timeout(int(max(0.2, wait) * 1000))
         draw()
-        msg = ""
         try:
             c = scr.getch()
         except KeyboardInterrupt:
             break
+        if c == -1:                             # timeout tick, not a key
+            continue
+        act["last"] = time.time()
         h, _w = scr.getmaxyx()
         page = max(1, h - 3)
+        rows = S["rows"]
         if c in (ord("q"), 27):
-            if mode == "read":
-                mode = "list"
+            if S["mode"] == "read":
+                S["mode"] = "list"
                 continue
             break
-        if mode == "list":
-            last = max(0, len(rows) - 1)     # empty list: stay at 0, never -1
+        if S["mode"] == "list":
+            last = max(0, len(rows) - 1)       # empty list: stay at 0, never -1
             if c in (ord("j"), curses.KEY_DOWN):
-                sel = min(last, sel + 1)
+                S["sel"] = min(last, S["sel"] + 1)
             elif c in (ord("k"), curses.KEY_UP):
-                sel = max(0, sel - 1)
+                S["sel"] = max(0, S["sel"] - 1)
             elif c in (curses.KEY_NPAGE, ord(" ")):
-                sel = min(last, sel + page)
+                S["sel"] = min(last, S["sel"] + page)
             elif c == curses.KEY_PPAGE:
-                sel = max(0, sel - page)
+                S["sel"] = max(0, S["sel"] - page)
             elif c in (ord("\n"), curses.KEY_ENTER, 10, 13):
                 if rows:
-                    it = rows[sel][0]
-                    msg = " fetching..."
+                    it = rows[S["sel"]][0]
+                    flash("fetching...", 3600)
                     draw()
-                    body, bscroll, mode = wrap_article(it), 0, "read"
+                    S["body"], S["bscroll"], S["mode"] = wrap_article(it), 0, "read"
+                    S["reading"] = it
+                    note["until"] = 0
                     k = key(it["ti"])
-                    if k not in st["read"]:
-                        st["read"].append(k)
-                        state(st)
+                    if k not in S["st"]["read"]:
+                        S["st"]["read"].append(k)
+                        state(S["st"])
             elif c == ord("r"):
-                msg = " refreshing..."
-                draw()
-                rows, sel, top = _tui_rows(a, True), 0, 0
+                load_now(True, "refreshing...")
             elif c in (ord("n"), ord("p"), 9):
                 # letters, not Tab: terminal emulators and phone keyboards
                 # swallow Tab before curses ever sees it
-                ci = (ci + (-1 if c == ord("p") else 1)) % len(cats)
-                a.cat = cats[ci]
-                msg = " loading %s..." % cats[ci]
-                draw()
-                rows, sel, top = _tui_rows(a, False), 0, 0
+                ci[0] = (ci[0] + (-1 if c == ord("p") else 1)) % len(cats)
+                a.cat = cats[ci[0]]
+                load_now(False, "loading %s..." % cats[ci[0]])
             elif c == ord("s") and rows:
-                it = rows[sel][0]
-                k = key(it["ti"])
-                keep = [x for x in st["star"] if key(x["ti"]) != k]
-                if len(keep) == len(st["star"]):
-                    keep.append(it)
-                    msg = " starred"
-                else:
-                    msg = " unstarred"
-                st["star"] = keep[-STARCAP:]
-                state(st)
+                toggle_star(rows[S["sel"]][0])
             elif c == ord("o") and rows:
-                u = rows[sel][0].get("u")
-                if u:
-                    open_url(u)
-                    msg = " opened"
-            sel = max(0, min(sel, max(0, len(rows) - 1)))
-            if sel < top:
-                top = sel
-            if sel >= top + (h - 2):
-                top = sel - (h - 3)
-            top = max(0, min(top, max(0, len(rows) - 1)))
+                open_it(rows[S["sel"]][0])
+            rows = S["rows"]
+            S["sel"] = max(0, min(S["sel"], max(0, len(rows) - 1)))
+            if S["sel"] < S["top"]:
+                S["top"] = S["sel"]
+            if S["sel"] >= S["top"] + (h - 2):
+                S["top"] = S["sel"] - (h - 3)
+            S["top"] = max(0, min(S["top"], max(0, len(rows) - 1)))
         else:
+            body = S["body"]
             if c in (ord("j"), curses.KEY_DOWN):
-                bscroll = min(max(0, len(body) - 1), bscroll + 1)
+                S["bscroll"] = min(max(0, len(body) - 1), S["bscroll"] + 1)
             elif c in (ord("k"), curses.KEY_UP):
-                bscroll = max(0, bscroll - 1)
+                S["bscroll"] = max(0, S["bscroll"] - 1)
             elif c in (curses.KEY_NPAGE, ord(" ")):
-                bscroll = min(max(0, len(body) - 1), bscroll + page)
+                S["bscroll"] = min(max(0, len(body) - 1), S["bscroll"] + page)
             elif c == curses.KEY_PPAGE:
-                bscroll = max(0, bscroll - page)
+                S["bscroll"] = max(0, S["bscroll"] - page)
             elif c == ord("b"):
-                mode = "list"
+                S["mode"] = "list"
+            elif c == ord("s") and S["reading"]:
+                toggle_star(S["reading"])       # the hint promised this
+            elif c == ord("o") and S["reading"]:
+                open_it(S["reading"])
 
 
-def cmd_tui(a, P, D):
+LIST_FLAGS = ("budget", "check", "cost", "download", "light", "list", "mark_all",
+              "only", "open", "query", "read", "star", "stream", "titles",
+              "unread", "update", "ascii")
+
+
+def default_tui_ok(a):
+    """True when nothing on the command line asks for list output."""
+    for f in LIST_FLAGS:
+        v = getattr(a, f, None)
+        if v not in (None, False, 0, ""):
+            return False
+    if getattr(a, "n", 5) not in (None, 5):     # -n shapes the list
+        return False
+    return True
+
+
+def tui_can_start():
+    """Default-mode check: everything --tui needs, without complaining."""
+    if os.environ.get("LPN_NO_TUI"):
+        return False
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    if os.environ.get("TERM", "") in ("", "dumb"):
+        return False
+    ok, _why = tui_available()
+    return ok
+
+
+def cmd_tui(a, P, D, explicit=True):
     ok, why = tui_available()
     if not ok:
+        if not explicit:
+            return None                        # default mode: fall back quietly
         sys.exit("news: %s" % why)
-    if not sys.stdout.isatty():
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        if not explicit:
+            return None
         sys.exit("news: --tui needs a terminal (this looks like a pipe)")
     import curses
     os.environ["LPN_NO_PROGRESS"] = "1"     # the progress bar would draw over us
@@ -1916,20 +2629,34 @@ def cmd_tui(a, P, D):
     a.cat = (a.cat or "top").lower()
     if a.cat not in cats:
         a.cat = cats[0]
+    meter = None
+    if not OFFLINE[0] and not os.environ.get("LPN_NO_PING"):
+        meter = PingMeter().start()
     # stderr would draw over the curses screen, but discarding it would hide
     # crashes: capture instead, and replay once the screen is released
     buf = io.StringIO()
     real_err, sys.stderr = sys.stderr, buf
+    started = [False]
+
+    def body(scr, *args):
+        started[0] = True
+        return tui_main(scr, *args)
     try:
-        curses.wrapper(tui_main, a, cats)
+        curses.wrapper(body, a, cats, meter)
     except KeyboardInterrupt:
         pass
+    except curses.error:
+        if explicit or started[0]:
+            raise
+        return None                            # could not even initialise: list
     finally:
         sys.stderr = real_err
+        if meter is not None:
+            meter.close()
         held = buf.getvalue().strip()
         if held:
             sys.stderr.write(held + "\n")
-    return
+    return True
 
 
 def cmd_update(a, P, D):
@@ -1943,6 +2670,28 @@ def cmd_update(a, P, D):
     me = os.path.realpath(sys.argv[0])
     if not os.access(me, os.W_OK):
         sys.exit("news: %s is not writable" % me)
+    # Ask for the first 4 KB only: VERSION sits near the top, and most checks
+    # end in "already current". A server that ignores Range sends everything,
+    # which is no worse than before; a partial gzip still decodes its head.
+    if os.environ.get("LPN_FORCE") != "1":
+        try:
+            head, _h, _w, _p = get(url, 30, extra={"Range": "bytes=0-4095"}, cap=PAGECAP)
+            peek = "?"
+            for ln in head.decode("utf-8", "replace").splitlines()[:60]:
+                if ln.startswith("VERSION = "):
+                    peek = ln.split("=", 1)[1].strip().strip('"\'')
+                    break
+            if peek == VERSION:
+                print(D("  already %s %s %s" % (VERSION, bul_(a), spent())))
+                return
+            if peek != "?" and vkey(peek) < vkey(VERSION):
+                sys.exit("news: %s offers %s, older than the installed %s - not "
+                         "installing.\n  Set LPN_FORCE=1 to downgrade deliberately."
+                         % (url, peek, VERSION))
+        except SystemExit:
+            raise
+        except Exception:
+            pass                               # no verdict from the head: fetch it all
     try:
         raw, _, wire, _p = get(url, 30, cap=PAGECAP)
     except Exception as e:
@@ -1962,6 +2711,14 @@ def cmd_update(a, P, D):
     for ln in txt.splitlines()[:40]:
         if ln.startswith("VERSION = "):
             new = ln.split("=", 1)[1].strip().strip('"\'')
+    # never go backwards on its own: a stale branch or mirror would otherwise
+    # quietly undo fixes (this happened: 6.5 "updated" to 6.1)
+    if new == VERSION:
+        print(D("  already %s %s %s" % (VERSION, bul_(a), spent())))
+        return
+    if vkey(new) < vkey(VERSION) and os.environ.get("LPN_FORCE") != "1":
+        sys.exit("news: %s offers %s, older than the installed %s - not installing.\n"
+                 "  Set LPN_FORCE=1 to downgrade deliberately." % (url, new, VERSION))
     lines = txt.splitlines(True)
     if lines and lines[0].startswith("#!"):
         lines[0] = "#!%s\n" % (sys.executable or "/usr/bin/env python3")
@@ -1974,7 +2731,7 @@ def cmd_update(a, P, D):
         pass
     os.replace(tmp, me)                      # atomic: never a half-written news
     print(D("  updated %s -> %s %s %s %s backup at %s.bak"
-            % (VERSION, new, bul_(a), kbs(wire), bul_(a),
+            % (VERSION, new, bul_(a), spent(), bul_(a),
                os.path.basename(me))))
     if not os.path.exists(uf) or open(uf, encoding="utf-8").read().strip() != url:
         os.makedirs(CFD, exist_ok=True)
@@ -1990,6 +2747,9 @@ def cmd_pick(a, P, D, pick):
     if not 1 <= pick <= len(last):
         sys.exit("news: pick 1-%d" % len(last))
     it = last[pick - 1]
+    old_ = list_age_note()
+    if old_:
+        sys.stderr.write("  note: %s\n" % old_)
     st = state()
     if a.star:
         k = key(it["ti"])
@@ -2021,10 +2781,13 @@ def cmd_pick(a, P, D, pick):
     Pr = pal(a.color)
     for ln in textwrap.wrap(it["ti"], max(20, cols - 2)) or [""]:
         print(Pr["b"](ln))
-    note, col = kind_note(how)
+    note, col = kind_note(how, it)
     print(Pr["d"]("  %s %s %s" % (
         it.get("src", "?"), bul_(a), age(int(time.time()) - it["d"])
-        if it.get("d") else "?")) + Pr["d"](" %s " % bul_(a)) + Pr[col](note) + "\n")
+        if it.get("d") else "?")) + Pr["d"](" %s " % bul_(a)) + Pr[col](note))
+    if LAST_WHY and not how.endswith("full"):
+        print(Pr["d"]("  tried: " + "; ".join(LAST_WHY)[:max(20, cols - 10)]))
+    print()
     for para in (body or "").split("\n\n"):
         print(textwrap.fill(para, max(20, cols - 2), initial_indent="  ",
                             subsequent_indent="  ") + "\n")
@@ -2055,14 +2818,20 @@ def cmd_download(a, P, D):
             print(D("  %2d skipped - out of range" % i))
             continue
         it = last[i - 1]
-        if tot >= cap_ and not (it.get("c") or have(key(it["ti"]))):
-            print(D("  stopped before %d - budget %s spent (--budget KB to raise)"
-                    % (i, kbs(tot))))
-            break                       # check before spending, so counts stay true
+        # afford it before starting it: every fetch pays at least a handshake,
+        # so "stop once over" overshot the budget by a whole article
+        need = predict(0, it.get("u"))
+        if tot + need > cap_ and not have(key(it["ti"])):
+            print(D("  stopped before %d - %s spent, the next needs ~%s "
+                    "(--budget KB to raise)" % (i, kbs(tot), kbs(need))))
+            break
         try:
+            e0 = NETSTAT["est"]
             txt, nb, how = fetch_article(it)
+            nb = NETSTAT["est"] - e0           # true cost, handshakes included
         except Exception as e:
             print(D("  %2d failed   %s" % (i, str(e)[:40])))
+            tot += NETSTAT["est"] - e0         # a failed fetch still spent bytes
             continue
         tot += nb
         if how in ("feed", "offline"):
@@ -2173,6 +2942,7 @@ def cmd_signal(a, P, D):
 
 
 def run(a):
+    OFFLINE[0] = bool(getattr(a, "offline", False))
     a.unit = "celsius" if getattr(a, "celsius", False) else "fahrenheit"
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
         a.color = False
@@ -2205,7 +2975,7 @@ def run(a):
     D, B, C = P["d"], P["b"], P["cyn"]
 
     if getattr(a, "tui", False):
-        return cmd_tui(a, P, D)
+        return cmd_tui(a, P, D, explicit=True)
 
     if a.update is not None:
         return cmd_update(a,P,D)
@@ -2278,6 +3048,13 @@ def run(a):
         return cmd_signal(a,P,D)
 
     srcs = sources(a)
+    # interactive by default, but only for a plain listing in a real terminal:
+    # any flag that shapes or acts on the list, a pipe, or a dumb terminal keeps
+    # the classic output, so `news | head`, -q, --stream and scripts behave
+    if not getattr(a, "plain", False) and default_tui_ok(a) and tui_can_start():
+        if cmd_tui(a, P, D, explicit=False):
+            return
+
     if a.light:
         keep_ = []
         for x in srcs:
@@ -2295,21 +3072,23 @@ def run(a):
         tot, unknown = 0, 0
         for x in srcs:
             c_ = jread("%s/%s.json" % (CD, x["id"]), {})
-            w_, age_ = c_.get("w"), time.time() - (c_.get("t") or 0)
+            w_, age_ = c_.get("w"), age_of(c_.get("t"))
             fresh_ = age_ < (x.get("ttl") or TTL)
             if w_ is None:
                 unknown += 1
                 print("  %-7s %s" % (x["id"],
                       D("unknown - not fetched since v2.4")))
                 continue
-            due = 0 if fresh_ else w_
+            due = 0 if fresh_ else predict(w_)
             tot += due
             print("  %-7s %s %s" % (x["id"],
                   (P["grn"] if not due else P["yel"] if due < 40960 else P["red"])(
                       "%7s" % (kbs(due) if due else "cached")),
-                  D("last %s%s" % (kbs(w_), "" if due else ", within ttl"))))
-        print(D("  ~%s if refreshed now%s"
-                % (kbs(tot), ", %d unknown" % unknown if unknown else "")))
+                  D("body %s%s" % (kbs(w_), "" if due else ", within ttl"))))
+        print(D("  ~%s if refreshed now%s" % (kbs(tot),
+                ", %d unknown" % unknown if unknown else "")))
+        print(D("  each refresh pays ~%s of handshake even when nothing changed"
+                % kbs(predict(0))))
         return
     if a.check:
         for x in srcs:
@@ -2334,7 +3113,7 @@ def run(a):
         for x in srcs:
             c_ = jread("%s/%s.json" % (CD, x["id"]), {})
             if c_.get("items"):
-                bag[x["id"]] = (c_["items"], 0, int(time.time() - (c_.get("t") or 0)), 0, 0)
+                bag[x["id"]] = (c_["items"], 0, (max(1, age_secs(c_.get("t"))) if age_secs(c_.get("t")) >= 0 else -3), 0, 0)
             else:
                 bag[x["id"]] = ([], 0, -1, 0, 0)
     elif a.stream:
@@ -2379,7 +3158,7 @@ def run(a):
             c_ = jread("%s/%s.json" % (CD, x["id"]), {})
             if c_.get("items"):
                 bag[x["id"]] = (c_["items"], 0,
-                                max(1, int(time.time() - (c_.get("t") or 0))), 0, 0)
+                                (max(1, age_secs(c_.get("t"))) if age_secs(c_.get("t")) >= 0 else -3), 0, 0)
     try:
         cols = os.get_terminal_size().columns
     except Exception:
@@ -2391,9 +3170,10 @@ def run(a):
     if a.stream:                           # rows already printed as they arrived
         tot_b = sum(bag.get(x["id"], ([], 0, 0, 0, 0))[1] for x in srcs)
         dn = [x["name"] for x in srcs if bag.get(x["id"], ([], 0, -1, 0, 0))[2] == -1]
-        wrapout("%d item%s %s %s%s" % (
+        wrapout("%d item%s %s %s%s%s" % (
             st_n[0], "" if st_n[0] == 1 else "s", bul_(a),
-            kbs(tot_b) if tot_b else "0B, cached",
+            spent(),
+            stale_note([bag.get(x["id"], ([], 0, -1, 0, 0)) for x in srcs], a),
             (" %s down: %s" % (bul_(a), ", ".join(dn))) if dn else ""),
             P, cols_())
         return
@@ -2410,7 +3190,6 @@ def run(a):
         if sta == -1:
             down.append(x["name"])
             continue
-        stale = max(stale, sta)
         for it in sorted(items, key=lambda z: -when_sort(z))[:a.n]:
             k = key(it["ti"])
             if k in seen:
@@ -2418,13 +3197,12 @@ def run(a):
             seen.add(k)
             rows.append((x["name"], it))
     rows.sort(key=lambda r: -when_sort(r[1]))
-    foot = "%s %s" % (bul_(a), kbs(bytes_) if bytes_ else "0B, cached")
+    foot = "%s %s" % (bul_(a), spent())
     if partial_n:
         foot += " %s %d truncated, salvaged" % (bul_(a), partial_n)
     if nm:
         foot += " %s %d unchanged (304)" % (bul_(a), nm)
-    if stale:
-        foot += " %s stale %s" % (bul_(a), ago(stale))
+    foot += stale_note([bag.get(x["id"], ([], 0, -1, 0, 0)) for x in srcs], a)
     if down:
         foot += " %s down: %s" % (bul_(a), ", ".join(down))
     if skipped:

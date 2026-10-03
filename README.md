@@ -22,7 +22,7 @@ NEWS top   Sun 13 Sep 19:35
     ● ↓ Swedish party blocs tied after Sunday vote, projections say
     A partial count by Sweden's election authority projected…
 
-  25 items · 16.5KB · 2 unchanged (304) · news -r N to read
+  25 items · ~51K · 2 unchanged (304) · news -r N to read
 ```
 
 `●` unread  `↓` article text already downloaded, readable offline at zero cost
@@ -170,9 +170,17 @@ is flagged `proxied?`, since captive portals answer for everything.
   Servers advertising no validator are still sent `If-Modified-Since` from the
   cache timestamp — about 40 bytes to ask, and many honour it. On the default
   set this measured **437 KB → 269 KB** on a repeat pull.
-- **Few hosts, deliberately.** A TLS handshake is roughly 4 KB regardless of
-  payload, so host count dominates. The default set is small on purpose.
-- **Nothing polls in the background.** Nothing is fetched unless you ask.
+- **Few hosts, deliberately.** Every new connection pays a TCP and TLS
+  handshake of about 6 KB before a single byte of news arrives, so host count
+  dominates. The default set is small on purpose.
+- **Repeat connections resume.** One TLS context is shared for the whole run,
+  so a second request to the same host resumes the session instead of
+  repeating the handshake, and feeds on the same host are fetched in turn so
+  the second can benefit.
+- **Nothing is fetched while you are not looking.** The plain list fetches
+  only when run. The interactive reader refreshes stale data and samples the
+  ping meter only within five minutes of a keypress; left idle, it shows how
+  old its data is and spends nothing.
 - **Truncated downloads still count.** If the connection dies mid-transfer the
   bytes that arrived are kept: gzip is a stream, and every `<item>` that closed
   is a complete record. 85% of a feed yields 10 of 12 stories; 60% yields 6.
@@ -273,13 +281,47 @@ Every default feed, from a phone on 2026-09-13:
 Four servers ignore `Accept-Encoding` entirely. Advertising `deflate` alongside
 `gzip` was tried and changed nothing, so that avenue is closed. `nature` and
 `reg` dominate their categories; retag them in `sources.json` for a leaner
-default. These are worst-case figures — conditional GET makes a second run the
-same day close to free.
+default. These are body sizes only; see below for what a request really
+costs.
+
+## What a request really costs
+
+A body is the smallest part of most requests. Measured on a live interface
+against an HTTPS server:
+
+| request | on the wire |
+|---|---|
+| `304 Not Modified`, fresh TLS handshake | 6.7 KB |
+| `304 Not Modified`, resumed TLS session | 3.8 KB |
+| three 304s on one kept-alive connection | 8.6 KB (vs 20.1 KB separately) |
+| ping meter probe (TCP open, reset) | 0.8 KB |
+
+Of a fresh 304, headers are about 0.8 KB and the rest is TCP and TLS — mostly
+the server's certificate chain. So a refresh of five unchanged feeds is not
+"close to free"; it is about 33 KB. Bodies add their own size plus ~5% for
+packet framing and the acknowledgements sent back.
+
+Earlier versions reported only the compressed body, which understated small
+requests by up to 90%. Totals are now estimated from these measurements —
+within a few percent on the server they were taken from — and shown with a
+`~` because certificate chains and network paths differ. `--budget` counts
+the same estimate, and will not start a fetch it cannot afford.
+
+`--update` asks for the first 4 KB of the published file before anything
+else: the version is near the top, and most checks end in "already current".
+Measured against GitHub, that is ~11 KB instead of ~39 KB. It also refuses to
+install an *older* version unless `LPN_FORCE=1` is set — a stale branch once
+quietly turned 6.5 back into 6.1.
+
+Hacker News, which is served uncompressed, is asked only for the six fields
+the reader uses. That saving is unmeasured: the API was not reachable from
+the build machine. If the server refuses the trimmed query, the reader steps
+down to a plainer one and remembers what worked.
 
 | action | over the wire |
 |---|---|
 | within the cache TTL | nothing, no socket opened |
-| refresh, feed unchanged | handshake + 304, no body |
+| refresh, feed unchanged | handshake + 304, no body: ~4-7 KB |
 | refresh, feed changed | handshake + gzipped feed |
 | `-r N`, text already in the feed | nothing |
 | `-r N`, already downloaded | nothing |
@@ -368,6 +410,10 @@ and titles in scripts with no Latin characters.
 - Weather codes are ranked by an explicit severity table, not by numeric value:
   WMO puts rain showers (80) above heavy snow (75), so `max()` would have
   reported the wrong condition for a snowy day.
+- `--offline` is enforced inside the one function that touches the network, so
+  no new code path can forget it.
+- The interactive view survives terminals down to 1x1, live resizing, and
+  titles in wide or mixed-direction scripts.
 - `Ctrl-C` exits cleanly; `SIGPIPE` and broken pipes make `| head` behave.
 
 ## Development
@@ -424,25 +470,81 @@ own section headings and real length, anything else when it runs past a few
 paragraphs. A paywall teaser fails both and is never called a full article.
 
 Saved copies remember which kind they were, so a re-read does not claim more
-than the first fetch found.
+than the first fetch found — and a saved *abstract* is never the end of the
+road: if a full-text address exists it is tried first, so copies downloaded
+before this existed get upgraded on the next read.
 
-## Interactive mode
+bioRxiv feeds have linked in more than one form (`/cgi/content/short/<id>` as
+well as `/content/10.1101/<id>`); both carry the same id and resolve to the
+same `.full` page. When full text still is not had, the reader says why:
 
-```sh
-lowpingnews --tui
+```
+  abstract only - no full text available
+  tried: 2026.09.20.677123v1.full HTTP 403
+```
+
+## Interactive mode (the default)
+
+In a terminal, `lowpingnews` opens the interactive reader:
+
+```
+ LowPingNews 6.3  BIO  40 items            ▂▃▂▁▂ 38ms good
+ • bioRxiv plant  3d   BSA101: Unlocking Historical Mutant...
 ```
 
   j/k move    enter read    b back    s star    o open
   n/p category    r refresh    q quit
 
-Built on `curses`, which is in the standard library: no dependency, ~12 ms to
-import, and it only loads when you ask for it. The default path is untouched,
-so `news | head`, `-q` and `--stream` keep working as before.
+The classic list is still there, and is what you get whenever the invocation
+asks for it: `--plain`, any list-shaping flag (`-t`, `-u`, `-n`, `-q`,
+`--stream`, `--light`...), a pipe (`lowpingnews | head`), `TERM=dumb`, or
+`LPN_NO_TUI=1`. Scripts never see the TUI. Numbers shown in the TUI are the
+ones `-r N`, `-o N` and `-S N` use afterwards.
 
-`curses` is POSIX-only. On Linux, macOS and Termux it is present; on Windows it
-needs `pip install windows-curses`, and `--tui` says so rather than failing
-obscurely. Tab is deliberately not the category key — terminal emulators and
-phone keyboards swallow it before curses sees it, so `n`/`p` are used instead.
+**The ping meter** in the banner is round-trip time to the nearest point of
+presence, measured as a TCP handshake — not ICMP, which carriers drop
+independently of real traffic and which most Termux installs lack. The
+references are anycast addresses (1.1.1.1, 8.8.8.8, 9.9.9.9): the network
+routes each to its closest site, so "nearest to where you are" needs no location
+lookup. One probe is sent every five minutes, trying a different reference
+each time until all three have been measured, then keeping the fastest. Each
+probe is about 0.8 KB, closed with a reset rather than the usual exchange to
+save packets, and none are sent more than five minutes after your last
+keypress — so an idle reader costs nothing. `--offline` and `LPN_NO_PING=1`
+turn it off; `LPN_PING_REFS=host:port,...` substitutes your own reference.
+
+Built on `curses` (standard library, ~12 ms to import). POSIX-only: on Windows
+it needs `pip install windows-curses`; without it the default quietly falls
+back to the list, and only an explicit `--tui` complains.
+
+## Freshness
+
+The rule: anything shown is either current or says how old it is. In
+practice:
+
+- **Every footer** — normal, `--offline`, `--stream`, weather — reports data
+  served from cache after a failed refresh: `stale 5h ago`.
+- **The TUI banner** always carries the age of the oldest source on screen, in
+  green while current and yellow once past its refresh interval
+  (`TOP  40 items  12m` / `stale 5h`). Ages in the list recompute every second.
+- **The TUI refreshes itself** once data passes its interval, in the
+  background, using conditional requests so an unchanged feed costs a
+  handshake (~4-7 KB) rather than a full download — but only within five
+  minutes of a keypress. The cursor stays on the story it was on. After a failed
+  attempt it backs off two minutes instead of retrying continuously, and no
+  feed is refreshed more often than once a minute whatever its `ttl` says.
+- **Status messages expire**, and "working" messages are replaced by the
+  outcome, so nothing like "refreshing…" outlives the work it describes.
+- **`-r N` on an old list** warns on stderr: `note: from a list shown 2d ago`.
+- **Saved articles** say how old they are: `full article, saved 3d ago`.
+- **The ping meter** reports `stale` if its sampler stops producing readings,
+  rather than showing an old number as current.
+- **A timestamp in the future** — a cache written while the phone's clock was
+  wrong — counts as *unknown age*, never as fresh. The naive check
+  `now - t < ttl` is true for negative ages, which would have frozen a feed
+  indefinitely; and a self-generated `If-Modified-Since` dated in the future
+  invites a 304, which would have defeated even `-f`. Both are guarded, and
+  "age unknown" is shown rather than a plausible-looking number.
 
 ## Tests
 

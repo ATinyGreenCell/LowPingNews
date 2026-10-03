@@ -127,13 +127,14 @@ class Server(object):
         self.routes[path] = handler
 
 
-def _drive_tui(env, keys, rows=24, cols=64, settle=0.7):
+def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",)):
     """Run the curses interface on a pty and feed it real keystrokes."""
     import fcntl, pty, select, struct, termios
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update(env)
-        os.execv(NEWS, ["news", "--tui"])
+        os.environ.setdefault("TERM", "xterm-256color")
+        os.execv(NEWS, ["news"] + list(args))
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     buf = b""
 
@@ -641,6 +642,626 @@ def t_paywall_is_not_called_full(env, srv):
     run(env, "-t")
     out, _, _ = run(env, "-r", "1")
     assert "full article" not in out, "a paywall teaser was called a full article"
+
+
+def _preprint_site(srv, pid, full_status=200):
+    _page(srv, "/content/10.1101/%s" % pid, "<html><body><article><h2>Abstract</h2>"
+          "<p>A short abstract as the landing page shows it to any visitor, "
+          "one block of text and nothing further.</p></article></body></html>")
+    _page(srv, "/cgi/content/short/%s" % pid, "<html><body><article><h2>Abstract"
+          "</h2><p>The same short abstract, reached by the older link form the "
+          "feed uses for this preprint.</p></article></body></html>")
+    if full_status == 200:
+        _page(srv, "/content/10.1101/%s.full" % pid,
+              "<html><body><article><h2>Abstract</h2><p>Short.</p>"
+              "<h2>Introduction</h2>" + _body(5) + "<h2>Results</h2>" + _body(6) +
+              "<h2>Methods</h2>" + _body(5) + "<h2>Discussion</h2>" + _body(3) +
+              "</article></body></html>")
+    else:
+        def refuse(h):
+            h.send_response(full_status)
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+        srv.routes["/content/10.1101/%s.full" % pid] = refuse
+
+
+@test
+def t_feed_link_form_cgi_short_still_reaches_full_text(env, srv):
+    """bioRxiv feeds link as /cgi/content/short/<id>?rss=1, not /content/10.1101/."""
+    pid = "2026.09.20.677123v1"
+    _preprint_site(srv, pid)
+    srv.feed("/f", [item("Phylogenomics preprint",
+                         link=srv.url("/cgi/content/short/%s?rss=1" % pid))])
+    sources(env, [{"id": "a", "name": "bioRxiv plant", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-r", "1")
+    assert "full article" in out, "old link form never reached .full:\n%s" % out[:300]
+
+
+@test
+def t_saved_abstract_does_not_block_full_text(env, srv):
+    """Copies saved before full-text support must not be served forever."""
+    pid = "2026.09.21.111111v1"
+    _preprint_site(srv, pid)
+    srv.feed("/f", [item("Saved abstract preprint",
+                         link=srv.url("/content/10.1101/%s" % pid))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    # write a legacy, unmarked copy exactly where the program looks for it
+    code = ("import os,sys;sys.argv=['x'];"
+            "import importlib.util as u;from importlib.machinery import SourceFileLoader as L;"
+            "s=u.spec_from_loader('n',L('n',%r));m=u.module_from_spec(s);s.loader.exec_module(m);"
+            "os.makedirs(m.ADIR,exist_ok=True);"
+            "open(m.apath(m.key('Saved abstract preprint')),'w').write('old abstract')" % NEWS)
+    subprocess.run([sys.executable, "-c", code], env=env)
+    out, _, _ = run(env, "-r", "1")
+    assert "full article" in out, "a stale saved abstract was served:\n%s" % out[:300]
+
+
+@test
+def t_blocked_full_text_says_why(env, srv):
+    pid = "2026.09.22.222222v1"
+    _preprint_site(srv, pid, full_status=403)
+    srv.feed("/f", [item("Blocked preprint", link=srv.url("/content/10.1101/%s" % pid))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-r", "1")
+    assert "abstract only" in out, out[:300]
+    assert "403" in out, "the reason full text was missing was not shown:\n%s" % out[:300]
+
+
+@test
+def t_tui_banner_names_app_and_version(env, srv):
+    srv.feed("/f", [item("Some headline")])
+    sources(env, [{"id": "a", "name": "bioRxiv synbio", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    out = _drive_tui(env, [b"q"])
+    m = load()
+    assert "LowPingNews" in out and m.VERSION in out, "banner missing:\n%s" % out[:200]
+    assert "bioRxiv synbio" in out, "source name truncated to an ambiguous stem"
+
+
+@test
+def t_offline_read_never_touches_the_network(env, srv):
+    """Regression: retrying past a saved abstract ignored --offline."""
+    pid = "2026.09.23.333333v1"
+    _preprint_site(srv, pid)
+    srv.feed("/f", [item("Offline preprint", link=srv.url("/content/10.1101/%s" % pid))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    code = ("import os,importlib.util as u;from importlib.machinery import SourceFileLoader as L;"
+            "s=u.spec_from_loader('n',L('n',%r));m=u.module_from_spec(s);s.loader.exec_module(m);"
+            "os.makedirs(m.ADIR,exist_ok=True);"
+            "open(m.apath(m.key('Offline preprint')),'w').write('saved abstract')" % NEWS)
+    subprocess.run([sys.executable, "-c", code], env=env)
+    before = len(srv.seen)
+    run(env, "--offline", "-r", "1")
+    extra = [p for p, _h in srv.seen[before:]]
+    assert not extra, "--offline made requests: %s" % extra
+
+
+@test
+def t_reasons_do_not_leak_between_reads(env, srv):
+    m = load()
+    m.LAST_WHY[:] = ["stale reason from an earlier article"]
+    it = {"ti": "No link here", "c": "feed body text"}
+    m.fetch_article(it)
+    assert not m.LAST_WHY, "reasons carried over: %r" % m.LAST_WHY
+
+
+@test
+def t_ping_meter_picks_fastest_and_survives_outage(env, srv):
+    import socket
+    m = load()
+    s1 = socket.socket(); s1.bind(("127.0.0.1", 0)); s1.listen(16)
+    port = s1.getsockname()[1]
+    threading.Thread(target=lambda: [s1.accept()[0].close() for _ in iter(int, 1)],
+                     daemon=True).start()
+    pm = m.PingMeter(every=5, refs=(("127.0.0.1", 1, "dead"), ("127.0.0.1", port, "live")))
+    pm.every = 0.05
+    pm.start()
+    time.sleep(0.6)
+    ms, _smp, ref, state = pm.reading()
+    pm.close()
+    assert state == "ok" and ref == "live", (state, ref)
+    # all references down for many cycles: a loop, never deep recursion
+    pm = m.PingMeter(every=5, refs=(("127.0.0.1", 1, "x"),))
+    pm.every = 0.001
+    pm.start(); time.sleep(2.0); pm.close(); pm.t.join(2)
+    assert not pm.t.is_alive(), "meter thread ignored close()"
+    assert pm.reading()[3] == "no route"
+
+
+@test
+def t_tui_is_default_only_in_a_plain_terminal_session(env, srv):
+    srv.feed("/f", [item("Headline %d" % i) for i in range(4)])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    tui = lambda o: "j/k move" in o
+    assert tui(_drive_tui(e, [b"q"], args=())), "bare `news` did not open the TUI"
+    assert not tui(_drive_tui(e, [b"q"], args=("-t",))), "-t should keep list output"
+    assert not tui(_drive_tui(e, [b"q"], args=("--plain",))), "--plain ignored"
+    d = dict(e); d["TERM"] = "dumb"
+    assert not tui(_drive_tui(d, [b"q"], args=())), "TUI on a dumb terminal"
+    out, _, _ = run(env)                               # piped
+    assert "j/k move" not in out and out.strip(), "a pipe got the TUI"
+
+
+@test
+def t_tui_survives_tiny_terminals_and_wide_glyphs(env, srv):
+    """v6.2 crashed on a 1x1 terminal: addnwstr() returned ERR."""
+    srv.feed("/f", [item("\u690d\u7269\u306e\u9752\u3044\u8272\u7d20" * 4),
+                    item("Emoji \U0001F331\U0001F9EC headline " * 3),
+                    item("Plain headline")])
+    sources(env, [{"id": "a", "name": "bioRxiv plant", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    for rows, cols in ((1, 1), (2, 10), (3, 3), (24, 40)):
+        out = _drive_tui(e, [b"j", b"j", b"q"], rows=rows, cols=cols, settle=0.4)
+        assert "Traceback" not in out, "%dx%d crashed:\n%s" % (rows, cols, out[-300:])
+
+
+@test
+def t_read_numbers_follow_the_tui_list(env, srv):
+    srv.feed("/f", [item("Story %d" % i, when="2026-09-1%dT00:00:00Z" % i) for i in range(5)])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    _drive_tui(e, [b"q"])
+    out, _, _ = run(env, "-r", "1")
+    assert "Story 4" in out.split("\n")[0], "-r 1 is not the TUI's first row:\n%s" % out[:200]
+
+
+# ---------------------------------------------------------------- staleness
+def _cache(env, sid):
+    return os.path.join(env["XDG_CACHE_HOME"], "lowpingnews", sid + ".json")
+
+
+def _restamp(env, sid, t):
+    p = _cache(env, sid)
+    c = json.load(io.open(p, encoding="utf-8"))
+    c["t"] = t
+    json.dump(c, io.open(p, "w", encoding="utf-8"))
+
+
+def _versioned(srv, path, ver, honour_ims=True):
+    """A feed with no Last-Modified header, that honours If-Modified-Since
+    the way real servers do: 304 when asked about a date after its change."""
+    import email.utils
+    changed = [time.time() - 3600]
+
+    def h(req):
+        ims = req.headers.get("If-Modified-Since")
+        if honour_ims and ims:
+            try:
+                if email.utils.parsedate_to_datetime(ims).timestamp() >= changed[0]:
+                    req.send_response(304)
+                    req.send_header("Content-Length", "0")
+                    req.end_headers()
+                    return
+            except Exception:
+                pass
+        raw = gzip.compress(('<?xml version="1.0"?><rss version="2.0"><channel>%s'
+                             '</channel></rss>' % "".join(item(v) for v in ver[0])).encode())
+        req.send_response(200)
+        req.send_header("Content-Encoding", "gzip")
+        req.send_header("Content-Length", str(len(raw)))
+        req.end_headers()
+        req.wfile.write(raw)
+    srv.routes[path] = h
+    return changed
+
+
+@test
+def t_future_cache_stamp_is_not_fresh_forever(env, srv):
+    """now - t < ttl is true for a stamp in the future: frozen cache."""
+    ver = [["Edition ONE"]]
+    changed = _versioned(srv, "/f", ver)
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 60}])
+    run(env, "-t")
+    _restamp(env, "a", time.time() + 86400)       # clock was a day ahead
+    ver[0], changed[0] = ["Edition TWO"], time.time()
+    out, _, _ = run(env, "-t")
+    assert "Edition TWO" in out, "a future-stamped cache was served as fresh"
+
+
+@test
+def t_forced_refresh_never_sends_a_future_if_modified_since(env, srv):
+    """Our own IMS dated in the future invites a 304, so even -f froze."""
+    ver = [["Edition ONE"]]
+    changed = _versioned(srv, "/f", ver)
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 60}])
+    run(env, "-t")
+    _restamp(env, "a", time.time() + 86400)
+    ver[0], changed[0] = ["Edition TWO"], time.time()
+    out, _, _ = run(env, "-tf")
+    assert "Edition TWO" in out, "-f could not recover a future-stamped cache"
+
+
+@test
+def t_unknown_cache_age_is_said_not_hidden(env, srv):
+    srv.feed("/f", [item("Cached story")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 60}])
+    run(env, "-t")
+    _restamp(env, "a", time.time() + 86400)
+    srv.routes.clear()                            # refresh fails: cache is served
+    out, _, _ = run(env, "-t")
+    assert "age unknown" in out, "stale data of unknown age shown as current:\n%s" % out
+
+
+@test
+def t_every_footer_discloses_stale_data(env, srv):
+    srv.feed("/f", [item("Cached story")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 60}])
+    run(env, "-t")
+    _restamp(env, "a", time.time() - 5 * 3600)
+    srv.routes.clear()
+    for args in (["-t"], ["--stream", "-t"], ["--offline", "-t"]):
+        out, _, _ = run(env, *args)
+        assert "stale 5h" in out, "%s hid that its data was 5h old:\n%s" % (args, out)
+
+
+@test
+def t_reading_from_an_old_list_says_so_on_stderr(env, srv):
+    srv.feed("/f", [item("Story")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    lp = os.path.join(env["XDG_CACHE_HOME"], "lowpingnews", "last.json")
+    old = time.time() - 2 * 86400
+    os.utime(lp, (old, old))
+    out, err, _ = run(env, "-r", "1")
+    assert "2d ago" in err, "no warning that item 1 is from a 2-day-old list"
+    assert "list shown" not in out, "the warning leaked into stdout"
+
+
+@test
+def t_saved_copy_says_how_old_it_is(env, srv):
+    srv.feed("/f", [item("Saved story")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    code = ("import os,time,importlib.util as u;from importlib.machinery import SourceFileLoader as L;"
+            "s=u.spec_from_loader('n',L('n',%r));m=u.module_from_spec(s);s.loader.exec_module(m);"
+            "p=m.apath(m.key('Saved story'));os.makedirs(m.ADIR,exist_ok=True);"
+            "open(p,'w').write(chr(1)+'kind:full\\nSaved body text.');"
+            "t=time.time()-3*86400;os.utime(p,(t,t))" % NEWS)
+    subprocess.run([sys.executable, "-c", code], env=env)
+    out, _, _ = run(env, "-r", "1")
+    assert "saved 3d" in out, "a 3-day-old saved copy did not say so:\n%s" % out[:200]
+
+
+@test
+def t_ping_meter_never_shows_an_old_sample_as_current(env, srv):
+    m = load()
+    pm = m.PingMeter(every=5, refs=(("127.0.0.1", 1, "x"),))
+    pm._add(42.0)
+    pm.stamps[-1] = time.time() - 600             # sampler stalled ten minutes ago
+    assert pm.reading()[3] == "stale", pm.reading()
+
+
+@test
+def t_stale_label_is_never_stale_just_now(env, srv):
+    m = load()
+    for ttl, age_ in ((1, 5), (1, 30), (60, 90), (900, 7200)):
+        txt, _c, stale = m.tui_freshness({"t": time.time() - age_, "ttl": ttl,
+                                           "unknown": False, "failed": []})
+        assert not ("stale" in txt and "just now" in txt), txt
+
+
+@test
+def t_tui_banner_shows_data_age(env, srv):
+    srv.feed("/f", [item("Story %d" % i) for i in range(3)])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 600}])
+    run(env, "-t")
+    _restamp(env, "a", time.time() - 5 * 3600)
+    srv.routes.clear()
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    out = _drive_tui(e, [b"q"], cols=80)
+    assert "stale 5h" in out, "TUI hid that its data was 5h old"
+
+
+@test
+def t_tui_refreshes_stale_data_on_its_own(env, srv):
+    ver = [["Morning edition %d" % i for i in range(3)]]
+    _versioned(srv, "/f", ver, honour_ims=False)
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 1}])
+    e = dict(env); e["LPN_NO_PING"] = "1"; e["LPN_TUI_MINAGE"] = "3"
+    import fcntl, pty, select, struct, termios
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(e)
+        os.environ["TERM"] = "xterm-256color"
+        os.execv(NEWS, ["news", "--tui"])
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
+    buf = [b""]
+
+    def pump(t):
+        end = time.time() + t
+        while time.time() < end:
+            r, _w, _x = select.select([fd], [], [], 0.1)
+            if r:
+                try:
+                    buf[0] += os.read(fd, 65536)
+                except OSError:
+                    return
+    pump(2.0)
+    mark = len(buf[0])
+    ver[0] = ["Evening edition %d" % i for i in range(3)] + ver[0]
+    pump(6.0)
+    try:
+        os.write(fd, b"q")
+    except OSError:
+        pass
+    pump(0.3)
+    try:
+        os.close(fd)
+        os.waitpid(pid, 0)
+    except Exception:
+        pass
+    seg = buf[0][mark:].decode("utf-8", "replace")
+    assert "Evening edition" in seg, "stale data was never refreshed"
+    # the rows that moved must be repainted as text: shifting them with
+    # scroll regions dropped them on some terminal emulators
+    assert "Morning edition" in seg, "moved rows were not repainted"
+    last = json.load(io.open(os.path.join(env["XDG_CACHE_HOME"], "lowpingnews",
+                                          "last.json"), encoding="utf-8"))
+    assert any("Evening" in x["ti"] for x in last), "-r numbering not updated"
+
+
+@test
+def t_tui_star_works_while_reading(env, srv):
+    srv.feed("/f", [item("Readable story", body="Body text.")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    out = _drive_tui(e, [b"\r", b"s", b"q", b"q"], cols=80, settle=1.0)
+    assert "starred" in out, "the hint offered s while reading, but it did nothing"
+
+
+# ---------------------------------------------------------------- efficiency
+@test
+def t_a_304_is_not_reported_as_free(env, srv):
+    """Every request pays a handshake; "0B, cached" after 304s was false."""
+    srv.feed("/f", [item("Story")], etag='"v1"')
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t")
+    out, _, _ = run(env, "-tf")
+    assert "unchanged (304)" in out
+    assert "0B, cached" not in out, "a 304 round was reported as costing nothing"
+    assert "~" in out, "cost is an estimate and should say so"
+
+
+@test
+def t_cost_prediction_includes_the_handshake(env, srv):
+    srv.feed("/f", [item("Story")])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 60}])
+    run(env, "-t")
+    _restamp(env, "a", time.time() - 3600)
+    m = load()
+    body = json.load(io.open(_cache(env, "a"), encoding="utf-8"))["w"]
+    out, _, _ = run(env, "--cost")
+    assert "handshake" in out
+    assert m.predict(body) > body + 3000, "prediction ignores connection overhead"
+
+
+@test
+def t_estimate_counts_what_a_request_really_costs(env, srv):
+    m = load()
+    full = m.est_wire(0, 300, 500, "full")
+    resumed = m.est_wire(0, 300, 500, "resumed")
+    assert full > 6000 and 3000 < resumed < full, (full, resumed)
+    assert m.est_wire(100000, 300, 500, "full") > 100000 + full - 100
+
+
+@test
+def t_same_host_feeds_share_one_worker(env, srv):
+    m = load()
+    srcs = [{"id": "p", "url": "https://connect.example.org/a"},
+            {"id": "e", "url": "https://other.example.org/x"},
+            {"id": "s", "url": "https://connect.example.org/b"}]
+    units = [[x["id"] for x in u] for u in m.host_units(srcs)]
+    assert units == [["p", "s"], ["e"]], units
+
+
+@test
+def t_hn_query_is_trimmed_and_steps_down_if_refused(env, srv):
+    import json as J
+    hits = {"hits": [{"objectID": "1", "title": "Show HN: a thing", "points": 1,
+                      "url": "https://example.invalid/x", "num_comments": 0,
+                      "created_at_i": int(time.time()) - 60}]}
+    seen = []
+
+    def h(req):
+        q = req.path
+        seen.append(2 if "attributesToHighlight" in q else 1 if "attributesToRetrieve" in q else 0)
+        if "attributesToHighlight" in q:
+            req.send_response(400)
+            req.send_header("Content-Length", "0")
+            req.end_headers()
+            return
+        raw = gzip.compress(J.dumps(hits).encode())
+        req.send_response(200)
+        req.send_header("Content-Encoding", "gzip")
+        req.send_header("Content-Length", str(len(raw)))
+        req.end_headers()
+        req.wfile.write(raw)
+    srv.routes["/api/v1/search"] = h
+    sources(env, [{"id": "hn", "name": "HN", "kind": "hn", "cats": ["top"],
+                   "url": srv.url("/api/v1/search?tags=front_page&hitsPerPage=20")}])
+    out, _, _ = run(env, "-t")
+    assert "Show HN" in out and seen == [2, 1], seen
+    del seen[:]
+    run(env, "-tf")
+    assert seen == [1], "repeated a request the server already refused: %s" % seen
+
+
+@test
+def t_idle_reader_spends_nothing(env, srv):
+    ver = [["Morning edition %d" % i for i in range(3)]]
+    _versioned(srv, "/f", ver, honour_ims=False)
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f"), "ttl": 1}])
+    e = dict(env)
+    # activity window well inside the stale floor: stored stamps are whole
+    # seconds, so data can read up to a second older than the clock says
+    e.update(LPN_NO_PING="1", LPN_TUI_MINAGE="3", LPN_TUI_ACTIVE="1")
+    import fcntl, pty, select, struct, termios
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(e)
+        os.environ["TERM"] = "xterm-256color"
+        os.execv(NEWS, ["news", "--tui"])
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
+
+    def pump(t):
+        end = time.time() + t
+        while time.time() < end:
+            r, _w, _x = select.select([fd], [], [], 0.1)
+            if r:
+                try:
+                    os.read(fd, 65536)
+                except OSError:
+                    return
+    deadline = time.time() + 10
+    while not srv.seen and time.time() < deadline:
+        pump(0.1)                                # the opening fetch, however slow
+    pump(0.5)
+    at_open = len(srv.seen)
+    pump(6.0)                                    # stale, but nobody is looking
+    idle = len(srv.seen) - at_open
+    os.write(fd, b"j")                           # someone is back
+    pump(4.0)
+    back = len(srv.seen) - at_open - idle
+    try:
+        os.write(fd, b"q")
+    except OSError:
+        pass
+    pump(0.3)
+    try:
+        os.close(fd)
+        os.waitpid(pid, 0)
+    except Exception:
+        pass
+    assert idle == 0, "an idle reader made %d requests" % idle
+    assert back >= 1, "activity did not resume refreshing"
+
+
+@test
+def t_meter_probes_once_per_cycle_and_not_when_idle(env, srv):
+    import socket
+    m = load()
+    calls = []
+    pm = m.PingMeter(every=5, refs=(("127.0.0.1", 9, "a"), ("127.0.0.1", 10, "b"),
+                                    ("127.0.0.1", 11, "c")))
+    pm._rtt = lambda h, p: calls.append(p) or 5.0
+    pm._cycle()
+    assert calls == [9], "a cycle probed %d references at once" % len(calls)
+    pm._cycle(); pm._cycle()
+    assert sorted(calls) == [9, 10, 11], "same host, different ports must all be tried"
+    pm.active_until = time.time() - 1
+    pm._cycle()
+    assert len(calls) == 3, "the meter probed while nobody was looking"
+    assert pm.reading()[3] in ("paused", "ok")
+
+
+@test
+def t_download_budget_counts_true_cost(env, srv):
+    page = b"<html><body>" + b"<p>" + b"word " * 200 + b"</p>" * 3 + b"</body></html>"
+
+    def serve(h):
+        h.send_response(200)
+        h.send_header("Content-Length", str(len(page)))
+        h.end_headers()
+        h.wfile.write(page)
+    srv.routes["/p"] = serve
+    srv.feed("/f", [item("S%d" % i, link=srv.url("/p")) for i in range(6)])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    run(env, "-t", "-n", "6")
+    # ~1 KB of body each, but over plain HTTP each still costs a TCP handshake
+    # and headers, ~2 KB. Counting bodies alone, 5 KB would store four or five
+    # pages; counting true cost, two.
+    out, _, _ = run(env, "-d", "all", "--budget", "5")
+    stored = int(re.search(r"(\d+)/\d+ stored", out).group(1))
+    assert stored <= 2, "budget counted bodies only: stored %d pages\n%s" % (stored, out)
+    spent_ = re.search(r"([\d.]+)K spent", out)
+    assert spent_ is None or float(spent_.group(1)) <= 5.0, "budget overshot:\n%s" % out
+
+
+def _update_fixture(srv, env, offered):
+    """A scratch copy of news, and a server offering a build at `offered`."""
+    m = load()
+    src = io.open(NEWS, encoding="utf-8").read()
+    body = re.sub(r'^VERSION = "[^"]+"', 'VERSION = "%s"' % offered, src,
+                  count=1, flags=re.M).encode()
+    ranges = []
+
+    def h(req):
+        rg = req.headers.get("Range")
+        ranges.append(rg)
+        b = body
+        if rg and rg.startswith("bytes=0-"):
+            b = body[:int(rg.split("-")[1]) + 1]
+            req.send_response(206)
+        else:
+            req.send_response(200)
+        req.send_header("Content-Length", str(len(b)))
+        req.end_headers()
+        req.wfile.write(b)
+    srv.routes["/news"] = h
+    d = tempfile.mkdtemp()
+    copy = os.path.join(d, "news")
+    shutil.copy(NEWS, copy)
+    os.chmod(copy, 0o755)
+    return m, copy, ranges
+
+
+def _update(env, copy, url, extra=None):
+    e = dict(env); e.update(extra or {})
+    p = subprocess.run([copy, "--update", url], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=e)
+    v = subprocess.run([copy, "--version"], stdout=subprocess.PIPE).stdout.decode()
+    return (p.stdout + p.stderr).decode("utf-8", "replace"), v.strip()
+
+
+@test
+def t_update_never_downgrades_on_its_own(env, srv):
+    """6.5 "updated" itself to 6.1 from a stale main branch."""
+    m, copy, _r = _update_fixture(srv, env, "1.0")
+    out, v = _update(env, copy, srv.url("/news"))
+    assert v.endswith(m.VERSION), "silently downgraded to %s" % v
+    assert "older" in out
+    out, v = _update(env, copy, srv.url("/news"), {"LPN_FORCE": "1"})
+    assert v.endswith("1.0"), "a deliberate downgrade was refused"
+
+
+@test
+def t_update_check_reads_only_the_head_when_current(env, srv):
+    m, copy, ranges = _update_fixture(srv, env, load().VERSION)
+    out, v = _update(env, copy, srv.url("/news"))
+    assert "already" in out, out
+    assert ranges and all(r for r in ranges), "downloaded the whole file to learn nothing"
+
+
+@test
+def t_update_installs_a_newer_build(env, srv):
+    m, copy, _r = _update_fixture(srv, env, "999.0")
+    out, v = _update(env, copy, srv.url("/news"))
+    assert v.endswith("999.0"), "a newer build was not installed:\n%s" % out
 
 
 @test
