@@ -148,6 +148,51 @@ cmd_install() {
     ln -sf "$BIN/lowpingnews" "$BIN/lpn"
     say "installed lowpingnews (takes effect next invocation)"
   fi
+  install_launchers
+  check_shadows
+}
+
+LAUNCH_MARK="# lowpingnews launcher - written by lpn install, safe to delete"
+
+install_launchers() {
+  # `weather` runs the LowPingNews forecast. Created if absent, refreshed if it
+  # is ours (it carries LAUNCH_MARK), and never written over if it is anyone
+  # else's - an older weather script is the user's to keep or move.
+  w="$BIN/weather"
+  sh_="$(command -v sh || echo /bin/sh)"
+  want="$(printf '#!%s\n%s\nexec "%s" weather "$@"\n' "$sh_" "$LAUNCH_MARK" "$BIN/news")"
+  if [ -e "$w" ] || [ -L "$w" ]; then
+    if [ -L "$w" ] || ! grep -qF "$LAUNCH_MARK" "$w" 2>/dev/null; then
+      say "kept your own $w - it is not ours, so \`weather\` still runs it"
+      say "  move it aside to use the LowPingNews forecast:  mkdir -p ~/old-applets && mv $w ~/old-applets/"
+      return 0
+    fi
+    [ "$(cat "$w")" = "$want" ] && return 0
+  fi
+  printf '%s\n' "$want" > "$w.new" && chmod +x "$w.new" && mv "$w.new" "$w" \
+    && say "installed launcher: weather -> lowpingnews weather" \
+    || { rm -f "$w.new"; say "WARN: could not write $w"; }
+}
+
+check_shadows() {
+  # Read-only. A script earlier in PATH, or an alias or function in a shell
+  # startup file, wins over what was just installed - and says nothing.
+  for c in news weather; do
+    first="$(command -v "$c" 2>/dev/null || true)"
+    case "$first" in
+      ""|"$BIN/$c") ;;
+      *) say "note: \`$c\` runs $first, which comes before $BIN in your PATH"
+         say "  move it aside to get LowPingNews:  mkdir -p ~/old-applets && mv $first ~/old-applets/" ;;
+    esac
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
+      [ -f "$rc" ] || continue
+      grep -nE "^[[:space:]]*(alias[[:space:]]+$c=|(function[[:space:]]+)?$c[[:space:]]*\(\))" "$rc" 2>/dev/null \
+        | grep -v -e lowpingnews -e 'lpn' | head -2 | while IFS=: read -r ln _rest; do
+          say "note: $rc line $ln redefines \`$c\` in your shell, hiding LowPingNews"
+          say "  delete that line, then run: unalias $c 2>/dev/null; hash -r"
+        done
+    done
+  done
 }
 
 ensure_catalog() {
@@ -209,12 +254,14 @@ release_has_changes() {
   grep -v '^VERSION = ' "$REPO/news" > "$REPO/.rel_new"
   if cmp -s "$REPO/.rel_old" "$REPO/.rel_new"; then
     rm -f "$REPO/.rel_old" "$REPO/.rel_new"
-    # news is unchanged, but the feed index may not be: publishing check
-    # results (`catalog check all --write catalog.json`) is a real release
-    if [ -f "$REPO/catalog.json" ] && ! git -C "$REPO" show "$last:catalog.json" 2>/dev/null \
-         | cmp -s - "$REPO/catalog.json"; then
-      return 0
-    fi
+    # news is unchanged, but any other file the project owns may not be:
+    # check results in catalog.json, a fix to this tool, the tests, the docs.
+    # Each of those is a real release; only a bare VERSION bump is not.
+    for f in $OWNED; do
+      [ "$f" = news ] && continue
+      [ -f "$REPO/$f" ] || continue
+      git -C "$REPO" show "$last:$f" 2>/dev/null | cmp -s - "$REPO/$f" || return 0
+    done
     return 1
   fi
   rm -f "$REPO/.rel_old" "$REPO/.rel_new"

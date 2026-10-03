@@ -65,6 +65,20 @@ lowpingnews bio -d all      # at the trailhead
 lowpingnews -r 3            # later, no signal, zero bytes
 ```
 
+## How many articles
+
+A number is how many articles to show, newest first across every feed in the
+category: `lowpingnews top 13`, `lowpingnews 13`, `lowpingnews science 40`. It
+raises the per-feed limit to match, so the count is not quietly capped at five
+per feed; if fewer exist than you asked for, the footer says so. In a terminal
+it opens the reader with that many. `-n` still sets a per-feed limit, and means
+list output. Because numbers are counts, a category name cannot be a number.
+
+In the reader, **← →** (or `h`/`l`) slide the title column sideways so long
+headlines can be read in full; `«` and `»` show there is more. Source and age
+stay put. Arrow keys work in either encoding terminals send, and an
+unrecognised key sequence is ignored rather than mistaken for Esc.
+
 ## Weather
 
 ```sh
@@ -342,6 +356,67 @@ down to a plainer one and remembers what worked.
 Config lives outside the cache, so clearing the cache never eats your feed list.
 `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME` are honoured where set,
 `%APPDATA%`/`%LOCALAPPDATA%` on Windows.
+
+## NOAA radio
+
+`lowpingnews radio` (or `noaa`) is a weather radio in text: active watches and
+warnings for your spot first, most severe first, then the National Weather
+Service forecast read period by period, the way the broadcast reads it. It
+uses the same location as `weather` (`-c`, `-p`, `--label`). United States only.
+
+- It always says which spot it checked: your name for it, the exact
+  coordinates, and how they were set (pinned, place name, device, or network
+  address), with the Weather Service's nearest town beside the office and zone
+  for comparison. A spot from a network address, or an old device fix that
+  could not be refreshed, gets a warning and the command to pin your location.
+- Severe and extreme warnings print in full, including "What to do"; lesser
+  ones are shortened (`radio --full` shows everything).
+- Alerts are re-checked after five minutes, the forecast after thirty; a
+  repeat inside that window costs nothing. A typical check is a few KB.
+- If weather.gov cannot be reached it says **ALERTS UNKNOWN** — never "no
+  alerts". A cached copy is shown with its age, warnings that have since
+  ended are hidden and counted, and tests and drills are never shown.
+- `--marine ANZ335` adds the coastal marine forecast for a zone (find yours at
+  weather.gov/marine); it is remembered until `--marine off`.
+- Exit status: 0 checked, 1 no NOAA coverage here, 2 alerts could not be checked.
+- `weather` shows a one-line banner when the radio found warnings within the
+  last hour, at no extra cost.
+
+## Weather in words
+
+Conditions are written out — Partly Cloudy, Icy Drizzle, Thunder & Hail — never
+two-letter codes, with a small icon beside them: ☀ sun, ☁ cloud, ☂ rain,
+❄ snow, ☈ thunderstorm, ≋ fog, paired (☀☁ partly cloudy, ☀☂ showers, ☂☂ heavy
+rain). They are built only from glyphs every terminal draws one cell wide;
+weather emoji like 🌤 are drawn two cells wide while claiming one, which pushes
+every column after them out of line. With `LANG=C` or `--ascii` the words
+appear alone. Wind, humidity, sunrise and the rain outlook are full sentences
+("Rain 80% around 11:00, 0.50 in total"), and the 7-day table labels its
+columns. Names are never shortened to fit: below about 40 columns the
+temperature bar gives way to a plain range, and on very narrow screens each day
+takes two lines.
+
+## `news` and `weather` as commands
+
+`lpn install` (which `lpn release` also runs) puts `news` in your `PATH` and
+adds a small `weather` launcher that runs the LowPingNews forecast, passing
+flags through: `weather -f`, `weather -p Huntington`, `weather -c 40.9,-73.4`.
+
+It will not take over a `weather` that is not its own — an older script of
+yours is left in place, with a note on how to move it aside. The launcher is
+recognised by a marker line, so later installs keep it current.
+
+Installing also reports anything that would silently win over these commands:
+a script earlier in your `PATH`, or an alias or function in `~/.bashrc`,
+`~/.profile`, `~/.bash_profile` or `~/.zshrc`. It only reports — your files are
+never edited. After moving or deleting what it names, run `hash -r` (or open a
+new session) so the shell forgets where it last found the old command.
+
+## Speed
+
+A run with every feed cached takes about a third of the time it used to
+(208 ms to 82 ms on the build machine): the program waited a fixed 0.12 s per
+batch of feeds even when they came from cache in a millisecond.
 
 ## Updating
 
@@ -646,7 +721,8 @@ python3 test.py weather    # just the weather tests
 lpn test                   # same, via the dev tool
 ```
 
-No network, and the program itself is not mocked: each test starts a local HTTP
+No network — verified by logging every name lookup across a full run, which
+found none — and the program itself is not mocked: each test starts a local HTTP
 server and runs the real binary against it, with config, cache and state
 redirected to a scratch directory. The suite covers failures that actually
 shipped — a truncated transfer cached as complete, a future-dated item pinning

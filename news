@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "6.8"
+VERSION = "7.3"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -21,16 +21,37 @@ DATA = _base("XDG_DATA_HOME", "LOCALAPPDATA", "~/.local/share/news")
 
 ADIR = DATA + "/art"
 NET = DATA + "/net.json"
-WMO = {0: ("Clear", "CL"), 1: ("Mostly clear", "MC"), 2: ("Partly cloudy", "PC"),
-       3: ("Overcast", "OV"), 45: ("Fog", "FG"), 48: ("Rime fog", "FG"),
-       51: ("Light drizzle", "dz"), 53: ("Drizzle", "dz"), 55: ("Drizzle", "DZ"),
-       56: ("Frz drizzle", "FZ"), 57: ("Frz drizzle", "FZ"), 61: ("Light rain", "rn"),
-       63: ("Rain", "RN"), 65: ("Heavy rain", "RN"), 66: ("Frz rain", "FZ"),
-       67: ("Frz rain", "FZ"), 71: ("Light snow", "sn"), 73: ("Snow", "SN"),
-       75: ("Heavy snow", "SN"), 77: ("Snow grains", "sn"), 80: ("Showers", "sh"),
-       81: ("Showers", "sh"), 82: ("Hvy showers", "SH"), 85: ("Snow showers", "SS"),
-       86: ("Snow showers", "SS"), 95: ("Thunderstorm", "TS"),
-       96: ("Thunderstorm", "TS"), 99: ("Thunderstorm", "TS")}
+# name, icon. Icons use only glyphs Unicode classes as one cell and fonts draw
+# as text (sun, cloud, umbrella, snowflake, thunderstorm, fog), paired so every
+# icon is exactly two cells. Weather emoji look nicer but several (🌤 🌧) are
+# classed narrow while drawn wide, which shifts every column after them.
+_S, _C, _R, _N, _T, _F = "\u2600", "\u2601", "\u2602", "\u2744", "\u2608", "\u224b"
+WMO = {0: ("Clear", _S + " "), 1: ("Mostly Clear", _S + " "),
+       2: ("Partly Cloudy", _S + _C), 3: ("Overcast", _C + _C),
+       45: ("Fog", _F + _F), 48: ("Freezing Fog", _F + _N),
+       51: ("Light Drizzle", _R + " "), 53: ("Drizzle", _R + " "),
+       55: ("Heavy Drizzle", _R + _R), 56: ("Icy Drizzle", _R + _N),
+       57: ("Icy Drizzle", _R + _N), 61: ("Light Rain", _R + " "),
+       63: ("Rain", _R + " "), 65: ("Heavy Rain", _R + _R),
+       66: ("Freezing Rain", _R + _N), 67: ("Freezing Rain", _R + _N),
+       71: ("Light Snow", _N + " "), 73: ("Snow", _N + " "), 75: ("Heavy Snow", _N + _N),
+       77: ("Snow Grains", _N + " "), 80: ("Light Showers", _S + _R),
+       81: ("Showers", _S + _R), 82: ("Heavy Showers", _R + _R),
+       85: ("Snow Showers", _S + _N), 86: ("Heavy Snowfall", _N + _N),
+       95: ("Thunderstorm", _T + " "), 96: ("Thunder & Hail", _T + _N),
+       99: ("Thunder & Hail", _T + _N)}
+MOON = "\u263e "
+WXNAMEMAX = max(len(v[0]) for v in WMO.values())    # 14: every name fits whole
+
+
+def wx_label(code, ascii_, night=False):
+    """-> (icon, words). The icon is two cells, or "" where Unicode cannot show."""
+    name, icon = WMO.get(int(code or 0), ("Unknown", "? "))
+    if night and int(code or 0) in (0, 1):
+        icon = MOON
+    return ("" if ascii_ else icon), name
+
+
 SEV = {0: 0, 1: 1, 2: 2, 3: 3, 45: 4, 48: 4,
        51: 5, 53: 6, 55: 7, 56: 8, 57: 8,          # drizzle / freezing drizzle
        61: 6, 63: 8, 65: 10, 66: 11, 67: 11,       # rain / freezing rain
@@ -61,6 +82,7 @@ WINRESERVED = set(["CON", "PRN", "AUX", "NUL"] +
                   ["LPT%d" % n for n in range(1, 10)])
 STARCAP = 500
 STORECAP = 40                  # items kept per feed; DW ships 136, you read 5
+TUILIST = 60                   # rows in the interactive list unless a count is given
 DLBUDGET = 4 * 1024 * 1024     # ceiling for one -d run; raise with --budget
 ST = DATA + "/state.json"
 CD = _base("XDG_CACHE_HOME", "LOCALAPPDATA", "~/.cache/news")
@@ -70,6 +92,7 @@ WXC = CD + "/weather.json"
 WXTTL = 1800
 LOCTTL = 1800                  # refresh a followed location after this
 CFG = CFD + "/sources.json"
+RADIOCF = CFD + "/radio.json"
 LAST = CD + "/last.json"
 TTL = 900                      # a feed younger than this is reused, no request
 DEADLINE = 20                  # hard ceiling on the whole fetch round
@@ -1406,6 +1429,308 @@ def wx_locate(a):
              "  lowpingnews weather -c 40.900,-73.412 --label 'Fleets Cove'")
 
 
+# ---------------------------------------------------------------- NOAA radio
+# The National Weather Service API: what a NOAA weather radio broadcasts -
+# watches, warnings and the spoken-style forecast - as small gzipped JSON.
+# United States only. It asks callers to identify themselves.
+NWS = "https://api.weather.gov"
+NWS_HDR = {"Accept": "application/geo+json"}
+NWSC = os.path.join(CD, "nws.json")
+NWS_ALERT_TTL = 300            # warnings are the point: re-ask after five minutes
+NWS_FC_TTL = 1800
+NWS_POINT_TTL = 30 * 86400     # which office and grid cover a spot rarely changes
+SEV_RANK = {"Extreme": 0, "Severe": 1, "Moderate": 2, "Minor": 3}
+URG_RANK = {"Immediate": 0, "Expected": 1, "Future": 2, "Past": 4}
+MARINE_ZONE = re.compile(r"^[A-Z]{2}Z\d{3}$")
+
+
+def nws_ua():
+    return {"User-Agent": "LowPingNews/%s (github.com/ATinyGreenCell/LowPingNews)" % VERSION}
+
+
+def nws_get(url, cap):
+    h = dict(NWS_HDR)
+    h.update(nws_ua())
+    raw, _hd, wire, _p = get(url, 15, extra=h, cap=cap)
+    return json.loads(raw), wire
+
+
+def nws_alerts_live(alerts, now=None):
+    """Drop what has run out, and anything not a real alert (tests, drills).
+    A cached copy can outlive the warnings in it; never show those as current."""
+    now = time.time() if now is None else now
+    keep, gone = [], 0
+    for p in alerts:
+        if not isinstance(p, dict) or p.get("status", "Actual") != "Actual":
+            continue
+        if p.get("messageType") == "Cancel":
+            continue
+        end = when(p.get("ends") or p.get("expires") or "")
+        if end and end < now:
+            gone += 1
+            continue
+        keep.append(p)
+    keep.sort(key=lambda p: (SEV_RANK.get(p.get("severity"), 5),
+                             URG_RANK.get(p.get("urgency"), 3), -(when(p.get("onset") or "") or 0)))
+    return keep, gone
+
+
+def nws_fetch(loc, fresh, marine=None):
+    """-> dict with point, alerts, periods, marine text, and how fresh each is.
+    Each part fails on its own: a dead forecast must never hide a warning."""
+    c = jread(NWSC, {})
+    key_ = "%.4f,%.4f" % (loc["lat"], loc["lon"])
+    if c.get("key") != key_:
+        c = {"key": key_}
+    now = time.time()
+    out = {"wire": 0, "err": {}}
+
+    def stale(part, ttl):
+        t_ = (c.get(part) or {}).get("t")
+        return fresh or not t_ or age_of(t_) >= ttl
+
+    if stale("point", NWS_POINT_TTL) and not OFFLINE[0]:
+        try:
+            d, w = nws_get("%s/points/%s" % (NWS, key_), 64 * 1024)
+            out["wire"] += w
+            pr = d.get("properties") or {}
+            fc = str(pr.get("forecast") or "")
+            if not fc.startswith(NWS + "/"):     # only ever follow links to NWS itself
+                raise ValueError("no forecast office for this spot")
+            rel = ((pr.get("relativeLocation") or {}).get("properties") or {})
+            c["point"] = {"t": int(now), "fc": fc, "office": str(pr.get("gridId") or "")[:8],
+                          "place": ("%s %s" % (rel.get("city") or "", rel.get("state") or "")).strip()[:60],
+                          "zone": str(pr.get("forecastZone") or "").rsplit("/", 1)[-1][:8]}
+        except Exception as e:
+            out["err"]["point"] = nws_why(e)
+    if stale("alerts", NWS_ALERT_TTL) and not OFFLINE[0]:
+        try:
+            d, w = nws_get("%s/alerts/active?point=%s" % (NWS, key_), 1024 * 1024)
+            out["wire"] += w
+            feats = d.get("features")
+            if not isinstance(feats, list):
+                raise ValueError("unreadable alert list")
+            keep = []
+            for f in feats[:60]:
+                p = (f or {}).get("properties") if isinstance(f, dict) else None
+                if isinstance(p, dict):
+                    keep.append({k: (clean_alert(p.get(k), 4000, keep_lines=True)
+                                     if k in ("description", "instruction") else clean_alert(p.get(k), 300))
+                                 for k in ("event", "headline", "severity", "urgency", "certainty",
+                                           "onset", "effective", "expires", "ends", "status",
+                                           "messageType", "senderName", "areaDesc",
+                                           "description", "instruction")})
+            c["alerts"] = {"t": int(now), "list": keep}
+        except Exception as e:
+            out["err"]["alerts"] = nws_why(e)
+    pt = c.get("point") or {}
+    if pt.get("fc") and stale("fc", NWS_FC_TTL) and not OFFLINE[0]:
+        try:
+            d, w = nws_get(pt["fc"], 256 * 1024)
+            out["wire"] += w
+            per = ((d.get("properties") or {}).get("periods"))
+            if not isinstance(per, list) or not per:
+                raise ValueError("no forecast periods")
+            c["fc"] = {"t": int(now), "periods": [
+                {"name": clean_alert(p.get("name"), 30), "temp": p.get("temperature"),
+                 "unit": clean_alert(p.get("temperatureUnit"), 2),
+                 "short": clean_alert(p.get("shortForecast"), 80),
+                 "text": clean_alert(p.get("detailedForecast"), 600),
+                 "day": bool(p.get("isDaytime", True))}
+                for p in per[:14] if isinstance(p, dict)]}
+        except Exception as e:
+            out["err"]["fc"] = nws_why(e)
+    if not marine or (c.get("marine") or {}).get("zone") != marine:
+        c.pop("marine", None)                  # switched off or changed: drop the old text
+    if marine and stale("marine", NWS_FC_TTL) and not OFFLINE[0]:
+        try:
+            raw, _hd, w, _p = get("https://tgftp.nws.noaa.gov/data/forecasts/marine/coastal/%s/%s.txt"
+                                  % (marine[:2].lower(), marine.lower()), 15, extra=nws_ua(), cap=64 * 1024)
+            out["wire"] += w
+            c["marine"] = {"t": int(now), "zone": marine,
+                           "text": clean_alert(raw.decode("utf-8", "replace"), 6000, keep_lines=True)}
+        except Exception as e:
+            out["err"]["marine"] = nws_why(e)
+    jwrite(NWSC, c)
+    if out["wire"]:
+        net_log([(True, 0, out["wire"])])
+    out.update(c)
+    return out
+
+
+def nws_why(e):
+    code = getattr(e, "code", None)
+    if code == 404:
+        return "not covered (NOAA serves the United States only)"
+    if code in (403, 429):
+        return "refused by weather.gov (%d)" % code
+    if code:
+        return "weather.gov error %d" % code
+    return str(e)[:60] or e.__class__.__name__
+
+
+def clean_alert(v, n, keep_lines=False):
+    """Text from an outside service: strip control characters, bound the size."""
+    if v is None:
+        return ""
+    v = str(v)
+    if keep_lines:
+        v = "\n".join(CTRL.sub("", ln).rstrip() for ln in v.replace("\r", "").split("\n"))
+    else:
+        v = " ".join(CTRL.sub(" ", v).split())
+    return v[:n]
+
+
+def radio_banner(loc):
+    """For `weather`: warnings the radio found here recently, from its cache.
+    Costs nothing; silent when the check is over an hour old, so a stale copy
+    can never pass for current."""
+    c = jread(NWSC, {})
+    if c.get("key") != "%.4f,%.4f" % (loc["lat"], loc["lon"]):
+        return []
+    al = c.get("alerts") or {}
+    if not al.get("t") or age_of(al["t"]) >= 3600:
+        return []
+    live, _gone = nws_alerts_live(al.get("list") or [])
+    return live
+
+
+def radio_show(a, P, loc, r):
+    import textwrap
+    B, D = P["b"], P["d"]
+    cols = cols_()
+    wrap = lambda t, ind="    ": textwrap.wrap(t, max(20, cols - len(ind) - 1)) or [""]
+
+    pt = r.get("point") or {}
+    def say(txt, fn=None, ind="  "):
+        """Every message wraps: error text from outside can be any length."""
+        for ln in textwrap.wrap(txt, max(16, cols - len(ind) - 1)) or [""]:
+            print((fn or D)(ind + ln))
+
+    def paras(t):
+        """NWS text is hard-wrapped at ~70 columns with blank lines between
+        paragraphs: rejoin each paragraph, then wrap it to this screen."""
+        out_ = []
+        for para in re.split(r"\n\s*\n", t.strip()):
+            para = " ".join(para.split())
+            if para:
+                if out_:
+                    out_.append("")
+                out_.extend(wrap(para))
+        return out_
+
+    # Which spot was checked comes first and is never left implicit: a radio
+    # that reads the right warnings for the wrong county looks authoritative.
+    where = loc.get("label") or pt.get("place") or "%.4f,%.4f" % (loc["lat"], loc["lon"])
+    print(P["hdr"]("NOAA RADIO") + "  " + B(where[:max(10, cols - 14)]))
+    via = loc.get("via") or "device"
+    how = {"pinned": "pinned", "place": "set by place name",
+           "ip": "approximate, from your network address"}.get(via, "device fix")
+    say("For %.4f,%.4f (%s)" % (loc["lat"], loc["lon"], how))
+    if pt.get("office"):
+        say("Weather Service office %s%s%s" % (
+            pt["office"], (", zone " + pt["zone"]) if pt.get("zone") else "",
+            (", near " + pt["place"]) if pt.get("place") and pt.get("place") != where else ""))
+    if via == "ip":
+        say("A network address can place you many miles off, so these alerts may be "
+            "for the wrong county. Pin your spot:", P["yel"])
+        say("lowpingnews radio -c LAT,LON --label NAME", P["b"], "    ")
+    elif via not in ("pinned", "place") and age_secs(loc.get("t")) > LOCTTL:
+        say("Location fixed %s and could not be refreshed. If you have moved, pin "
+            "where you are:" % ago(age_secs(loc.get("t"))), P["yel"])
+        say("lowpingnews radio -c LAT,LON --label NAME", P["b"], "    ")
+    errs = r.get("err") or {}
+    if "point" in errs and not pt:
+        print()
+        say("No NOAA coverage here: " + errs["point"], P["red"])
+        return 1
+    # ---- alerts: first, always, and honest about how old they are
+    al = r.get("alerts")
+    rc_ = 0
+    print()
+    if al is None:
+        rc_ = 2                                 # could not check: never mistaken for "all clear"
+        print("  " + P["red"](B("ALERTS UNKNOWN")))
+        say("Could not reach weather.gov (%s). This is not an all-clear." % errs.get("alerts", "offline"))
+    else:
+        live, gone = nws_alerts_live(al.get("list") or [])
+        age_ = age_secs(al.get("t"))
+        old = age_ >= NWS_ALERT_TTL * 2 or "alerts" in errs
+        if not live:
+            print("  " + P["grn"](B("No active alerts")))
+        else:
+            n = len(live)
+            print("  " + P["red"](B("%s %d ACTIVE ALERT%s" % ("!!" if a.ascii else "\u26a0",
+                                                              n, "" if n == 1 else "S"))))
+        if old:
+            say("Alerts checked %s%s - may be out of date" % (
+                ago(age_) if age_ >= 0 else "at an unknown time",
+                " (%s)" % errs["alerts"] if "alerts" in errs else ""), P["yel"])
+        if gone:
+            say("%d expired alert%s hidden" % (gone, "" if gone == 1 else "s"))
+        for p in live:
+            sev = p.get("severity") or "Unknown"
+            col = P["red"] if sev in ("Extreme", "Severe") else P["yel"] if sev == "Moderate" else D
+            end = when(p.get("ends") or p.get("expires") or "")
+            until = (" until %s" % time.strftime("%a %H:%M", time.localtime(end))) if end else ""
+            ev = (p.get("event") or "Alert").upper()
+            if 2 + len(ev) + len(until) <= cols:
+                print("\n  " + col(B(ev)) + D(until))
+            else:                               # narrow: the time on its own line
+                print("\n  " + col(B(ev[:cols - 2])))
+                if until:
+                    print(D("   " + until))
+            sep = ", " if a.ascii else " \u00b7 "
+            facts = sep.join(x for x in (sev.lower(), (p.get("urgency") or "").lower(),
+                                         (p.get("certainty") or "").lower()) if x)
+            for ln in wrap(facts):
+                print(D("    " + ln))
+            for ln in wrap(p.get("headline") or ""):
+                print("    " + ln)
+            body = p.get("description") or ""
+            todo = p.get("instruction") or ""
+            full = getattr(a, "full", False) or sev in ("Extreme", "Severe")
+            if body:
+                lines = paras(body)
+                show_ = lines if full else lines[:4]
+                for ln in show_:
+                    print(D("    " + ln) if ln else "")
+                if len(show_) < len(lines):
+                    say("... %d more lines: radio --full" % (len(lines) - len(show_)), ind="    ")
+            if todo:
+                print("    " + B("What to do:"))
+                for ln in (paras(todo) if full else paras(todo)[:3]):
+                    print(("    " + ln) if ln else "")
+    # ---- forecast: the spoken periods, the way the radio reads them
+    fc = r.get("fc")
+    print("\n" + D("  FORECAST"))
+    if not fc:
+        say("unavailable (%s)" % errs.get("fc", errs.get("point", "offline")), ind="    ")
+    else:
+        if "fc" in errs or age_secs(fc.get("t")) >= NWS_FC_TTL * 3:
+            say("Forecast from %s" % ago(age_secs(fc.get("t"))), P["yel"])
+        for p in fc.get("periods") or []:
+            t_ = p.get("temp")
+            head = "%s  %s" % ((p.get("name") or "").upper(),
+                               ("%s\u00b0%s" % (t_, p.get("unit") or "")) if isinstance(t_, (int, float)) else "")
+            print("  " + B(head.strip()))
+            for ln in wrap(p.get("text") or p.get("short") or ""):
+                print("    " + ln)
+    mar = r.get("marine")
+    if mar:
+        print()
+        say("MARINE  zone %s, %s" % (mar.get("zone"), ago(age_secs(mar.get("t")))))
+        for raw_ln in (mar.get("text") or "").split("\n"):
+            for ln in (textwrap.wrap(raw_ln, max(20, cols - 5)) or [""]):
+                print("    " + ln)
+    elif "marine" in errs:
+        print()
+        say("MARINE  unavailable (%s)" % errs["marine"])
+    spent_ = ("~%s" % kbs(r["wire"])) if r.get("wire") else "0B, cached"
+    print(D("\n  " + spent_))
+    return rc_
+
+
 def wx_fetch(loc, unit, fresh):
     """One gzipped Open-Meteo call, cached like any feed."""
     c = jread(WXC, {})
@@ -1467,12 +1792,21 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     L = lambda t: dt.datetime.fromtimestamp(t + off, dt.timezone.utc)
     U = "\u00b0F" if a.unit == "fahrenheit" else "\u00b0C"
     t0 = L(cu["time"])
-    name, mark = WMO.get(int(cu.get("weather_code") or 0), ("Unknown", "??"))
-    if not cu.get("is_day", 1) and mark in ("CL", "MC"):
-        mark = "cl"
-    print(P["hdr"](loc.get("label") or "%.3f,%.3f" % (loc["lat"], loc["lon"])) +
-          D("  %s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"),
-                               t0.strftime("%H:%M"))))
+    icon, name = wx_label(cu.get("weather_code"), a.ascii, night=not cu.get("is_day", 1))
+    place = loc.get("label") or "%.3f,%.3f" % (loc["lat"], loc["lon"])
+    when_ = "%s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"), t0.strftime("%H:%M"))
+    if len(place) + 2 + len(when_) <= cols:
+        print(P["hdr"](place) + D("  " + when_))
+    else:                                       # a narrow screen: one line each
+        print(P["hdr"](place[:cols]))
+        print(D("  " + when_))
+    for p_ in radio_banner(loc)[:3]:
+        end_ = when(p_.get("ends") or p_.get("expires") or "")
+        print("  " + P["red"](P["b"]("%s %s" % ("!!" if a.ascii else "\u26a0", (p_.get("event") or "Alert")[:cols - 6])))
+              + (P["d"](" until %s" % time.strftime("%a %H:%M", time.localtime(end_)))
+                 if end_ and len(p_.get("event") or "") + 20 <= cols else ""))
+    if radio_banner(loc):
+        print(P["d"]("  details: lowpingnews radio"))
     via = loc.get("via")
     if via and via not in ("pinned", "place"):
         t_fix = loc.get("t") or 0
@@ -1489,16 +1823,21 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
                                     "matched" if via == "place" else "pinned")))
     temp = round(cu["temperature_2m"])
     tc = (P["cyn"] if temp <= 32 else P["grn"] if temp <= 80 else P["yel"])
-    print("  " + B(tc("%d%s" % (temp, U))) +
-          D(" feels %d\u00b0" % round(cu["apparent_temperature"])) +
-          "  %s %s" % (mark, name))
+    print("  " + B(tc("%d%s" % (temp, U))) + "  " + (icon + " " if icon else "") + B(name))
+    feels = "Feels like %d\u00b0" % round(cu["apparent_temperature"])
+    humid = "Humidity %d%%" % round(cu.get("relative_humidity_2m") or 0)
+    if 2 + len(feels) + 3 + len(humid) <= cols:
+        print(D("  %s %s %s" % (feels, bul_(a), humid)))
+    else:
+        print(D("  " + feels))
+        print(D("  " + humid))
     wd = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][
         int((cu.get("wind_direction_10m", 0) + 22.5) % 360 // 45)]
     gust = cu.get("wind_gusts_10m")
     spd = round(cu.get("wind_speed_10m") or 0)
     gtxt = ""
     if gust and round(gust) > spd + 3:      # only worth saying when it is gusty
-        gtxt = P["yel"](" g%d" % round(gust))
+        gtxt = P["yel"](", gusts %d" % round(gust))
     # the next event chronologically, not sunrise-first: at 15:00 the useful
     # number is tonight's sunset, not tomorrow's sunrise
     cand = [(ts, lbl) for lbl, key_ in (("rises", "sunrise"), ("sets", "sunset"))
@@ -1507,24 +1846,20 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     if cand:
         ts, lbl = min(cand)
         mins = int((ts - cu["time"]) / 60)
-        sun_short = D("   %s %s" % (lbl, L(ts).strftime("%H:%M")))
+        word = "Sunrise" if lbl == "rises" else "Sunset"
+        sun_short = D("  %s %s" % (word, L(ts).strftime("%H:%M")))
         if mins < 180:                      # imminent: say how long is left
-            sun = P["yel"]("   %s %s in %dh%02dm" % (
-                lbl, L(ts).strftime("%H:%M"), mins // 60, mins % 60))
+            sun = P["yel"]("  %s %s, in %dh %02dm" % (
+                word, L(ts).strftime("%H:%M"), mins // 60, mins % 60))
         else:
             sun = sun_short
-    base = "  %s %d%s%s   RH %d%%" % (
-        wd, spd, "mph" if a.unit == "fahrenheit" else "km/h",
-        (" g%d" % round(gust)) if gtxt else "",
-        round(cu.get("relative_humidity_2m") or 0))
-    # the countdown form is the long one; drop it, then the whole clause,
-    # rather than overflowing a narrow screen
-    for cand in (sun, sun_short, ""):
-        if len(base) + len(_plain(cand)) <= cols:
-            sun = cand
+    unit_w = " mph" if a.unit == "fahrenheit" else " km/h"
+    print(D("  Wind %s %d%s" % (wd, spd, unit_w) if spd else "  Wind calm") + gtxt)
+    for cand in (sun, sun_short):           # the countdown is the long form
+        if len(_plain(cand)) <= cols:
+            if cand:
+                print(cand)
             break
-    print(D("  %s %d%s" % (wd, spd, "mph" if a.unit == "fahrenheit" else "km/h"))
-          + gtxt + D("   RH %d%%" % round(cu.get("relative_humidity_2m") or 0)) + sun)
     n = min(24, len(h["time"]), max(1, cols - 4))
     tp = h["temperature_2m"][:n]
     pr = [x or 0 for x in h["precipitation_probability"][:n]]
@@ -1535,16 +1870,13 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     k = max(range(n), key=lambda i: pr[i])
     tot = sum(amt)
     unit_p = "in" if a.unit == "fahrenheit" else "mm"
+    # probability alone does not support a decision; the amount does
     if pr[k] >= 10:
-        # probability alone does not support a decision; amount does - but the
-        # bar is already n wide, so only add it when the line actually fits
-        note = "  %d%% @%sh" % (pr[k], L(h["time"][k]).strftime("%H"))
-        extra = (", %.2f%s" % (tot, unit_p)) if tot >= 0.005 else ", trace"
-        if 2 + n + len(note) + len(extra) <= cols:
-            note += extra
+        note = "Rain %d%% around %s" % (pr[k], L(h["time"][k]).strftime("%H:00"))
+        note += (", %.2f %s total" % (tot, unit_p)) if tot >= 0.005 else ", a trace"
     else:
-        note = "  dry"
-    print("  " + P["cyn"](rainbar(pr, a.ascii)) + D(note))
+        note = "No rain expected"
+    print("  " + P["cyn"](rainbar(pr, a.ascii)))
     ax = [" "] * n
     for i in range(0, n, 6):               # a sparkline you cannot time-index is
         lab = L(h["time"][i]).strftime("%H")    # a picture, not a forecast
@@ -1552,11 +1884,34 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
             if i + j < n:
                 ax[i + j] = ch
     print("  " + D("".join(ax).rstrip()))
-    print("\n" + D("  7 DAY"))
+    import textwrap
+    for ln_ in textwrap.wrap(note, max(20, cols - 3)):      # a sentence, not a row
+        print("  " + (P["cyn"] if pr[k] >= 10 else D)(ln_))
     lo_a = min(dy["temperature_2m_min"])
     hi_a = max(dy["temperature_2m_max"])
-    sp, W = (hi_a - lo_a) or 1.0, max(6, min(12, cols - 26))
+    labels = [wx_label(c, a.ascii) for c in dy["weather_code"]]
+    iw = 0 if a.ascii else 3                        # icon (two cells) and a space
+    labw = max(len(w) for _i, w in labels)          # never more than WXNAMEMAX
+    # day icon label | lo bar hi | rain. Names are never cut: on a narrow
+    # screen the bar goes and the temperatures become a plain range instead.
+    base_w = 2 + 3 + 1 + iw + labw + 2
+    # a row is: left(base_w) + "lo° " + bar(W) + " hi°" + " " + "rain%"(5) + "*"
+    # i.e. base_w + W + 17 cells; without the bar: base_w + range(8) + 7
+    W = max(0, min(12, cols - base_w - 17))
+    use_bar = W >= 5
     fl, gp = ("#", ".") if a.ascii else ("\u2588", "\u00b7")
+    if use_bar:
+        head = "  7 DAY".ljust(base_w) + "low " + " " * (W + 1) + "high" + " " + "rain".rjust(5)
+    elif base_w + 15 <= cols:
+        head = "  7 DAY".ljust(base_w) + "low\u2013high" + " " + "rain".rjust(5)
+    else:
+        # too narrow for a name and the numbers on one line: two lines a day,
+        # rather than cutting words back into abbreviations
+        base_w = 6
+        head = "  7 DAY\n" + " " * base_w + "low\u2013high" + " " + "rain".rjust(5)
+    two_line = not use_bar and base_w == 6
+    print("\n" + D(head))
+    sp = (hi_a - lo_a) or 1.0
     # today's daily max spans midnight-to-midnight, so at 19:00 it reports rain
     # that already fell. Use only the hours still ahead of us.
     rest = None
@@ -1567,29 +1922,39 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     rest_code = None
     if ahead:
         rest = max(p for p, _ in ahead)
-        # the daily code summarises the whole day too: take the worst hour left
-        rest_code = worst(c for _, c in ahead)
+        rest_code = worst(c for _, c in ahead)      # the worst hour still to come
     for i, ts in enumerate(dy["time"]):
         lo, hi = dy["temperature_2m_min"][i], dy["temperature_2m_max"][i]
-        b0 = int((lo - lo_a) / sp * W)
-        b1 = max(b0 + 1, int(round((hi - lo_a) / sp * W)))
         pp = dy["precipitation_probability_max"][i] or 0
         amt_d = (dy.get("precipitation_sum") or [0] * 7)[i] or 0
         code = int(dy["weather_code"][i] or 0)
         mark_ = ""
         if i == 0 and rest is not None and (rest != pp or rest_code != code):
-            pp, mark_ = rest, "*"          # remaining hours, not the whole day
+            pp, mark_ = rest, "*"                   # remaining hours, not the whole day
             if rest_code is not None:
                 code = rest_code
-        _, g = WMO.get(code, ("", "??"))
-        # probability without amount is not decidable; show both when it matters
-        wet = "%3d%%" % pp
-        if pp >= 10 and amt_d >= 0.005 and cols >= 44:
-            wet += " %.2f" % amt_d
-        print("  %s %s %3d\u00b0 %s %3d\u00b0 %s%s" % (
-            L(ts).strftime("%a"), g, round(lo),
-            P["yel"]((gp * b0 + fl * (b1 - b0)).ljust(W, gp)), round(hi),
-            (P["cyn"] if pp >= 10 else D)(wet), D(mark_)))
+        icon_, word_ = wx_label(code, a.ascii)
+        if two_line:
+            left = "  %s " % L(ts).strftime("%a")
+        else:
+            left = "  %s %s%s  " % (L(ts).strftime("%a"), (icon_ + " ") if icon_ else "",
+                                    word_.ljust(labw))
+        if use_bar:
+            b0 = int((lo - lo_a) / sp * W)
+            b1 = max(b0 + 1, int(round((hi - lo_a) / sp * W)))
+            mid = "%3d\u00b0 %s %3d\u00b0" % (round(lo), P["yel"]((gp * b0 + fl * (b1 - b0)).ljust(W, gp)),
+                                          round(hi))
+        else:
+            mid = "%-8s" % ("%d\u2013%d\u00b0" % (round(lo), round(hi)))
+        wet = "%4d%%" % pp
+        row_w = len(_plain(left + mid)) + 1 + len(wet) + 1      # +1: room for "*"
+        if pp >= 10 and amt_d >= 0.005:             # the amount, only if it fits
+            more = " %.2f" % amt_d
+            if row_w + len(more) <= cols:
+                wet += more
+        print(left + mid + " " + (P["cyn"] if pp >= 10 else D)(wet) + D(mark_))
+        if two_line:
+            print("      " + (icon_ + " " if icon_ else "") + D(word_))
     if rest is not None and (rest != (dy["precipitation_probability_max"][0] or 0)
                              or rest_code != int(dy["weather_code"][0] or 0)):
         print(D("  * today = hours remaining"))
@@ -1683,7 +2048,11 @@ def gather(srcs, fresh, on_feed=None):
                 sys.stderr.write("\r" + progress_line(
                     srcs, cols, want_total, t_started).ljust(cols - 1))
                 sys.stderr.flush()
-            time.sleep(0.12)
+            # wait on a worker, not the clock: from cache they finish in a
+            # millisecond, and a fixed sleep here cost 120ms on every warm run
+            alive = [t for t in ths if t.is_alive()]
+            if alive:
+                alive[0].join(0.12)
         for t in ths:                      # join() is the real ceiling: socket
             t.join(max(0.05, end - time.time()))   # timeouts do not bound getaddrinfo
         if on_feed:
@@ -1919,7 +2288,7 @@ PROBECAP = 16 * 1024                   # a probe reads at most this much
 KINDS = ("rss", "hn", "epmc")
 CATMAX = 20
 # words the command line already gives meaning to can never be categories
-RESERVED_CATS = {"all", "weather", "signal", "saved", "catalog", "feeds", "help",
+RESERVED_CATS = {"radio", "noaa", "all", "weather", "signal", "saved", "catalog", "feeds", "help",
                  "update", "list", "add", "remove", "check", "upgrade"}
 
 
@@ -1927,6 +2296,8 @@ def norm_cat(c):
     """A category is a short lowercase word: 'My Stuff!' -> 'my-stuff'."""
     c = str(c or "").strip().lower().replace(" ", "-")
     c = re.sub(r"[^\w-]", "", c)[:CATMAX].strip("-_")   # letters in any script
+    if c.isdigit():
+        return ""                          # `lowpingnews 13` means thirteen articles
     return "" if c in RESERVED_CATS else c
 
 
@@ -2778,14 +3149,14 @@ lowpingnews catalog check [subscribed|all|CAT] [--budget KB] [--write FILE]
 In the reader, press f to do all of this from a menu."""
 
 
-BOOLF = {"--plain": "plain", "--tui": "tui", "-f": "fresh", "--fresh": "fresh", "--offline": "offline",
+BOOLF = {"--full": "full", "--plain": "plain", "--tui": "tui", "-f": "fresh", "--fresh": "fresh", "--offline": "offline",
          "--stream": "stream", "-g": "gps", "--gps": "gps", "--ip": "iploc",
          "-C": "celsius", "--celsius": "celsius",
          "--light": "light", "--cost": "cost", "-t": "titles", "--titles": "titles",
          "-u": "unread", "--unread": "unread", "--ascii": "ascii",
          "--check": "check", "-l": "list", "--list": "list",
          "--mark-all": "mark_all"}
-VALF = {"-p": ("place", str), "--place": ("place", str),
+VALF = {"--marine": ("marine", str), "-p": ("place", str), "--place": ("place", str),
         "-c": ("coords", str), "--coords": ("coords", str),
         "--label": ("label", str), "-n": ("n", int), "-s": ("only", str), "--only": ("only", str),
         "-o": ("open", int), "--open": ("open", int), "-r": ("read", int),
@@ -2793,7 +3164,7 @@ VALF = {"-p": ("place", str), "--place": ("place", str),
         "-q": ("query", str), "--query": ("query", str),
         "-d": ("download", str), "--download": ("download", str),
         "--budget": ("budget", int)}
-DEFAULTS_NS = {"plain": False, "tui": False, "place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
+DEFAULTS_NS = {"full": False, "marine": None, "n_by_count": False, "count": None, "plain": False, "tui": False, "place": None, "iploc": False, "gps": False, "stream": False, "coords": None, "label": None, "celsius": False,
                "offline": False, "light": False, "cost": False,
                "cat": None, "check": False, "fresh": False, "n": 5, "only": None,
                "titles": False, "open": None, "read": None, "star": None,
@@ -2827,12 +3198,35 @@ def fastparse(argv):
             raise SystemExit(0)
         elif t.startswith("-") and t != "-":
             return None                   # --help, --update, typos
+        elif t.isdigit() and ns.get("count") is None:
+            ns["count"] = int(t)          # `top 13`: how many articles, in all
         elif ns["cat"] is None:
             ns["cat"] = t
         else:
             return None                   # two positionals: let argparse complain
         i += 1
-    return argparse_ns(ns)
+    return argparse_ns(count_ok(ns))
+
+
+COUNTMAX = 500
+
+
+def count_ok(ns):
+    """A bare number is how many articles to show, newest first across every
+    feed. It also lifts the per-feed cap, or asking for 30 from five feeds of
+    five would silently stop at 25."""
+    c = ns.get("count") if isinstance(ns, dict) else getattr(ns, "count", None)
+    if c is None:
+        return ns
+    if not 1 <= c <= COUNTMAX:
+        sys.exit("news: show between 1 and %d articles, not %d" % (COUNTMAX, c))
+    get_n = ns.get("n") if isinstance(ns, dict) else getattr(ns, "n", 5)
+    if get_n in (None, 5):                 # -n left at its default: let the count lead
+        if isinstance(ns, dict):
+            ns["n"], ns["n_by_count"] = c, True
+        else:
+            ns.n, ns.n_by_count = c, True
+    return ns
 
 
 class argparse_ns(object):
@@ -2859,6 +3253,8 @@ def main():
     import argparse
     p = argparse.ArgumentParser(prog="lowpingnews",
                                 description="ultra-light headlines and weather")
+    p.add_argument("count_", nargs="?", metavar="COUNT", default=None,
+                   help="how many articles in all, newest first (top 13)")
     p.add_argument("cat", nargs="?", metavar="CATEGORY",
                    help="top, world, science, tech, bio, all, signal, weather")
     p.add_argument("--check", action="store_true", help="test every feed URL")
@@ -2874,6 +3270,9 @@ def main():
                    help="locate by town or city name")
     p.add_argument("-c", "--coords", metavar="LAT,LON", help="pin weather location")
     p.add_argument("--label", help="name for the pinned location")
+    p.add_argument("--full", action="store_true", help="radio: whole alert text")
+    p.add_argument("--marine", metavar="ZONE",
+                   help="radio: add the marine forecast for a zone like ANZ335 (off to stop)")
     p.add_argument("-C", "--celsius", action="store_true", help="weather in celsius")
     p.add_argument("--stream", action="store_true",
                    help="print each feed as it lands instead of waiting")
@@ -2904,6 +3303,18 @@ def main():
     p.add_argument("--ascii", action="store_true")
     p.add_argument("--no-color", dest="color", action="store_false")
     a = p.parse_args()
+    # argparse fills positionals left to right; sort them by what they are
+    vals = [v for v in (a.count_, a.cat) if v is not None]
+    a.count, a.cat = None, None
+    for v in vals:
+        if v.isdigit() and a.count is None:
+            a.count = int(v)
+        elif a.cat is None:
+            a.cat = v
+        else:
+            p.error("give one category and one count at most")
+    del a.count_
+    count_ok(a)
     return run(a)
 
 
@@ -3158,7 +3569,7 @@ def _tui_rows(a, fresh):
             continue
         seen.add(k)
         rows.append((it, x))
-    return rows[:STORECAP], meta
+    return rows[:getattr(a, "count", None) or TUILIST], meta
 
 
 def tui_freshness(meta):
@@ -3351,7 +3762,7 @@ def feeds_screen(scr, put, C, a, jump=None):
         scr.refresh()
         scr.timeout(-1)
         try:
-            c = scr.getch()
+            c = getkey(scr)
         except KeyboardInterrupt:
             break
         state_["msg"] = ""
@@ -3472,6 +3883,36 @@ def feeds_screen(scr, put, C, a, jump=None):
     return state_["changed"]
 
 
+def getkey(scr):
+    """getch, plus arrow keys in either encoding. In keypad mode terminals send
+    ESC O C, which curses decodes; some multiplexers and remote shells send
+    ESC [ C regardless, which curses then hands over as a bare Esc followed by
+    junk - and Esc means "back" or "quit". Decode those here; a lone Esc stays
+    an Esc."""
+    import curses
+    c = scr.getch()
+    if c != 27:
+        return c
+    scr.timeout(30)                            # the rest of a sequence is already here
+    try:
+        n1 = scr.getch()
+        if n1 in (ord("["), ord("O")):
+            n2 = scr.getch()
+            arrows = {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN,
+                      ord("C"): curses.KEY_RIGHT, ord("D"): curses.KEY_LEFT,
+                      ord("H"): curses.KEY_HOME, ord("F"): curses.KEY_END}
+            if n2 in arrows:
+                return arrows[n2]
+            while n2 != -1 and not (64 <= n2 <= 126):   # skip the rest of any CSI
+                n2 = scr.getch()
+            return -1                          # an unknown sequence: ignore it, never quit
+        if n1 != -1:
+            curses.ungetch(n1)
+        return 27
+    finally:
+        scr.timeout(-1)
+
+
 def tui_setup(scr, a):
     """Drawing and colour for any curses screen. -> (put, C, colour)."""
     import curses
@@ -3541,7 +3982,8 @@ def tui_main(scr, a, cats, meter=None):
 
     # ---- state -----------------------------------------------------------
     S = {"rows": [], "meta": {}, "st": state(), "sel": 0, "top": 0,
-         "mode": "list", "body": [], "bscroll": 0, "reading": None}
+         "mode": "list", "body": [], "bscroll": 0, "reading": None,
+         "hoff": 0, "hmax": 0}                 # sideways scroll of the title column
     note = {"text": "", "until": 0.0}          # transient status line
     act = {"last": time.time()}                 # opening the reader counts as use
     bg = {"thread": None, "result": None, "gen": 0, "last_try": 0.0}
@@ -3657,6 +4099,7 @@ def tui_main(scr, a, cats, meter=None):
             if x0 > x_f + 1:                   # never over the title or the age
                 put(0, x0, txt, len(txt) + 1, C(colr, True))
         # widest name that still tells sources apart, capped so titles keep room
+        S["hmax"] = 0
         nw = min(14, max([len(x["name"]) for _i, x in rows] or [4]))
         nw = max(4, min(nw, w // 4))
         st = S["st"]
@@ -3675,7 +4118,18 @@ def tui_main(scr, a, cats, meter=None):
                 sec = age_secs(it.get("d")) if it.get("d") else -3
                 stamp = "?" if sec < 0 else ("now" if sec < 60 else age(sec)[:4])
                 mark = "*" if k in stars else (" " if rd else "\u2022")
-                line = "%s %-*s %-4s %s" % (mark, nw, s_["name"][:nw], stamp, it["ti"])
+                prefix = "%s %-*s %-4s " % (mark, nw, s_["name"][:nw], stamp)
+                room = max(4, w - 1 - len(prefix))
+                ti = it["ti"]
+                over = max(0, len(ti) - room)
+                S["hmax"] = max(S["hmax"], over + 1 if over else 0)
+                off = min(S["hoff"], over + 1) if over else 0
+                shown = ti[off:]
+                if off:                         # more to the left
+                    shown = "\u00ab" + shown[1:] if not a.ascii else "<" + shown[1:]
+                if len(shown) > room:           # more to the right
+                    shown = shown[:room - 1] + ("\u00bb" if not a.ascii else ">")
+                line = prefix + shown
                 at = C(0) if rd else C(7 if not colour else 0, not rd)
                 if idx == S["sel"]:
                     at = curses.A_REVERSE
@@ -3685,7 +4139,8 @@ def tui_main(scr, a, cats, meter=None):
                 if S["bscroll"] + n >= len(S["body"]):
                     break
                 put(n + 1, 0, S["body"][S["bscroll"] + n][:w - 1], w - 1)
-        keys = (" j/k  enter read  s star  o open  r refresh  n/p cat  f feeds  q quit"
+        keys = ((" \u2190\u2192 titles " if S["hmax"] and not a.ascii else
+                 " h/l titles " if S["hmax"] else "") + " j/k  enter read  s star  o open  r refresh  n/p cat  f feeds  q quit"
                 if S["mode"] == "list" else
                 " j/k scroll  b back  s star  o open  q quit")
         msg = note["text"] if time.time() < note["until"] else ""
@@ -3771,7 +4226,7 @@ def tui_main(scr, a, cats, meter=None):
         scr.timeout(int(max(0.2, wait) * 1000))
         draw()
         try:
-            c = scr.getch()
+            c = getkey(scr)
         except KeyboardInterrupt:
             break
         if c == -1:                             # timeout tick, not a key
@@ -3787,7 +4242,13 @@ def tui_main(scr, a, cats, meter=None):
             break
         if S["mode"] == "list":
             last = max(0, len(rows) - 1)       # empty list: stay at 0, never -1
-            if c in (ord("j"), curses.KEY_DOWN):
+            h_, w_ = scr.getmaxyx()
+            step = max(8, (w_ - 24) // 2)            # half a title column at a time
+            if c in (curses.KEY_RIGHT, ord("l")):
+                S["hoff"] = min(S["hoff"] + step, max(0, S["hmax"]))
+            elif c in (curses.KEY_LEFT, ord("h")):
+                S["hoff"] = max(0, S["hoff"] - step)
+            elif c in (ord("j"), curses.KEY_DOWN):
                 S["sel"] = min(last, S["sel"] + 1)
             elif c in (ord("k"), curses.KEY_UP):
                 S["sel"] = max(0, S["sel"] - 1)
@@ -3813,6 +4274,7 @@ def tui_main(scr, a, cats, meter=None):
                 # letters, not Tab: terminal emulators and phone keyboards
                 # swallow Tab before curses ever sees it
                 ci[0] = (ci[0] + (-1 if c == ord("p") else 1)) % len(cats)
+                S["hoff"] = 0
                 a.cat = cats[ci[0]]
                 load_now(False, "loading %s..." % cats[ci[0]])
             elif c == ord("f"):
@@ -3867,7 +4329,9 @@ def default_tui_ok(a):
         v = getattr(a, f, None)
         if v not in (None, False, 0, ""):
             return False
-    if getattr(a, "n", 5) not in (None, 5):     # -n shapes the list
+    # -n shapes the list; a count also raises n, but that is not a request for
+    # list output - `lowpingnews top 13` should open the reader with 13
+    if not getattr(a, "n_by_count", False) and getattr(a, "n", 5) not in (None, 5):
         return False
     return True
 
@@ -4333,6 +4797,22 @@ def run(a):
              "%s no network" % bul_(a))
         return
 
+    if (a.cat or "").lower() in ("radio", "noaa"):
+        rc = jread(RADIOCF, {})
+        mz = getattr(a, "marine", None)
+        if mz:
+            mz = mz.strip().upper()
+            if mz in ("OFF", "NONE"):
+                rc.pop("marine", None)
+            elif not MARINE_ZONE.match(mz):
+                sys.exit("news: a marine zone looks like ANZ335 (see weather.gov/marine)")
+            else:
+                rc["marine"] = mz
+            jwrite(RADIOCF, rc)
+        loc = wx_locate(a)
+        r = nws_fetch(loc, a.fresh, rc.get("marine"))
+        raise SystemExit(radio_show(a, P, loc, r))
+
     if (a.cat or "").lower() == "weather":
         loc = wx_locate(a)
         d, wire, age_s, stale = wx_fetch(loc, a.unit, a.fresh)
@@ -4429,6 +4909,8 @@ def run(a):
                 print(D("  %s unreachable" % x["name"]))
                 return
             for it in sorted(items, key=lambda z: -when_sort(z))[:a.n]:
+                if getattr(a, "count", None) and st_n[0] >= a.count:
+                    return                     # `top 13` streams thirteen
                 k_ = key(it["ti"])
                 if k_ in st_seen:
                     continue
@@ -4492,7 +4974,12 @@ def run(a):
             seen.add(k)
             rows.append((x["name"], it))
     rows.sort(key=lambda r: -when_sort(r[1]))
+    want_n = getattr(a, "count", None)
+    if want_n:
+        rows = rows[:want_n]
     foot = "%s %s" % (bul_(a), spent())
+    if want_n and len(rows) < want_n:
+        foot += " %s only %d of %d available" % (bul_(a), len(rows), want_n)
     if partial_n:
         foot += " %s %d truncated, salvaged" % (bul_(a), partial_n)
     if nm:

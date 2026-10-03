@@ -30,6 +30,8 @@ def sandbox():
     env["XDG_CACHE_HOME"] = os.path.join(d, "cache")
     env["XDG_DATA_HOME"] = os.path.join(d, "data")
     env["LPN_NO_PROGRESS"] = "1"
+    # no ping meter unless a test asks for one: it probes real anycast hosts
+    env["LPN_NO_PING"] = "1"
     # what Termux sets; the host's own TERM (here "linux") would test a
     # different terminal - no alternate screen, another mouse encoding
     env["TERM"] = "xterm-256color"
@@ -172,7 +174,10 @@ def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",), raw=Fal
     return txt.replace("\r", "").replace("\x0f", "")
 
 
-def item(title, when=None, body="Summary text.", link="http://example.invalid/a"):
+NOWHERE = "http://127.0.0.1:9"       # closed: refused instantly, never leaves the machine
+
+
+def item(title, when=None, body="Summary text.", link=NOWHERE + "/a"):
     d = "<dc:date>%s</dc:date>" % when if when else ""
     return ("<item><title>%s</title><link>%s</link>"
             "<description>%s</description>%s</item>" % (title, link, body, d))
@@ -410,7 +415,7 @@ def _wx_binary(srv, tmp):
 def t_weather_severity_is_ranked_not_maxed(env, srv):
     m = load()
     # WMO numbers are not ordered by severity: 80 (showers) < 75 (heavy snow)
-    assert m.WMO[m.worst([75, 80])][0] == "Heavy snow"
+    assert m.WMO[m.worst([75, 80])][0] == "Heavy Snow"
     assert m.WMO[m.worst([95, 82])][0] == "Thunderstorm"
     assert m.WMO[m.worst([45, 3])][0] == "Fog"
 
@@ -431,7 +436,7 @@ def t_weather_renders_and_fits_narrow_terminals(env, srv):
         out = re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode())
         assert "Traceback" not in p.stderr.decode(), p.stderr.decode()[-200:]
         assert "NEXT" in out and "7 DAY" in out, "forecast sections missing:\n%s" % out
-        assert "g18" in out, "gusts well above mean wind should be shown"
+        assert "gusts 18" in out, "gusts well above mean wind should be shown"
         over = [l for l in out.split("\n") if len(l) > 40]
         assert not over, ("lines wider than the 40-column terminal:\n" +
                           "\n".join("%3d: %s" % (len(l), l) for l in over))
@@ -1344,7 +1349,7 @@ def t_hostile_catalog_entries_are_dropped_one_by_one(env, srv):
     m = load()
     idx = m.catalog_validate({"feeds": [
         {"id": "ok", "name": "Fine", "url": "https://ok.invalid/r", "cats": ["world"]},
-        {"id": "../../etc", "name": "x", "url": "https://a.invalid/", "cats": ["x"]},
+        {"id": "../../etc", "name": "x", "url": NOWHERE + "/", "cats": ["x"]},
         {"id": "js", "name": "x", "url": "javascript:alert(1)", "cats": ["x"]},
         {"id": "file", "name": "x", "url": "file:///etc/passwd", "cats": ["x"]},
         {"id": "esc", "name": "Evil\u001b[31m\u0007", "url": "https://e.invalid/", "cats": ["x"]},
@@ -1388,7 +1393,7 @@ def t_catalog_update_is_conditional_and_keeps_the_old_on_failure(env, srv):
 
 @test
 def t_catalog_update_offline_spends_nothing(env, srv):
-    _cat(env, srv, {"feeds": [{"id": "a", "name": "A", "url": "https://a.invalid/",
+    _cat(env, srv, {"feeds": [{"id": "a", "name": "A", "url": NOWHERE + "/",
                                "cats": ["x"]}]})
     before = len(srv.seen)
     out, _ = _cl(env, "update", "--offline")
@@ -1512,7 +1517,7 @@ def t_feed_manager_ticks_and_creates_categories(env, srv):
         {"id": "gdacs", "name": "GDACS disasters", "url": srv.url("/g.xml"), "cats": ["alerts"]}]})
     _cl(env, "update")
     sources(env, [{"id": "a", "name": "Alpha", "kind": "rss", "cats": ["top"],
-                   "url": "https://a.invalid/"}])
+                   "url": NOWHERE + "/"}])
     e = dict(env); e["LPN_NO_PING"] = "1"
     keys = [b"f", b" ", b"t"] + [bytes([ch]) for ch in b"Survival Kit"] + [b"\r", b"q", b"q"]
     _drive_tui(e, keys, cols=60, settle=0.5)
@@ -1649,8 +1654,11 @@ def t_catalog_only_changes_can_be_released(env, srv):
             shutil.copy(src, d)
         g("add", "-A"); g("commit", "-qm", "base"); g("tag", "v1")
 
+        owned = re.search(r'^OWNED="[^"]*"', tool, re.M).group(0)   # as the script sets it
+
         def allowed():
-            p = subprocess.run(["bash", "-c", "REPO=%s; %s\nrelease_has_changes" % (d, fn)])
+            p = subprocess.run(["bash", "-c", "REPO=%s; %s\n%s\nrelease_has_changes"
+                                % (d, owned, fn)])
             return p.returncode == 0
         news_p = os.path.join(d, "news")
         src = io.open(news_p, encoding="utf-8").read()
@@ -1660,6 +1668,14 @@ def t_catalog_only_changes_can_be_released(env, srv):
         with io.open(os.path.join(d, "catalog.json"), "a", encoding="utf-8") as fh:
             fh.write("\n")
         assert allowed(), "a catalog-only change was refused"
+        g("checkout", "-q", "catalog.json")
+        assert not allowed()
+        # a fix to the dev tool alone is a release too
+        shutil.copy(os.path.join(HERE, "lowpingnews"), d)
+        g("add", "lowpingnews"); g("commit", "-qm", "tool"); g("tag", "-f", "v1")
+        with io.open(os.path.join(d, "lowpingnews"), "a", encoding="utf-8") as fh:
+            fh.write("\n# changed\n")
+        assert allowed(), "a change to the dev tool alone was refused"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -1718,6 +1734,417 @@ def t_editor_gives_text_selection_back(env, srv):
     e2 = dict(e); e2["LPN_NO_MOUSE"] = "1"
     out = _drive_tui(e2, [b"q"], args=("catalog",), cols=72, raw=True)
     assert "1000h" not in out, "LPN_NO_MOUSE ignored"
+
+
+def _install(tmp, path_first=None, bashrc=None, existing=None):
+    """`lpn install` into a scratch prefix, as on a phone."""
+    pre, home = os.path.join(tmp, "usr"), os.path.join(tmp, "home")
+    os.makedirs(os.path.join(pre, "bin"), exist_ok=True)
+    os.makedirs(home, exist_ok=True)
+    if bashrc is not None:
+        io.open(os.path.join(home, ".bashrc"), "w").write(bashrc)
+    if existing is not None:
+        w = os.path.join(pre, "bin", "weather")
+        io.open(w, "w").write(existing)
+        os.chmod(w, 0o755)
+    # the scratch bin first, then the real PATH: on Termux python3, sh, sed and
+    # the rest live in $PREFIX/bin, and /usr/bin does not exist at all. A
+    # desktop-style "/usr/bin:/bin" here once made every install test fail there.
+    path = os.path.join(pre, "bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+    if path_first:
+        path = path_first + os.pathsep + path
+    # inherit everything, override only what this test is about. Google Play
+    # Termux runs every program through a library named in LD_PRELOAD (Android
+    # forbids executing app files directly); a hand-built minimal environment
+    # drops it, and the installer could find python3 but not run it.
+    env = dict(os.environ)
+    env.update({"PREFIX": pre, "HOME": home, "LPN_REPO": HERE, "PATH": path})
+    p = subprocess.run(["sh", os.path.join(HERE, "lowpingnews"), "install"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    return p.stdout.decode("utf-8", "replace"), os.path.join(pre, "bin", "weather"), env
+
+
+@test
+def t_install_makes_weather_run_lowpingnews(env, srv):
+    tmp = tempfile.mkdtemp()
+    try:
+        out, w, e = _install(tmp)
+        assert "launcher" in out, out
+        p = subprocess.run([w, "--version"], stdout=subprocess.PIPE, env=e)
+        assert load().VERSION in p.stdout.decode(), "weather did not run LowPingNews"
+        out2, _w, _e = _install(tmp)
+        assert "launcher" not in out2, "an unchanged launcher was rewritten"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_install_never_overwrites_someone_elses_weather(env, srv):
+    tmp = tempfile.mkdtemp()
+    try:
+        mine = "#!/bin/sh\necho my old applet\n"
+        out, w, _e = _install(tmp, existing=mine)
+        assert io.open(w).read() == mine, "a weather script that was not ours got replaced"
+        assert "kept your own" in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_install_points_out_what_hides_news_and_weather(env, srv):
+    tmp = tempfile.mkdtemp()
+    try:
+        old = os.path.join(tmp, "oldbin")
+        os.makedirs(old)
+        for c in ("news", "weather"):
+            io.open(os.path.join(old, c), "w").write("#!/bin/sh\necho old\n")
+            os.chmod(os.path.join(old, c), 0o755)
+        out, _w, _e = _install(tmp, path_first=old)
+        assert "`news` runs" in out and "`weather` runs" in out, out
+        rc = 'alias news="python3 old.py"\nweather() { curl wttr.in; }\nalias news2=x\n'
+        out, _w, _e = _install(tempfile.mkdtemp(), bashrc=rc)
+        assert "line 1 redefines `news`" in out and "line 2 redefines `weather`" in out, out
+        assert "news2" not in out
+        out, _w, _e = _install(tempfile.mkdtemp(), bashrc="alias news=lowpingnews\n")
+        assert "redefines" not in out, "warned about an alias that already points here"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- v7.0
+def _three_feeds(srv, env, n=20):
+    for f in ("a", "b", "c"):
+        srv.feed("/" + f, [item("%s story %d" % (f.upper(), i),
+                                when="2026-10-%02dT%02d:00:00Z" % (1 + i % 3, i)) for i in range(n)])
+    sources(env, [{"id": f, "name": f.upper(), "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/" + f)} for f in ("a", "b", "c")])
+
+
+@test
+def t_a_number_is_how_many_articles(env, srv):
+    _three_feeds(srv, env)
+    count = lambda o: len(re.findall(r"^\s+\d+ [ABC] ", o, re.M))
+    for args, want in ((("top", "13"), 13), (("13",), 13), (("13", "top"), 13), (("top", "45"), 45)):
+        out, _, _ = run(env, *(args + ("-t",)))
+        assert count(out) == want, "%s showed %d" % (" ".join(args), count(out))
+    out, _, _ = run(env, "top", "100", "-t")
+    assert count(out) == 60 and "only 60 of 100" in out, "fewer than asked, without saying so"
+    for bad in ("0", "9999"):
+        _o, err, rc = run(env, "top", bad, "--plain")
+        assert rc != 0 and "between 1 and" in err
+
+
+@test
+def t_a_count_opens_the_reader_with_that_many(env, srv):
+    _three_feeds(srv, env)
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    for args, want in ((("top", "13"), "13"), (("top", "55"), "55")):
+        out = _drive_tui(e, [b"q"], args=args, cols=72)
+        m_ = re.search(r"TOP\s+(\d+) items", out)
+        assert m_ and m_.group(1) == want, "%s did not open the reader with %s" % (args, want)
+    out = _drive_tui(e, [b"q"], args=("top", "13", "-n", "2"), cols=72)
+    assert "j/k" not in out, "an explicit -n should still mean list output"
+
+
+@test
+def t_numbers_cannot_be_category_names(env, srv):
+    m = load()
+    assert m.norm_cat("2024") == "" and m.norm_cat("top10") == "top10"
+
+
+@test
+def t_weather_speaks_in_words(env, srv):
+    tmp = tempfile.mkdtemp()
+    try:
+        import unicodedata
+        cells = lambda l: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in l)
+        fc = _forecast(rain=True)
+        fc["daily"]["weather_code"] = [2, 3, 56, 0, 80, 86, 96]
+        srv.json("/fc", fc)
+        binary = _wx_binary(srv, tmp)
+        subprocess.run([binary, "weather", "-c", "40.9,-73.4"], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=env)
+        for cols in (30, 40, 64, 100):
+            for extra in ([], ["--ascii"]):
+                e = dict(env); e["COLUMNS"] = str(cols)
+                p = subprocess.run([binary, "weather", "--plain"] + extra, stdout=subprocess.PIPE, env=e)
+                out = re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode())
+                for w in ("Partly Cloudy", "Overcast", "Icy Drizzle", "Heavy Snowfall", "Thunder & Hail",
+                          "Humidity", "Wind"):
+                    assert w in out, "%r missing at %d cols %s" % (w, cols, extra)
+                for code in (" PC ", " OV ", " RH ", " g18"):
+                    assert code not in out, "shorthand %r at %d cols" % (code, cols)
+                over = [l for l in out.split("\n") if cells(l) > cols]
+                assert not over, "%d cols overflow: %r" % (cols, over[0])
+                if extra:
+                    assert "\u2600" not in out and "\u2601" not in out, "icons in ASCII mode"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_weather_icons_are_one_cell_glyphs(env, srv):
+    """Weather emoji such as 🌤 are classed narrow but drawn wide, which shifts
+    every column after them; icons must be built from text glyphs only."""
+    import unicodedata
+    m = load()
+    for name, icon in m.WMO.values():
+        assert len(icon) == 2, "%s icon is not two cells" % name
+        for ch in icon:
+            assert ch == " " or (unicodedata.east_asian_width(ch) == "N" and ord(ch) < 0x1F000), \
+                "%s uses %r" % (name, ch)
+    assert max(len(n) for n, _i in m.WMO.values()) <= 14
+
+
+@test
+def t_titles_scroll_sideways_with_either_arrow_encoding(env, srv):
+    long_ = ("Researchers engineer a stable blue anthocyanin pigment in petunia "
+             "flowers using a bacterial enzyme pathway")
+    srv.feed("/f", [item(long_)])
+    sources(env, [{"id": "a", "name": "bioRxiv plant", "kind": "rss", "cats": ["top"],
+                   "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    for seq in (b"\x1bOC", b"\x1b[C", b"l"):
+        out = _drive_tui(e, [seq, b"q"], cols=48)
+        assert "\u00abngineer" in out, "%r did not scroll the titles" % seq
+    out = _drive_tui(e, [b"\x1b[5~", b"\x1b[Z", b"j", b"q"], cols=48)
+    assert "j/k" in out and "Traceback" not in out
+
+
+# ---------------------------------------------------------------- NOAA radio
+# Shapes follow the documented api.weather.gov responses; the live service is
+# not reachable from the build machine.
+def _nws_binary(srv, tmp):
+    src = io.open(NEWS, encoding="utf-8").read()
+    src = src.replace('NWS = "https://api.weather.gov"', 'NWS = "%s"' % srv.url("").rstrip("/"))
+    src = src.replace("https://tgftp.nws.noaa.gov", srv.url("").rstrip("/"))
+    p = os.path.join(tmp, "news_nws")
+    io.open(p, "w", encoding="utf-8").write(src)
+    os.chmod(p, 0o755)
+    return p
+
+
+def _iso(off_s):
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + off_s))
+
+
+def _nws_alert(event, sev="Severe", urg="Expected", ends=6 * 3600, status="Actual", **kw):
+    p = {"event": event, "severity": sev, "urgency": urg, "certainty": "Likely",
+         "status": status, "messageType": "Alert", "senderName": "NWS Upton NY",
+         "onset": _iso(-600), "expires": _iso(ends), "ends": _iso(ends),
+         "areaDesc": "Northwest Suffolk",
+         "headline": "%s issued by NWS Upton NY" % event,
+         "description": ("* WHAT...Flooding caused by excessive rainfall is expected.\n\n"
+                         "* WHERE...Portions of southeast New York, including\nNorthwest Suffolk.\n\n"
+                         "* WHEN...Until 6 PM EDT this evening.\n\n"
+                         "* IMPACTS...Flooding of rivers, creeks, streams, and other\nlow-lying areas."),
+         "instruction": "Turn around, don't drown when encountering flooded roads.\nMost flood deaths occur in vehicles."}
+    p.update(kw)
+    return {"type": "Feature", "properties": p}
+
+
+def _nws_serve(srv, alerts=(), periods=None, point=True, lat="40.9000", lon="-73.4000"):
+    base = srv.url("").rstrip("/")
+    if point:
+        srv.json("/points/%s,%s" % (lat, lon), {"properties": {
+            "gridId": "OKX", "gridX": 65, "gridY": 42,
+            "forecast": base + "/gridpoints/OKX/65,42/forecast",
+            "forecastZone": base + "/zones/forecast/NYZ078",
+            "relativeLocation": {"properties": {"city": "Huntington", "state": "NY"}}}})
+    srv.json("/alerts/active", {"type": "FeatureCollection", "features": list(alerts)})
+    if periods is None:
+        periods = [{"number": 1, "name": "Today", "isDaytime": True, "temperature": 74,
+                    "temperatureUnit": "F", "shortForecast": "Rain Likely",
+                    "detailedForecast": "Rain likely, mainly after 2pm. High near 74. "
+                                        "South wind 10 to 15 mph. Chance of precipitation is 70%."},
+                   {"number": 2, "name": "Tonight", "isDaytime": False, "temperature": 58,
+                    "temperatureUnit": "F", "shortForecast": "Showers",
+                    "detailedForecast": "Showers. Low around 58. New rainfall amounts between "
+                                        "a half and three quarters of an inch possible."}]
+    srv.json("/gridpoints/OKX/65,42/forecast", {"properties": {"periods": periods}})
+
+
+def _radio(binary, env, *args, cols=48):
+    e = dict(env); e["COLUMNS"] = str(cols)
+    p = subprocess.run([binary, "radio", "-c", "40.9,-73.4", "--plain"] + list(args),
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+    return (re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode("utf-8", "replace")),
+            p.stderr.decode("utf-8", "replace"), p.returncode)
+
+
+def _nws_env(srv):
+    tmp = tempfile.mkdtemp()
+    return _nws_binary(srv, tmp), tmp
+
+
+def _h503(h):
+    h.send_response(503)
+    h.end_headers()
+
+
+def _nws_cache(env):
+    import glob
+    return glob.glob(os.path.join(env["XDG_CACHE_HOME"], "*", "nws.json"))[0]
+
+
+@test
+def t_radio_reads_warnings_first_then_the_forecast(env, srv):
+    b, tmp = _nws_env(srv)
+    try:
+        _nws_serve(srv, alerts=[_nws_alert("Wind Advisory", sev="Moderate"), _nws_alert("Flood Warning")])
+        out, _e, rc = _radio(b, env)
+        assert rc == 0 and "2 ACTIVE ALERTS" in out
+        assert out.index("FLOOD WARNING") < out.index("WIND ADVISORY") < out.index("FORECAST"), \
+            "warnings must come first, most severe first"
+        assert "* WHERE...Portions" in out, "NWS paragraphs should survive"
+        assert "What to do:" in out and "TONIGHT" in out
+        n = len(srv.seen)
+        out2, _e, _rc = _radio(b, env)
+        assert len(srv.seen) == n and "0B, cached" in out2, "a repeat within five minutes cost data"
+        for k in ("User-Agent",):
+            ua = [h for p_, h in srv.seen if p_.startswith("/alerts")][0].get(k, "")
+            assert ua.startswith("LowPingNews/"), "weather.gov asks callers to identify themselves"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_radio_never_mistakes_not_knowing_for_all_clear(env, srv):
+    b, tmp = _nws_env(srv)
+    try:
+        _nws_serve(srv, alerts=[])
+        srv.routes["/alerts/active"] = _h503
+        out, _e, rc = _radio(b, env)
+        assert "ALERTS UNKNOWN" in out and "No active alerts" not in out and rc == 2
+        assert "TODAY" in out, "a dead alert feed must not hide the forecast"
+        out, _e, rc = _radio(b, env, "--offline", "-c", "41.1,-72.1")
+        assert "No active alerts" not in out and rc == 2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_radio_hides_expired_and_drill_alerts_and_says_when_old(env, srv):
+    b, tmp = _nws_env(srv)
+    try:
+        _nws_serve(srv, alerts=[_nws_alert("Flood Warning", ends=60),
+                                _nws_alert("Tornado Warning", sev="Extreme", status="Test"),
+                                _nws_alert("Flood Watch", status="Exercise")])
+        out, _e, _rc = _radio(b, env)
+        assert "TORNADO" not in out and "FLOOD WATCH" not in out, "a drill reached the screen"
+        cf = _nws_cache(env)
+        c = json.load(open(cf))
+        c["alerts"]["t"] -= 3 * 3600
+        c["alerts"]["list"][0]["ends"] = c["alerts"]["list"][0]["expires"] = _iso(-1800)
+        json.dump(c, open(cf, "w"))
+        out, _e, _rc = _radio(b, env, "--offline", cols=60)
+        assert "No active alerts" in out and "1 expired alert hidden" in out
+        assert "may be out of date" in out and "3h ago" in out and "ago ago" not in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_radio_refuses_hostile_text_and_foreign_links(env, srv):
+    b, tmp = _nws_env(srv)
+    try:
+        _nws_serve(srv, alerts=[_nws_alert("Flood\x1b[2J Warning", headline="x\x1b]0;pwned\x07y",
+                                           description="a\x1b[31mred\x00z")])
+        raw = subprocess.run([b, "radio", "-c", "40.9,-73.4", "--plain"], stdout=subprocess.PIPE, env=env).stdout
+        for bad in (b"\x1b[2J", b"\x1b]0", b"\x07", b"\x00"):
+            assert bad not in raw, "%r reached the terminal" % bad
+        srv.json("/points/40.9000,-73.4000", {"properties": {"forecast": "https://evil.example/f"}})
+        out, _e, rc = _radio(b, env, "-f")
+        assert "evil" not in str(srv.seen), "followed a link off weather.gov"
+        assert rc == 0 and "TODAY" in out, "a bad lookup should not discard the good cached office"
+        os.remove(_nws_cache(env))                 # and with nothing cached to fall back on
+        out, _e, rc = _radio(b, env, "-f")
+        assert "evil" not in str(srv.seen) and "No NOAA coverage" in out and rc == 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_radio_outside_the_us_and_marine_zones(env, srv):
+    b, tmp = _nws_env(srv)
+    try:
+        _nws_serve(srv, alerts=[], point=False)
+        out, _e, rc = _radio(b, env)
+        assert "United States only" in out and rc == 1
+        _nws_serve(srv, alerts=[])
+        srv.routes["/data/forecasts/marine/coastal/an/anz335.txt"] = lambda h: (
+            h.send_response(200), h.end_headers(),
+            h.wfile.write(b"Long Island Sound West of New Haven CT\nS winds 10 to 15 kt.\n"))
+        out, _e, _rc = _radio(b, env, "--marine", "anz335", "-f")
+        assert "zone ANZ335" in out and "Long Island Sound" in out
+        out, _e, _rc = _radio(b, env)
+        assert "zone ANZ335" in out, "the zone should be remembered"
+        out, _e, _rc = _radio(b, env, "--marine", "off")
+        assert "MARINE" not in out
+        _o, err, rc = _radio(b, env, "--marine", "../../etc")
+        assert rc != 0 and "ANZ335" in err
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_radio_fits_narrow_screens_in_every_state(env, srv):
+    import unicodedata
+    cells = lambda l: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in l)
+    b, tmp = _nws_env(srv)
+    try:
+        _nws_serve(srv, alerts=[_nws_alert("Flood Warning"), _nws_alert("Wind Advisory", sev="Moderate")])
+        for state in ("ok", "down"):
+            if state == "down":
+                cf = _nws_cache(env)
+                c = json.load(open(cf)); c["alerts"]["t"] -= 7200; json.dump(c, open(cf, "w"))
+                srv.routes["/alerts/active"] = _h503
+            for cols in (28, 40, 60):
+                for ex in ((), ("--ascii",)):
+                    out, _e, _rc = _radio(b, env, *ex, cols=cols)
+                    over = [l for l in out.split("\n") if cells(l) > cols]
+                    assert not over, "%s at %d: %r" % (state, cols, over[0])
+                    if ex:
+                        assert "\u26a0" not in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _radio_at(srv, env, b, loc, cols=48):
+    T_ = {"lat": "%.4f" % loc["lat"], "lon": "%.4f" % loc["lon"]}
+    _nws_serve(srv, alerts=[], lat=T_["lat"], lon=T_["lon"])
+    p = os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "loc.json")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    json.dump(loc, open(p, "w"))
+    e = dict(env); e["COLUMNS"] = str(cols)
+    out = subprocess.run([b, "radio", "--plain"], stdout=subprocess.PIPE, env=e).stdout.decode()
+    return re.sub(r"\x1b\[[0-9;]*m", "", out)
+
+
+@test
+def t_radio_always_says_which_spot_it_checked(env, srv):
+    """Once read the right warnings for the wrong county: a carrier address had
+    put the phone in Queens, and the screen showed only the NWS town name."""
+    b, tmp = _nws_env(srv)
+    try:
+        now = int(time.time())
+        out = _radio_at(srv, env, b, {"lat": 40.9, "lon": -73.412, "label": "Fleets Cove",
+                                      "via": "pinned", "t": now})
+        assert "NOAA RADIO  Fleets Cove" in out, "your own name for the spot comes first"
+        assert "For 40.9000,-73.4120 (pinned)" in out
+        flat = " ".join(out.split())                # prose may wrap anywhere
+        assert "near Huntington NY" in flat, "the NWS town belongs beside it, for comparison"
+        assert "may be for the wrong county" not in out
+        out = _radio_at(srv, env, b, {"lat": 40.68, "lon": -73.82, "via": "ip", "acc": 5000, "t": now})
+        flat = " ".join(out.split())
+        assert "from your network address" in flat and "wrong county" in flat
+        assert "\n    lowpingnews radio -c LAT,LON --label NAME" in out, "the command must copy whole"
+        out = _radio_at(srv, env, b, {"lat": 40.9, "lon": -73.412, "via": "network", "t": now - 172800})
+        assert "Location fixed 2d ago and could not be refreshed" in " ".join(out.split())
+        out = _radio_at(srv, env, b, {"lat": 40.9, "lon": -73.412, "via": "network", "t": now})
+        assert "could not be refreshed" not in out, "a fresh device fix needs no warning"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @test
