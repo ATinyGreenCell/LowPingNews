@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "9.1"
+VERSION = "9.2"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -1894,6 +1894,236 @@ def radio_banner(loc):
     return live
 
 
+# ---- tides --------------------------------------------------------------
+# One tile from the app's site (~1-3 KB: the NOAA tide stations and buoys near
+# you, with the buoys' latest readings), one NOAA prediction request (~0.8 KB,
+# kept for the day), and the moon worked out here - no request at all.
+SITE = os.environ.get("LPN_SITE") or "https://atinygreencell.github.io/LowPingNews/"
+COOPS = os.environ.get("LPN_COOPS") or "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+TIDEC = os.path.join(CD, "tide.json")
+TIDE_KM = 60          # nearest tide station must be this close
+BUOY_KM = 100
+BUOY_FRESH = 3 * 3600
+SYNODIC = 29.530588853              # days, new moon to new moon (mean)
+NEW_MOON0 = 947182440.0             # 2000-01-06 18:14 UTC, a known new moon
+
+
+def moon(t):
+    """Phase from the mean lunation: within ~half a day of the true times."""
+    import math
+    age = ((t - NEW_MOON0) / 86400.0) % SYNODIC
+    lit = (1 - math.cos(2 * math.pi * age / SYNODIC)) / 2
+    names = ((1.0, "New moon"), (6.4, "Waxing crescent"), (8.4, "First quarter"), (13.8, "Waxing gibbous"),
+             (15.8, "Full moon"), (21.1, "Waning gibbous"), (23.1, "Last quarter"), (28.5, "Waning crescent"),
+             (99, "New moon"))
+    name = next(n for lim, n in names if age < lim)
+    half = SYNODIC / 2
+    near = lambda x: min(abs(age - x), SYNODIC - abs(age - x))
+    tide = ("spring" if min(near(0), near(half)) <= 2 else
+            "neap" if min(near(SYNODIC / 4), near(3 * SYNODIC / 4)) <= 2 else "")
+    return {"name": name, "lit": lit, "age": age, "tide": tide,
+            "full": t + ((half - age) % SYNODIC) * 86400, "new": t + ((SYNODIC - age) % SYNODIC) * 86400}
+
+
+def km(a1, o1, a2, o2):
+    import math
+    p = math.pi / 180
+    h = (math.sin((a2 - a1) * p / 2) ** 2 +
+         math.cos(a1 * p) * math.cos(a2 * p) * math.sin((o2 - o1) * p / 2) ** 2)
+    return 12742 * math.asin(min(1, math.sqrt(h)))
+
+
+def tide_level(hilo, t):
+    """Water level at t between the predicted high and low around it: NOAA's
+    own curves are this cosine. (level, rising?) or (None, None) outside."""
+    import math
+    for (t0, v0, _k0), (t1, v1, _k1) in zip(hilo, hilo[1:]):
+        if t0 <= t <= t1 and t1 > t0:
+            f = (1 - math.cos(math.pi * (t - t0) / (t1 - t0))) / 2
+            return v0 + (v1 - v0) * f, v1 > v0
+    return None, None
+
+
+def tide_tile(lat, lon, fresh):
+    import math
+    key = "%d_%d" % (math.floor(lat), math.floor(lon))
+    c = jread(TIDEC, {})
+    tl = c.get("tile") if isinstance(c.get("tile"), dict) else {}
+    if not fresh and tl.get("key") == key and time.time() - tl.get("t", 0) < 1800:
+        return tl.get("d") or {}, 0
+    try:
+        raw, _h, wire, _p = get(SITE.rstrip("/") + "/data/tides/%s.json" % key, 15, cap=256 * 1024)
+        d = json.loads(raw)
+    except Exception as e:
+        if getattr(e, "code", None) == 404:
+            d, wire = {"s": [], "b": []}, 0          # no tide station or buoy within ~100 km
+        elif tl.get("key") == key:
+            return tl.get("d") or {}, 0               # offline: the last copy
+        else:
+            raise
+    c["tile"] = {"key": key, "t": int(time.time()), "d": d}
+    jwrite(TIDEC, c)
+    return d, wire
+
+
+def tide_predictions(sid, fresh):
+    """Highs and lows from yesterday through two days ahead, UTC."""
+    import calendar
+    day = time.strftime("%Y%m%d", time.gmtime(time.time() - 86400))
+    c = jread(TIDEC, {})
+    pc = c.get("pred") if isinstance(c.get("pred"), dict) else {}
+    if not fresh and pc.get("key") == sid + day and time.time() - pc.get("t", 0) < 12 * 3600:
+        return pc.get("h") or [], 0
+    url = ("%s?product=predictions&application=LowPingNews&begin_date=%s&range=96&datum=MLLW&station=%s"
+           "&time_zone=gmt&interval=hilo&units=english&format=json" % (COOPS, day, sid))
+    raw, _h, wire, _p = get(url, 20, cap=128 * 1024)
+    d = json.loads(raw)
+    if isinstance(d, dict) and isinstance(d.get("error"), dict):
+        raise ValueError(clean(str(d["error"].get("message") or "NOAA gave no predictions"), 160))
+    hilo = []
+    for x in (d.get("predictions") if isinstance(d, dict) else None) or []:
+        try:
+            t = calendar.timegm(time.strptime(str(x["t"]), "%Y-%m-%d %H:%M"))
+            hilo.append([t, float(x["v"]), "H" if str(x.get("type", "")).upper().startswith("H") else "L"])
+        except (KeyError, ValueError, TypeError):
+            continue
+    hilo.sort()
+    c["pred"] = {"key": sid + day, "t": int(time.time()), "h": hilo}
+    jwrite(TIDEC, c)
+    return hilo, wire
+
+
+def dur(sec):
+    """A coming wait as people say it: 45 min, 2 h 10 min."""
+    m_ = max(0, int(sec // 60))
+    return "%d min" % m_ if m_ < 60 else "%d h" % (m_ // 60) + (" %d min" % (m_ % 60) if m_ % 60 else "")
+
+
+def tides_show(a, P, loc):
+    import textwrap
+    B, D = P["b"], P["d"]
+    cols = cols_()
+    now = time.time()
+
+    def say(txt, fn=None, ind="  "):
+        for ln in textwrap.wrap(txt, max(16, cols - len(ind) - 1)) or [""]:
+            print((fn or D)(ind + ln))
+    where = loc.get("label") or "%.4f,%.4f" % (loc["lat"], loc["lon"])
+    print(P["hdr"]("TIDES") + "  " + B(where[:max(10, cols - 9)]))
+    via = loc.get("via") or "device"
+    if via == "ip":
+        say("Placed from your network address, which can be miles off: tides differ "
+            "a lot along a coast. Pin your spot:", P["yel"])
+        say("lowpingnews tides -c LAT,LON --label NAME", B, "    ")
+    day = lambda t: ("today" if time.strftime("%Y%m%d", time.localtime(t)) == time.strftime("%Y%m%d", time.localtime(now))
+                     else "tomorrow" if time.strftime("%Y%m%d", time.localtime(t)) ==
+                     time.strftime("%Y%m%d", time.localtime(now + 86400)) else time.strftime("%a", time.localtime(t)))
+    mi = lambda k: "%.0f mi" % (k / 1.609) if k >= 1.6 else "under a mile"
+    wire = 0
+    try:
+        tile, w = tide_tile(loc["lat"], loc["lon"], a.fresh)
+        wire += w
+    except Exception as e:
+        say("Could not get the station list (%s). Offline?" % clean(str(e), 80), P["yel"])
+        tile = {}
+    st = []
+    for x in tile.get("s") or []:
+        try:
+            # the ID goes into NOAA's address: only the shape NOAA's IDs have
+            if not re.match(r"^[0-9A-Z]{5,10}$", str(x[0])):
+                continue
+            st.append((km(loc["lat"], loc["lon"], float(x[2]), float(x[3])), str(x[0]), clean(str(x[1]), 60)))
+        except (IndexError, TypeError, ValueError):
+            continue
+    st.sort()
+    hilo = []
+    if not st or st[0][0] > TIDE_KM:
+        say("No NOAA tide station within %d km. Tide predictions cover US coasts and "
+            "territories; inland, there is no tide to show." % TIDE_KM, P["yel"])
+    else:
+        dk, sid, name = st[0]
+        say("Station %s, %s away (NOAA %s)" % (name, mi(dk), sid))
+        try:
+            hilo, w = tide_predictions(sid, a.fresh)
+            wire += w
+        except Exception as e:
+            say("NOAA gave no predictions: %s" % clean(str(e), 120), P["yel"])
+    if hilo:
+        lvl, up = tide_level(hilo, now)
+        nxt = [h for h in hilo if h[0] > now]
+        word = {"H": "High", "L": "Low "}
+        if lvl is not None and nxt:
+            print()
+            print("  " + B("Now  %.1f ft and %s" % (lvl, "rising" if up else "falling")) +
+                  D(" \u00b7 %s tide in %s" % ("high" if nxt[0][2] == "H" else "low", dur(nxt[0][0] - now))))
+        print()
+        print("  " + B("Next tides"))
+        for t, v, k in nxt[:4]:
+            print("  %s %s %s %s" % ((P["b"] if k == "H" else D)(word[k]), B(clock(t).rjust(8)),
+                                    ("%.1f ft" % v).rjust(7), D(("in " + dur(t - now)) if t - now < 12 * 3600 else day(t))))
+        win = [h for h in hilo if now <= h[0] <= now + 86400]
+        if win:
+            hi, lo = max(win, key=lambda h: h[1]), min(win, key=lambda h: h[1])
+            print()
+            say("Water highest %s %s, %.1f ft: least shore showing" % (clock(hi[0]), day(hi[0]), hi[1]), B)
+            say("Water lowest  %s %s, %.1f ft: most shore showing" % (clock(lo[0]), day(lo[0]), lo[1]), B)
+            print()
+            lv = [tide_level(hilo, now + i * 3600)[0] for i in range(25)]
+            lv = [x for x in lv if x is not None]
+            if len(lv) >= 13:
+                bars, a_, b_ = u"\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588", min(lv), max(lv)
+                line = "".join(bars[min(7, int((x - a_) / ((b_ - a_) or 1) * 7.999))] for x in lv)
+                print("  " + P["grn"](line) + D("  next 24 h"))
+                ticks = [" "] * (len(lv) + 4)
+                for i in range(0, len(lv), 6):
+                    lab = clock(now + i * 3600, short=True) if i else "now"
+                    for j, ch in enumerate(lab[:5]):
+                        ticks[i + j] = ch
+                print("  " + D("".join(ticks).rstrip()))
+    mo = moon(now)
+    print()
+    tip = {"spring": "spring tides: higher highs, lower lows",
+           "neap": "neap tides: a smaller range than usual"}.get(mo["tide"], "")
+    md = lambda t: "%s %d" % (time.strftime("%b", time.localtime(t)), time.localtime(t).tm_mday)
+    ev = sorted([(mo["new"], "new"), (mo["full"], "full")])        # the sooner first
+    say("Moon  %s, %d%% lit \u00b7 %s%s" % (
+        mo["name"], round(mo["lit"] * 100), ", ".join("%s %s" % (w, md(t)) for t, w in ev),
+        (" \u00b7 " + tip) if tip else ""), None)
+    by = []
+    for x in tile.get("b") or []:
+        try:
+            if now - float(x[4]) <= BUOY_FRESH:
+                by.append((km(loc["lat"], loc["lon"], float(x[2]), float(x[3])), x))
+        except (IndexError, TypeError, ValueError):
+            continue
+    by = sorted([b for b in by if b[0] <= BUOY_KM], key=lambda b: b[0])[:2]
+    if by:
+        print()
+        print("  " + B("Buoys"))
+        cel = getattr(a, "celsius", False)
+        deg = lambda c_: ("%.0f\u00b0C" % c_) if cel else ("%.0f\u00b0F" % (c_ * 9 / 5 + 32))
+        for dk, x in by:
+            bits = []
+            num = lambda i: float(x[i]) if len(x) > i and isinstance(x[i], (int, float)) else None
+            if num(5) is not None:
+                bits.append("water " + deg(num(5)))
+            if num(6) is not None:
+                bits.append("waves %.1f ft" % (num(6) * 3.281) + (" every %.0f s" % num(7) if num(7) else ""))
+            if num(9) is not None:
+                cmp_ = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+                d_ = cmp_[int(((num(8) or 0) + 22.5) // 45) % 8] + " " if num(8) is not None else ""
+                bits.append("wind %s%.0f kt" % (d_, num(9) * 1.944))
+            if num(11) is not None:
+                bits.append("air " + deg(num(11)))
+            say("%s %s, %s: %s \u00b7 %s" % (clean(str(x[0]), 12), clean(str(x[1] or ""), 50) or "buoy", mi(dk),
+                                         ", ".join(bits) or "no readings", ago(now - float(x[4]))), None)
+    print()
+    say("Predictions, not observations: wind and pressure can shift the water by a foot or more. "
+        "%s used." % kbs(wire) if wire else "Predictions, not observations: wind and pressure "
+        "can shift the water by a foot or more. Nothing downloaded.")
+    return 0
+
+
 def radio_show(a, P, loc, r):
     import textwrap
     B, D = P["b"], P["d"]
@@ -2599,7 +2829,7 @@ PROBECAP = 16 * 1024                   # a probe reads at most this much
 KINDS = ("rss", "hn", "epmc")
 CATMAX = 20
 # words the command line already gives meaning to can never be categories
-RESERVED_CATS = {"radio", "noaa", "all", "weather", "signal", "saved", "catalog", "feeds", "help",
+RESERVED_CATS = {"radio", "noaa", "tide", "tides", "all", "weather", "signal", "saved", "catalog", "feeds", "help",
                  "update", "list", "add", "remove", "check", "upgrade"}
 
 
@@ -3571,7 +3801,7 @@ def main():
     p.add_argument("count_", nargs="?", metavar="COUNT", default=None,
                    help="how many articles in all, newest first (top 13)")
     p.add_argument("cat", nargs="?", metavar="CATEGORY",
-                   help="top, world, science, tech, bio, all, signal, weather")
+                   help="top, world, science, tech, bio, pubmed, all, signal, weather, tides, radio")
     p.add_argument("--check", action="store_true", help="test every feed URL")
     p.add_argument("-g", "--gps", action="store_true",
                    help="take a fresh device location fix")
@@ -5372,6 +5602,9 @@ def run(a):
         loc = wx_locate(a)
         r = nws_fetch(loc, a.fresh, rc.get("marine"))
         raise SystemExit(radio_show(a, P, loc, r))
+
+    if (a.cat or "").lower() in ("tide", "tides"):
+        raise SystemExit(tides_show(a, P, wx_locate(a)))
 
     if (a.cat or "").lower() == "weather":
         loc = wx_locate(a)

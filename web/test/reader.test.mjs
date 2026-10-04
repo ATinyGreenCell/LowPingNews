@@ -39,6 +39,8 @@ const API = {
   "https://api.crossref.org/works/10.1101/2026.10.04.700001": { status: "ok", message: {
     abstract: "<jats:title>Abstract</jats:title><jats:p>Cytokinin delays senescence &amp; keeps chloroplasts working, here shown in detail.</jats:p><jats:p>CIA2 and CIL mediate it.</jats:p>",
     author: [{ given: "Ngozi Ada", family: "Okafor" }, { given: "Wei", family: "Li" }, { name: "A consortium" }] } },
+  "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&application=LowPingNews&begin_date=20261003&range=96&datum=MLLW&station=8516945&time_zone=gmt&interval=hilo&units=english&format=json":
+    { predictions: [{ t: "2026-10-04 19:42", v: "7.3", type: "H", extra: "<script>" }] },
   "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A12345678%20AND%20SRC%3AMED&resultType=core&format=json&pageSize=1":
     { resultList: { result: [{ abstractText: "<h4>Background</h4>Plants make pigments.<h4>Results</h4>We found &amp; characterised an enzyme.",
       authorString: "Smith J, Jones A", journalTitle: "Plant Cell", pubYear: "2026" }] } },
@@ -54,7 +56,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === SITE + "data/top.json") return new Response(JSON.stringify({ v: 1, items: listedUrls.map((u, i) => [0, "t" + i, "", u, 0]) }), { headers: { "content-type": "application/json" } });
   if (url.startsWith(SITE + "data/")) return new Response("", { status: 404 });
   if (url in API) return new Response(typeof API[url] === "string" ? API[url] : JSON.stringify(API[url]), { headers: { "content-type": "application/json" } });
-  if (url.startsWith("https://api.biorxiv.org/") || url.startsWith("https://www.ebi.ac.uk/") || url.startsWith("https://api.crossref.org/")) return new Response("{}", { status: 404 });
+  if (url.startsWith("https://api.biorxiv.org/") || url.startsWith("https://www.ebi.ac.uk/") || url.startsWith("https://api.crossref.org/") ||
+      url.startsWith("https://api.tidesandcurrents.noaa.gov/")) return new Response("{}", { status: 404 });
   if (url === "https://news.example/slow") return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))));
   const p = pages[url];
   if (!p) return new Response("nope", { status: 404, headers: { "content-type": "text/html" } });
@@ -154,6 +157,23 @@ await test("a PubMed link gets its abstract from Europe PMC's copy", async () =>
   const d = await (await ask("https://pubmed.ncbi.nlm.nih.gov/12345678/")).json();
   assert.ok(d.complete && /Plants make pigments/.test(d.text), JSON.stringify(d));
   assert.equal(d.url, "https://pubmed.ncbi.nlm.nih.gov/12345678/");
+});
+await test("tides: one fixed NOAA query, only a station and a date pass through", async () => {
+  const tideAsk = (qs, origin = ORIGIN) => W.fetch(new Request("https://reader.example/?" + qs, { headers: origin ? { Origin: origin } : {} }), {});
+  fetched = [];
+  const r = await tideAsk("tide=8516945&d=20261003");
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { predictions: [{ t: "2026-10-04 19:42", v: "7.3", type: "H" }] }, "only the three fields pass");
+  assert.equal(r.headers.get("access-control-allow-origin"), ORIGIN);
+  for (const bad of ["tide=8516945%26datum%3DNAVD&d=20261003", "tide=../x&d=20261003", "tide=8516945&d=today", "tide=&d=20261003"]) {
+    fetched = [];
+    const b = await tideAsk(bad);
+    assert.equal(b.status, 400, bad);
+    assert.ok(!fetched.some((u) => u.includes("tidesandcurrents")), "nothing reached NOAA for " + bad);
+  }
+  assert.equal((await tideAsk("tide=8516945&d=20261003", "https://evil.example")).status, 403);
+  const miss = await tideAsk("tide=9999999&d=20261003");
+  assert.equal(miss.status, 502);
 });
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");

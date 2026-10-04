@@ -1,4 +1,4 @@
-export const APP_VERSION = "9.1";
+export const APP_VERSION = "9.2";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -253,4 +253,73 @@ export function liveAlerts(raw, now) {
     }
     out.sort((a, b) => { var _a, _b; return ((_a = SEV[a.severity]) !== null && _a !== void 0 ? _a : 5) - ((_b = SEV[b.severity]) !== null && _b !== void 0 ? _b : 5); });
     return { alerts: out, expired };
+}
+const SYNODIC = 29.530588853;
+const NEW_MOON0 = 947182440;
+export function moon(t) {
+    const age = (((t - NEW_MOON0) / 86400) % SYNODIC + SYNODIC) % SYNODIC;
+    const lit = (1 - Math.cos(2 * Math.PI * age / SYNODIC)) / 2;
+    const names = [[1, "New moon"], [6.4, "Waxing crescent"], [8.4, "First quarter"], [13.8, "Waxing gibbous"],
+        [15.8, "Full moon"], [21.1, "Waning gibbous"], [23.1, "Last quarter"], [28.5, "Waning crescent"], [99, "New moon"]];
+    const name = names.find(([lim]) => age < lim)[1];
+    const near = (x) => Math.min(Math.abs(age - x), SYNODIC - Math.abs(age - x));
+    const half = SYNODIC / 2;
+    const tide = Math.min(near(0), near(half)) <= 2 ? "spring" : Math.min(near(SYNODIC / 4), near(3 * SYNODIC / 4)) <= 2 ? "neap" : "";
+    return { name, lit, age, tide, full: t + (((half - age) % SYNODIC + SYNODIC) % SYNODIC) * 86400,
+        next: t + (((SYNODIC - age) % SYNODIC + SYNODIC) % SYNODIC) * 86400 };
+}
+export function kmBetween(a1, o1, a2, o2) {
+    const p = Math.PI / 180;
+    const h = Math.sin((a2 - a1) * p / 2) ** 2 + Math.cos(a1 * p) * Math.cos(a2 * p) * Math.sin((o2 - o1) * p / 2) ** 2;
+    return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+export function tileKey(lat, lon) { return Math.floor(lat) + "_" + Math.floor(lon); }
+export function tideLevel(hilo, t) {
+    for (let i = 0; i + 1 < hilo.length; i++) {
+        const [t0, v0] = hilo[i], [t1, v1] = hilo[i + 1];
+        if (t0 <= t && t <= t1 && t1 > t0) {
+            const f = (1 - Math.cos(Math.PI * (t - t0) / (t1 - t0))) / 2;
+            return { level: v0 + (v1 - v0) * f, rising: v1 > v0 };
+        }
+    }
+    return null;
+}
+const num = (x) => (typeof x === "number" && isFinite(x) ? x : null);
+export function parseTile(raw, lat, lon, now) {
+    const d = raw && typeof raw === "object" ? raw : {};
+    const rows = (k) => (Array.isArray(d[k]) ? d[k].filter(Array.isArray) : []);
+    const stations = [];
+    for (const r of rows("s")) {
+        const a = num(r[2]), o = num(r[3]);
+        if (a === null || o === null || typeof r[0] !== "string" || !/^[0-9A-Z]{5,10}$/.test(r[0]))
+            continue;
+        stations.push({ id: r[0], name: cleanText(r[1], 60), km: kmBetween(lat, lon, a, o) });
+    }
+    const buoys = [];
+    for (const r of rows("b")) {
+        const a = num(r[2]), o = num(r[3]), t = num(r[4]);
+        if (a === null || o === null || t === null || now - t > 3 * 3600 || typeof r[0] !== "string")
+            continue;
+        buoys.push({ id: cleanText(r[0], 10), name: cleanText(r[1], 50), km: kmBetween(lat, lon, a, o), t,
+            water: num(r[5]), waves: num(r[6]), period: num(r[7]), dir: num(r[8]), wind: num(r[9]), air: num(r[11]) });
+    }
+    stations.sort((x, y) => x.km - y.km);
+    buoys.sort((x, y) => x.km - y.km);
+    const reader = safeUrl(d.reader);
+    return { stations, buoys, reader: reader.startsWith("https://") ? reader : "" };
+}
+export function parsePredictions(raw) {
+    const d = raw && typeof raw === "object" ? raw : {};
+    if (d.error && typeof d.error === "object")
+        return { hilo: [], error: cleanText(d.error.message, 160) || "no predictions" };
+    const out = [];
+    for (const x of Array.isArray(d.predictions) ? d.predictions : []) {
+        const m = x && typeof x.t === "string" ? /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)$/.exec(x.t) : null;
+        const v = x ? parseFloat(String(x.v)) : NaN;
+        if (!m || !isFinite(v))
+            continue;
+        out.push([Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) / 1000, v, String(x.type).toUpperCase().startsWith("H") ? "H" : "L"]);
+    }
+    out.sort((a, b) => a[0] - b[0]);
+    return { hilo: out, error: out.length ? "" : "no predictions" };
 }

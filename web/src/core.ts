@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "9.1";
+export const APP_VERSION = "9.2";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -283,4 +283,82 @@ export function liveAlerts(raw: unknown, now: number): { alerts: Alert[]; expire
   }
   out.sort((a, b) => (SEV[a.severity] ?? 5) - (SEV[b.severity] ?? 5));
   return { alerts: out, expired };
+}
+
+
+// ---- tides ------------------------------------------------------------------
+// The moon from the mean lunation (within ~half a day of the true times), the
+// water level between NOAA's predicted highs and lows (their curves are this
+// cosine), and safe readers for the site's tile and NOAA's predictions.
+const SYNODIC = 29.530588853;
+const NEW_MOON0 = 947182440;          // 2000-01-06 18:14 UTC, a known new moon
+export interface Moon { name: string; lit: number; age: number; tide: "" | "spring" | "neap"; full: number; next: number }
+export function moon(t: number): Moon {
+  const age = (((t - NEW_MOON0) / 86400) % SYNODIC + SYNODIC) % SYNODIC;
+  const lit = (1 - Math.cos(2 * Math.PI * age / SYNODIC)) / 2;
+  const names: [number, string][] = [[1, "New moon"], [6.4, "Waxing crescent"], [8.4, "First quarter"], [13.8, "Waxing gibbous"],
+    [15.8, "Full moon"], [21.1, "Waning gibbous"], [23.1, "Last quarter"], [28.5, "Waning crescent"], [99, "New moon"]];
+  const name = names.find(([lim]) => age < lim)![1];
+  const near = (x: number): number => Math.min(Math.abs(age - x), SYNODIC - Math.abs(age - x));
+  const half = SYNODIC / 2;
+  const tide = Math.min(near(0), near(half)) <= 2 ? "spring" : Math.min(near(SYNODIC / 4), near(3 * SYNODIC / 4)) <= 2 ? "neap" : "";
+  return { name, lit, age, tide, full: t + (((half - age) % SYNODIC + SYNODIC) % SYNODIC) * 86400,
+           next: t + (((SYNODIC - age) % SYNODIC + SYNODIC) % SYNODIC) * 86400 };
+}
+export function kmBetween(a1: number, o1: number, a2: number, o2: number): number {
+  const p = Math.PI / 180;
+  const h = Math.sin((a2 - a1) * p / 2) ** 2 + Math.cos(a1 * p) * Math.cos(a2 * p) * Math.sin((o2 - o1) * p / 2) ** 2;
+  return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+export function tileKey(lat: number, lon: number): string { return Math.floor(lat) + "_" + Math.floor(lon); }
+export type Tide = [number, number, "H" | "L"];
+export function tideLevel(hilo: Tide[], t: number): { level: number; rising: boolean } | null {
+  for (let i = 0; i + 1 < hilo.length; i++) {
+    const [t0, v0] = hilo[i], [t1, v1] = hilo[i + 1];
+    if (t0 <= t && t <= t1 && t1 > t0) {
+      const f = (1 - Math.cos(Math.PI * (t - t0) / (t1 - t0))) / 2;
+      return { level: v0 + (v1 - v0) * f, rising: v1 > v0 };
+    }
+  }
+  return null;
+}
+const num = (x: unknown): number | null => (typeof x === "number" && isFinite(x) ? x : null);
+export interface Station { id: string; name: string; km: number }
+export interface Buoy { id: string; name: string; km: number; t: number; water: number | null; waves: number | null;
+                        period: number | null; dir: number | null; wind: number | null; air: number | null }
+/** The site's tile, sorted by distance from you: hostile or broken rows dropped. */
+export function parseTile(raw: unknown, lat: number, lon: number, now: number): { stations: Station[]; buoys: Buoy[]; reader: string } {
+  const d = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const rows = (k: string): unknown[][] => (Array.isArray(d[k]) ? (d[k] as unknown[]).filter(Array.isArray) as unknown[][] : []);
+  const stations: Station[] = [];
+  for (const r of rows("s")) {
+    const a = num(r[2]), o = num(r[3]);
+    if (a === null || o === null || typeof r[0] !== "string" || !/^[0-9A-Z]{5,10}$/.test(r[0])) continue;
+    stations.push({ id: r[0], name: cleanText(r[1], 60), km: kmBetween(lat, lon, a, o) });
+  }
+  const buoys: Buoy[] = [];
+  for (const r of rows("b")) {
+    const a = num(r[2]), o = num(r[3]), t = num(r[4]);
+    if (a === null || o === null || t === null || now - t > 3 * 3600 || typeof r[0] !== "string") continue;
+    buoys.push({ id: cleanText(r[0], 10), name: cleanText(r[1], 50), km: kmBetween(lat, lon, a, o), t,
+                 water: num(r[5]), waves: num(r[6]), period: num(r[7]), dir: num(r[8]), wind: num(r[9]), air: num(r[11]) });
+  }
+  stations.sort((x, y) => x.km - y.km);
+  buoys.sort((x, y) => x.km - y.km);
+  const reader = safeUrl(d.reader);
+  return { stations, buoys, reader: reader.startsWith("https://") ? reader : "" };
+}
+/** NOAA's high/low predictions, asked for in GMT: [epoch, feet, H|L], in order. */
+export function parsePredictions(raw: unknown): { hilo: Tide[]; error: string } {
+  const d = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  if (d.error && typeof d.error === "object") return { hilo: [], error: cleanText((d.error as Record<string, unknown>).message, 160) || "no predictions" };
+  const out: Tide[] = [];
+  for (const x of Array.isArray(d.predictions) ? d.predictions as Record<string, unknown>[] : []) {
+    const m = x && typeof x.t === "string" ? /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)$/.exec(x.t) : null;
+    const v = x ? parseFloat(String(x.v)) : NaN;
+    if (!m || !isFinite(v)) continue;
+    out.push([Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) / 1000, v, String(x.type).toUpperCase().startsWith("H") ? "H" : "L"]);
+  }
+  out.sort((a, b) => a[0] - b[0]);
+  return { hilo: out, error: out.length ? "" : "no predictions" };
 }

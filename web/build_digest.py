@@ -229,6 +229,123 @@ def write_abstracts(m, out_dir, items, now):
     return asked, written
 
 
+# ---- tides: one small tile per 1-degree square ---------------------------
+# NOAA's station list is megabytes and NDBC's buoys cannot be read from a web
+# page (no CORS), so this build gathers both and writes data/tides/<lat>_<lon>.json:
+# every tide station and buoy within about 100 km of that square, with each
+# buoy's latest reading. A phone fetches only its own tile (~1-3 KB).
+TIDE_META = os.environ.get("LPN_TIDE_META") or "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions"
+NDBC = os.environ.get("LPN_NDBC") or "https://www.ndbc.noaa.gov"
+WEEK = 7 * 86400
+
+
+def _get_text(url, timeout=30, cap=8 * 1024 * 1024):
+    import gzip, urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "LowPingNews-site/1 (https://github.com/ATinyGreenCell/LowPingNews)",
+                                               "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(cap)
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            raw = gzip.decompress(raw)
+    return raw.decode("utf-8", "replace")
+
+
+def _weekly(m, name, fetch, now):
+    """A slow-changing list: refetched weekly; a failed refetch keeps the old one."""
+    f = os.path.join(m.CD, name)
+    c = m.jread(f, {})
+    if not isinstance(c, dict):
+        c = {}
+    if now - c.get("t", 0) > WEEK or not c.get("d"):
+        try:
+            d = fetch()
+            if d:
+                c = {"t": int(now), "d": d}
+                m.jwrite(f, c)
+        except Exception as e:
+            print("  (%s not refreshed: %s)" % (name, str(e)[:80]))
+    return c.get("d") or []
+
+
+def tide_stations():
+    d = json.loads(_get_text(TIDE_META))
+    out = []
+    for x in (d.get("stations") if isinstance(d, dict) else None) or []:
+        try:
+            sid, lat, lon = str(x["id"]), float(x["lat"]), float(x.get("lng", x.get("lon")))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not re.match(r"^[0-9A-Z]{5,10}$", sid) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        name = clean(x.get("name"), 50) + (", " + clean(x.get("state"), 4) if x.get("state") else "")
+        out.append([sid, name, round(lat, 4), round(lon, 4)])
+    return out
+
+
+def buoy_names():
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(_get_text(NDBC + "/activestations.xml"))
+    return {clean(e.get("id"), 10).upper(): clean(e.get("name"), 50) for e in root.iter("station") if e.get("id")}
+
+
+def buoy_obs(now):
+    """NDBC's one file of every station's latest reading (metric, UTC)."""
+    import calendar
+    lines = _get_text(NDBC + "/data/latest_obs/latest_obs.txt").splitlines()
+    head = next((l.lstrip("#").split() for l in lines if l.startswith("#") and "LAT" in l.upper()), None)
+    if not head:
+        return []
+    col = {h.upper(): i for i, h in enumerate(head)}
+    need = ("STN", "LAT", "LON", "YYYY", "MM", "DD", "HH", "MM_")
+    out = []
+    for l in lines:
+        if l.startswith("#") or not l.strip():
+            continue
+        v = l.split()
+        if len(v) < len(head):
+            continue
+        num = lambda k: (None if k not in col or v[col[k]] in ("MM", "N/A") else float(v[col[k]]))
+        try:
+            # the header names minutes "mm" and months "MM": they are the 5th and 8th columns
+            t = calendar.timegm((int(v[3]), int(v[4]), int(v[5]), int(v[6]), int(v[7]), 0))
+            lat, lon = float(v[1]), float(v[2])
+            row = [clean(v[0], 10).upper(), "", round(lat, 3), round(lon, 3), t,
+                   num("WTMP"), num("WVHT"), num("DPD"), num("WDIR"), num("WSPD"), num("GST"), num("ATMP")]
+        except (ValueError, IndexError, OverflowError):
+            continue
+        if now - t <= 6 * 3600 and -90 <= lat <= 90 and -180 <= lon <= 180:
+            out.append(row)
+    return out
+
+
+def write_tides(m, out_dir, now):
+    import math
+    st = _weekly(m, "tide-stations.json", tide_stations, now)
+    names = _weekly(m, "buoy-names.json", buoy_names, now)
+    try:
+        obs = buoy_obs(now)
+    except Exception as e:
+        print("  (buoy readings not fetched: %s)" % str(e)[:80])
+        obs = []
+    for b in obs:
+        b[1] = (names.get(b[0]) if isinstance(names, dict) else "") or ""
+    tiles = {}
+    for kind, rows in (("s", st), ("b", obs)):
+        for r in rows:
+            la, lo = int(math.floor(r[2])), int(math.floor(r[3]))
+            for dla in (-1, 0, 1):
+                for dlo in (-1, 0, 1):
+                    k = "%d_%d" % (la + dla, (lo + dlo + 180) % 360 - 180)
+                    tiles.setdefault(k, {"s": [], "b": []})[kind].append(r)
+    tdir = os.path.join(out_dir, "data", "tides")
+    os.makedirs(tdir, exist_ok=True)
+    for k, d in tiles.items():
+        with io.open(os.path.join(tdir, k + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps({"v": 1, "t": int(now), "reader": READER, "s": d["s"], "b": d["b"]},
+                                ensure_ascii=False, separators=(",", ":")))
+    return len(st), len(obs), len(tiles)
+
+
 def load_news():
     import importlib.util
     from importlib.machinery import SourceFileLoader
@@ -330,6 +447,11 @@ def build(out_dir, now=None):
             fh.write(body)
         sizes[c] = len(body.encode("utf-8"))
     sizes["(abstracts)"] = write_abstracts(m, out_dir, all_links, now)
+    try:
+        sizes["(tides)"] = write_tides(m, out_dir, now)
+    except Exception as e:                       # tides never stop the news
+        print("  (tides skipped: %s)" % str(e)[:120])
+        sizes["(tides)"] = (0, 0, 0)
     return sizes
 
 
@@ -346,6 +468,8 @@ def main():
     copy_static(out)
     sizes = build(out)
     import gzip
+    ns, nb, nt = sizes.pop("(tides)")
+    print("  tides: %d stations, %d buoy readings, %d tiles" % (ns, nb, nt))
     asked, written = sizes.pop("(abstracts)")
     print("  paper abstracts: %d published, %d outside requests this run" % (written, asked))
     for c, n in sorted(sizes.items()):

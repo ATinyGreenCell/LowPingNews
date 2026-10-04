@@ -9,7 +9,7 @@
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
 
-const VERSION = "9.1";
+const VERSION = "9.2";
 const SITE = "https://atinygreencell.github.io/LowPingNews/";   // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024;     // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -298,6 +298,26 @@ export async function read(url: string, timeoutMs: number = TIMEOUT_MS): Promise
   return best;
 }
 
+/** Tide highs and lows for the app, when a browser refuses NOAA's API (CORS).
+ *  Only a station ID and a date pass through, to one fixed NOAA query: this is
+ *  never an open proxy. Cached at the edge for six hours. */
+async function tide(q: URLSearchParams, allow: string): Promise<Response> {
+  const sid = q.get("tide") || "", day = q.get("d") || "";
+  if (!/^[0-9A-Z]{5,10}$/.test(sid) || !/^20\d{6}$/.test(day)) return reply({ v: 1, error: "bad request" }, 400, allow);
+  const url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&application=LowPingNews" +
+              "&begin_date=" + day + "&range=96&datum=MLLW&station=" + sid + "&time_zone=gmt&interval=hilo&units=english&format=json";
+  const d = await getJSON(url, TIMEOUT_MS * 2).catch(() => null) as { predictions?: unknown[]; error?: { message?: unknown } } | null;
+  const preds = d && Array.isArray(d.predictions)
+    ? d.predictions.filter((x): x is Record<string, unknown> => !!x && typeof x === "object").slice(0, 40)
+        .map((x) => ({ t: String(x.t).slice(0, 16), v: String(x.v).slice(0, 10), type: String(x.type).slice(0, 2) }))
+    : null;
+  const body = preds ? { predictions: preds } : { error: { message: d && d.error ? tidy(String(d.error.message || "")).slice(0, 160) : "NOAA " + (apiWhy || "did not answer") } };
+  return new Response(JSON.stringify(body), { status: preds ? 200 : 502, headers: {
+    "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": allow, Vary: "Origin",
+    "Cache-Control": preds ? "public, max-age=21600" : "no-store", "X-LPN-Reader": VERSION,
+    "Access-Control-Expose-Headers": "X-LPN-Reader" } });
+}
+
 function reply(body: Out | { v: number; error: string }, status: number, origin: string, cache = 0): Response {
   const h = new Headers({ "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": origin,
                           Vary: "Origin", "X-Content-Type-Options": "nosniff", "X-LPN-Reader": VERSION,
@@ -319,6 +339,7 @@ export default {
     }
     if (req.method !== "GET") return reply({ v: 1, error: "GET only" }, 405, allow);
     const q = new URL(req.url).searchParams;
+    if (q.has("tide")) return tide(q, allow);
     const cat = q.get("cat") || "";
     const url = safeUrl(q.get("u"));
     if (!/^[a-z0-9_-]{1,24}$/.test(cat) || !url) return reply({ v: 1, error: "bad request" }, 400, allow);

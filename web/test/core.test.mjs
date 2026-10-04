@@ -172,5 +172,30 @@ test("PubMed records: recognised, and their abstract file checked by PMID", () =
   assert.match(a.note, /journal/);
   assert.equal(C.parseAbstractDoc(doc, { server: "pubmed", id: "41000002" }).text, "", "another record's file");
 });
+test("tides: the moon, the water level, and hostile tiles", () => {
+  const full = C.moon(1706205240), nw = C.moon(1712600460);
+  assert.ok(full.name === "Full moon" && full.lit > 0.97 && full.tide === "spring", JSON.stringify(full));
+  assert.ok(nw.name === "New moon" && nw.lit < 0.03, JSON.stringify(nw));
+  assert.equal(C.moon(1706205240 + 7.4 * 86400).tide, "neap");
+  const hilo = [[0, 0, "L"], [21600, 6, "H"], [43200, 0.5, "L"]];
+  assert.ok(Math.abs(C.tideLevel(hilo, 10800).level - 3) < 1e-9 && C.tideLevel(hilo, 10800).rising);
+  assert.equal(C.tideLevel(hilo, 50000), null, "outside the predictions: unknown, not guessed");
+  assert.equal(C.tileKey(40.9, -73.4), "40_-74", "negative longitudes round down");
+  assert.ok(Math.abs(C.kmBetween(40.871, -73.426, 40.713, -74.006) - 51.9) < 0.5);
+  const now = 1791140000;
+  const t = C.parseTile({ reader: "javascript:alert(1)", s: [["8516945", "Northport, NY", 40.9, -73.35], ["BAD/ID", "x", 40.9, -73.41],
+                          ["8516990", "\u001b[2JWillets", 40.79, -73.78], "junk", [null]],
+                          b: [["44040", "W LIS", 40.956, -73.58, now - 600, 18, 0.5, 4, 225, 6.2, 8, 19], ["44022", "old", 40.9, -73.7, now - 4 * 3600]] },
+                        40.9, -73.412, now);
+  assert.deepEqual(t.stations.map((s) => s.id), ["8516945", "8516990"], "a malformed ID never reaches NOAA's address");
+  assert.ok(!/\u001b/.test(t.stations[1].name));
+  assert.deepEqual(t.buoys.map((b) => b.id), ["44040"], "a reading 4 hours old is not current");
+  assert.equal(t.reader, "", "only an https reader is trusted");
+  assert.equal(C.parseTile(null, 0, 0, now).stations.length, 0);
+  const p = C.parsePredictions({ predictions: [{ t: "2026-10-04 19:42", v: "7.3", type: "H" }, { t: "2026-10-04 13:30", v: "-0.2", type: "L" },
+                                               { t: "nonsense", v: "1" }, { t: "2026-10-05 01:58", v: "x", type: "L" }] });
+  assert.deepEqual(p.hilo, [[Date.UTC(2026, 9, 4, 13, 30) / 1000, -0.2, "L"], [Date.UTC(2026, 9, 4, 19, 42) / 1000, 7.3, "H"]]);
+  assert.match(C.parsePredictions({ error: { message: "No Predictions data was found." } }).error, /No Predictions/);
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

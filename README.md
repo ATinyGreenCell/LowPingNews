@@ -164,6 +164,7 @@ lowpingnews               the reader (q quits)
 lowpingnews top 13        thirteen newest headlines
 lowpingnews weather -p "Huntington, NY"     forecast; the place is remembered
 lowpingnews radio         NOAA warnings and forecast (United States)
+lowpingnews tides         next high and low tides, moon, nearby buoys
 lowpingnews catalog       choose feeds: tap or space to tick
 lowpingnews --check       test every feed: which work, what they cost
 ```
@@ -527,6 +528,16 @@ rather than choosing a place elsewhere. A place name is remembered, so
 `weather` and `radio` both show which spot they used, and how it was set.
 
 ## NOAA radio
+
+`lowpingnews tides` (or `tide`, and the Tides tab in the web app) gives the
+next highs and lows at the nearest NOAA tide station, when the water will be
+highest and lowest over the next day (least and most shore showing), a 24-hour
+chart, the moon's phase with spring/neap tides, and the nearest buoys' water
+temperature, waves and wind. It uses the same spot as `weather` (pin it with
+`-c LAT,LON --label NAME`); the web app can use your phone's precise location.
+About 2 KB a check: one small tile of nearby stations and buoys from the app's
+site, NOAA's highs and lows (kept for the day), and the moon is computed on the
+device. Predictions, not observations - wind and pressure move real water.
 
 `lowpingnews radio` (or `noaa`) is a weather radio in text: active watches and
 warnings for your spot first, most severe first, then the National Weather

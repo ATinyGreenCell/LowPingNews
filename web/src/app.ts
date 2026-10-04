@@ -1,6 +1,7 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId } from "./core.js";
+import type { Tide } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -49,7 +50,7 @@ function toast(text: string): void {
 function status(): void {
   const s = $("status");
   s.className = "status";
-  if (S.view === "weather") { s.textContent = ""; return; }
+  if (S.view === "weather" || S.view === "tides") { s.textContent = ""; return; }
   const d = S.digest;
   if (!d) { s.textContent = S.offline ? "offline, and nothing saved yet" : "loading\u2026"; return; }
   const st = staleness(d.t, now());
@@ -264,7 +265,7 @@ async function renderReader(it: Item, force = false): Promise<void> {
 function renderTabs(): void {
   const nav = $("tabs");
   nav.replaceChildren();
-  const all: [string, string][] = [["weather", "Weather"], ...S.cats];
+  const all: [string, string][] = [["weather", "Weather"], ["tides", "Tides"], ...S.cats];
   for (const [id, name] of all) {
     const b = el("button", id === S.view ? "tab on" : "tab", name);
     b.onclick = () => go(id);
@@ -273,13 +274,15 @@ function renderTabs(): void {
 }
 
 function go(view: string): void {
-  if (view === S.view && view !== "weather") { void loadNews(view, true); return; }
+  if (view === S.view && view !== "weather" && view !== "tides") { void loadNews(view, true); return; }
   S.view = view;
   keep("view", view);
   S.digest = null; S.limit = SHOW; S.shown = []; S.known = new Set(); S.reading = null;
   renderTabs();
   window.scrollTo(0, 0);
-  if (view === "weather") void showWeather(); else { renderNews(); void loadNews(view); }
+  if (view === "weather") void showWeather();
+  else if (view === "tides") void showTides();
+  else { renderNews(); void loadNews(view); }
 }
 
 // ---- weather ------------------------------------------------------------
@@ -330,6 +333,148 @@ function locate(): void {
     keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Here", via: "device", t: now() });
     void showWeather(true);
   }, () => toast("location not shared - type a place instead"), { enableHighAccuracy: false, maximumAge: 1800000, timeout: 15000 });
+}
+
+// ---- tides -------------------------------------------------------------------
+// One tile from this site (stations and buoys near you, ~1-3 KB), NOAA's highs
+// and lows (~1 KB, kept 12 h), and the moon worked out on the phone.
+const COOPS = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
+function locatePrecise(): void {
+  if (!navigator.geolocation) { toast("this browser cannot share its location"); return; }
+  toast("finding your exact spot\u2026");
+  navigator.geolocation.getCurrentPosition((p) => {
+    keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Here", via: "device", t: now() });
+    void showTides(true);
+  }, () => toast("location not shared - set a place in Weather instead"), { enableHighAccuracy: true, maximumAge: 300000, timeout: 20000 });
+}
+async function predictions(sid: string, force: boolean, reader: string): Promise<{ hilo: Tide[]; error: string }> {
+  const day = new Date((now() - 86400) * 1000).toISOString().slice(0, 10).replace(/-/g, "");
+  const key = sid + day;
+  const c = store<{ key: string; t: number; h: Tide[] } | null>("tidepred", null);
+  if (!force && c && c.key === key && now() - c.t < 12 * 3600 && Array.isArray(c.h) && c.h.length) return { hilo: c.h, error: "" };
+  const q = "?product=predictions&application=LowPingNews&begin_date=" + day + "&range=96&datum=MLLW&station=" + sid +
+            "&time_zone=gmt&interval=hilo&units=english&format=json";
+  let raw: unknown = null;
+  try { raw = (await getJSON(COOPS + q)).body; } catch { /* the browser may refuse NOAA (CORS): the reader asks for us */ }
+  if (!raw && reader) { try { raw = (await getJSON(reader + "?tide=" + sid + "&d=" + day)).body; } catch { /* offline */ } }
+  const p = parsePredictions(raw);
+  if (p.hilo.length) keep("tidepred", { key, t: now(), h: p.hilo });
+  else if (c && c.key === key && c.h && c.h.length) return { hilo: c.h, error: "" };   // offline: the last copy
+  return p;
+}
+function dayWord(t: number): string {
+  const d = new Date(t * 1000), n = new Date();
+  const same = (a: Date, b: Date): boolean => a.toDateString() === b.toDateString();
+  if (same(d, n)) return "today";
+  if (same(d, new Date(n.getTime() + 86400000))) return "tomorrow";
+  return d.toLocaleDateString(undefined, { weekday: "short" });
+}
+function wait(sec: number): string {
+  const m = Math.max(0, Math.floor(sec / 60));
+  return m < 60 ? m + " min" : Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "");
+}
+function tideChart(hilo: Tide[], t0: number): SVGElement {
+  const NS = "http://www.w3.org/2000/svg", W = 320, H = 96, pad = 14;
+  const pts: [number, number][] = [];
+  for (let i = 0; i <= 96; i++) { const l = tideLevel(hilo, t0 + i * 900); if (l) pts.push([i / 96, l.level]); }
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H); svg.setAttribute("class", "tidechart"); svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Water level over the next 24 hours");
+  if (pts.length < 2) return svg;
+  const lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(...pts.map((p) => p[1]));
+  const x = (f: number): number => f * W, y = (v: number): number => pad + (1 - (v - lo) / ((hi - lo) || 1)) * (H - 2 * pad);
+  const line = pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + " " + y(p[1]).toFixed(1)).join(" ");
+  const area = document.createElementNS(NS, "path");
+  area.setAttribute("d", line + " L" + x(pts[pts.length - 1][0]).toFixed(1) + " " + H + " L" + x(pts[0][0]).toFixed(1) + " " + H + " Z");
+  area.setAttribute("class", "fill");
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", line); path.setAttribute("class", "line");
+  svg.append(area, path);
+  for (const [t, v, k] of hilo) {
+    const f = (t - t0) / 86400;
+    if (f < 0 || f > 1) continue;
+    const lab = document.createElementNS(NS, "text");
+    lab.setAttribute("x", String(Math.min(W - 30, Math.max(2, x(f) - 16))));
+    lab.setAttribute("y", String(k === "H" ? y(v) - 4 : Math.min(H - 2, y(v) + 12)));
+    lab.textContent = clock(t, true);
+    svg.append(lab);
+  }
+  return svg;
+}
+async function showTides(force = false): Promise<void> {
+  status();
+  const main = $("main");
+  main.replaceChildren();
+  const mine = el("button", "small", "Use my precise location");
+  mine.onclick = () => locatePrecise();
+  main.append(el("div", "where", mine));
+  const sp = store<Spot | null>("spot", null);
+  if (!sp) { main.append(el("p", "empty", "Tides need your spot: tap above, or set a place in Weather. It is kept on this phone only.")); return; }
+  main.append(el("h2", "place", sp.label || "Your spot"), el("p", "note", spotLine(sp)));
+  const box = el("section", "tides", el("p", "empty", "Loading tides\u2026"));
+  main.append(box);
+  const t = now();
+  let tile: unknown = null;
+  try {
+    const r = await fetch("./data/tides/" + tileKey(sp.lat, sp.lon) + ".json");
+    tile = r.ok ? await r.json() : r.status === 404 ? {} : null;
+  } catch { /* offline */ }
+  if (S.view !== "tides") return;
+  box.replaceChildren();
+  if (tile === null) box.append(el("p", "note warn", "Could not get the station list. Offline?"));
+  const { stations, buoys, reader } = parseTile(tile || {}, sp.lat, sp.lon, t);
+  const mi = (k: number): string => (k >= 1.6 ? Math.round(k / 1.609) + " mi" : "under a mile");
+  const st = stations[0];
+  if (!st || st.km > 60) {
+    if (tile !== null) box.append(el("p", "note warn", "No NOAA tide station within 60 km. Predictions cover US coasts and territories."));
+  } else {
+    box.append(el("p", "note", "Station " + st.name + ", " + mi(st.km) + " away (NOAA " + st.id + ")"));
+    const pr = await predictions(st.id, force, reader);
+    if (S.view !== "tides") return;
+    if (!pr.hilo.length) box.append(el("p", "note warn", "NOAA gave no predictions: " + pr.error));
+    else {
+      const lv = tideLevel(pr.hilo, t);
+      const next = pr.hilo.filter((h) => h[0] > t);
+      if (lv && next.length)
+        box.append(el("p", "now", "Now " + lv.level.toFixed(1) + " ft and " + (lv.rising ? "rising" : "falling") +
+                      " \u00b7 " + (next[0][2] === "H" ? "high" : "low") + " tide in " + wait(next[0][0] - t)));
+      const list = el("div", "tidelist");
+      for (const [tt, v, k] of next.slice(0, 4))
+        list.append(el("div", k === "H" ? "trow hi" : "trow",
+          el("span", "k", k === "H" ? "High" : "Low"), el("span", "c", clock(tt)), el("span", "v", v.toFixed(1) + " ft"),
+          el("span", "w", tt - t < 12 * 3600 ? "in " + wait(tt - t) : dayWord(tt))));
+      box.append(list);
+      const win = pr.hilo.filter((h) => h[0] >= t && h[0] <= t + 86400);
+      if (win.length) {
+        const top = win.reduce((a, b) => (b[1] > a[1] ? b : a)), bot = win.reduce((a, b) => (b[1] < a[1] ? b : a));
+        box.append(el("p", "", "Water highest " + clock(top[0]) + " " + dayWord(top[0]) + ", " + top[1].toFixed(1) + " ft: least shore showing"),
+                   el("p", "", "Water lowest " + clock(bot[0]) + " " + dayWord(bot[0]) + ", " + bot[1].toFixed(1) + " ft: most shore showing"),
+                   tideChart(pr.hilo, t), el("p", "note", "Next 24 hours, from now"));
+      }
+    }
+  }
+  const mo = moon(t);
+  const md = (x: number): string => new Date(x * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const ev = [[mo.next, "new"], [mo.full, "full"]].sort((a, b) => (a[0] as number) - (b[0] as number));
+  box.append(el("p", "", "Moon: " + mo.name + ", " + Math.round(mo.lit * 100) + "% lit \u00b7 " +
+                ev.map(([x, w]) => w + " " + md(x as number)).join(", ") +
+                (mo.tide === "spring" ? " \u00b7 spring tides: higher highs, lower lows" : mo.tide === "neap" ? " \u00b7 neap tides: a smaller range than usual" : "")));
+  const near = buoys.filter((b) => b.km <= 100).slice(0, 2);
+  if (near.length) {
+    box.append(el("h3", "", "Buoys"));
+    const deg = (c: number): string => (US ? Math.round(c * 9 / 5 + 32) + "\u00b0F" : Math.round(c) + "\u00b0C");
+    const cmp = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    for (const b of near) {
+      const bits: string[] = [];
+      if (b.water !== null) bits.push("water " + deg(b.water));
+      if (b.waves !== null) bits.push("waves " + (b.waves * 3.281).toFixed(1) + " ft" + (b.period ? " every " + Math.round(b.period) + " s" : ""));
+      if (b.wind !== null) bits.push("wind " + (b.dir !== null ? cmp[Math.floor((b.dir + 22.5) / 45) % 8] + " " : "") + Math.round(b.wind * 1.944) + " kt");
+      if (b.air !== null) bits.push("air " + deg(b.air));
+      box.append(el("p", "", b.id + " " + (b.name || "buoy") + ", " + mi(b.km) + ": " + (bits.join(", ") || "no readings") +
+                    " \u00b7 " + ago(t - b.t) + " ago"));
+    }
+  }
+  box.append(el("p", "note", "Predictions, not observations: wind and pressure can shift the water by a foot or more."));
 }
 
 async function findPlace(q: string): Promise<void> {
@@ -473,6 +618,7 @@ async function renderForecast(sp: Spot, box: HTMLElement, force: boolean): Promi
 function start(): void {
   $("refresh").onclick = () => {
     if (S.view === "weather") void showWeather(true);
+    else if (S.view === "tides") void showTides(true);
     else if (S.reading) void renderReader(S.reading, true);         // in an article: fetch it afresh
     else void loadNews(S.view, true);
   };
@@ -484,9 +630,9 @@ function start(): void {
   // the phone's back gesture leaves the article, not the app
   window.addEventListener("popstate", () => { if (S.reading) closeReader(); });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && S.view !== "weather" && now() - S.fetched > 15 * 60) void loadNews(S.view);
+    if (document.visibilityState === "visible" && S.view !== "weather" && S.view !== "tides" && now() - S.fetched > 15 * 60) void loadNews(S.view);
   });
-  window.addEventListener("online", () => { if (S.view !== "weather") void loadNews(S.view); });
+  window.addEventListener("online", () => { if (S.view !== "weather" && S.view !== "tides") void loadNews(S.view); });
   const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
   const standalone = (navigator as unknown as { standalone?: boolean }).standalone === true ||
                      matchMedia("(display-mode: standalone)").matches;
