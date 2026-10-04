@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, } from "./core.js";
+import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -224,6 +224,19 @@ async function renderReader(it, force = false) {
     if (!it.link) {
         show(null, "This feed gives no link to the full article.", -1);
         return;
+    }
+    const pre = preprintId(it.link);
+    if (pre) {
+        try {
+            const r = await fetch(abstractFile(pre));
+            const a = r.ok ? parseAbstractDoc(await r.json()) : null;
+            if (a && a.text) {
+                saveArticle(it.key, a);
+                show(a, "", -1);
+                return;
+            }
+        }
+        catch { }
     }
     if (!reader) {
         show(null, "Full-text reading is not set up for this app yet.", -1);

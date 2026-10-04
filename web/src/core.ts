@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "8.6";
+export const APP_VERSION = "8.7";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -104,6 +104,39 @@ export function parseArticle(raw: unknown): Article {
 }
 
 /** "just now", "5m", "3h", "2d" - for ages in seconds. */
+/** A bioRxiv/medRxiv link's preprint ID, if it is one. */
+const PREPRINT = /^https?:\/\/(?:www\.|connect\.)?(biorxiv|medrxiv)\.org\/(?:content\/(?:early\/\d{4}\/\d{2}\/\d{2}\/)?|cgi\/content\/(?:short|abstract|full)\/)(?:10\.1101\/)?(\d{4}\.\d{2}\.\d{2}\.\d{5,8}|\d{6})(?:v\d+)?/i;
+export function preprintId(link: string): { server: string; id: string } | null {
+  const m = PREPRINT.exec(link || "");
+  return m ? { server: m[1].toLowerCase(), id: m[2] } : null;
+}
+/** Where the site build publishes that preprint's abstract (same site, ~1 KB). */
+export function abstractFile(p: { server: string; id: string }): string {
+  return "./data/abs/" + p.server + "-" + p.id + ".json";
+}
+const authorsShort = (a: string): string => {
+  const names = a.split(/;\s*/).map((x) => x.trim()).filter(Boolean);
+  return names.length > 3 ? names.slice(0, 3).join("; ") + " and " + (names.length - 3) + " more" : names.join("; ");
+};
+/** The published abstract file as an article: who, when, which version, then the abstract. */
+export function parseAbstractDoc(raw: unknown): Article {
+  const none: Article = { text: "", complete: false, note: "", error: "no abstract" };
+  if (!raw || typeof raw !== "object") return none;
+  const d = raw as Record<string, unknown>;
+  const str = (k: string): string => cleanText(d[k], 600);
+  const abs = cleanParas(d.abstract, 8000);
+  if (!abs) return none;
+  const cat = str("category");
+  const meta = [authorsShort(str("authors")), cat && cat[0].toUpperCase() + cat.slice(1),
+                str("date") && "posted " + str("date"), str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
+  const paras = [meta, abs].filter(Boolean);
+  const pub = str("published");
+  if (pub && pub !== "NA" && /^10\.\S+$/.test(pub)) paras.push("Since published: https://doi.org/" + pub);
+  const host = d.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+  return { text: paras.join("\n\n"), complete: true, error: "",
+           note: "This is the abstract. The full paper is on " + host + ": open the original page." };
+}
+
 export function ago(sec: number): string {
   if (!isFinite(sec) || sec < 0) return "?";
   if (sec < 60) return "just now";

@@ -41,7 +41,8 @@ const API = {
 };
 const listedUrls = Object.keys(pages).concat(["https://news.example/slow", "https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1",
   "http://biorxiv.org/cgi/content/short/2026.10.01.612345v2?rss=1", "https://www.biorxiv.org/content/10.1101/339747v1",
-  "https://europepmc.org/article/MED/12345678"]);
+  "https://europepmc.org/article/MED/12345678", "http://biorxiv.org/content/early/2026/10/01/2026.10.01.612345",
+  "https://www.biorxiv.org/content/10.1101/2026.01.03.999999v1"]);
 let fetched = [];
 globalThis.fetch = async (url, init = {}) => {
   url = String(url); fetched.push(url);
@@ -128,6 +129,13 @@ await test("a site-wide tagline is never passed off as the article", async () =>
 await test("an anti-bot page is named, not read", async () => {
   const r = await ask("https://blocked.example/a");
   assert.equal(r.status, 502); assert.match((await r.json()).error, /blocked automated reading/);
+});
+await test("when bioRxiv refuses the reader, the error says so", async () => {
+  const r = await ask("https://www.biorxiv.org/content/10.1101/2026.01.03.999999v1");
+  assert.equal(r.status, 502);
+  assert.match((await r.json()).error, /bioRxiv's API answered 404/);
+  const d = await (await ask("http://biorxiv.org/content/early/2026/10/01/2026.10.01.612345")).json();
+  assert.match(d.text, /central to photoprotection/, "an older /content/early/ link is a preprint too");
 });
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");

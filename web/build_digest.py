@@ -12,6 +12,7 @@ request per category replaces a dozen feeds and their handshakes.
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -28,6 +29,79 @@ SKIP_CATS = {"app"}      # release notes are for the terminal app
 READER = os.environ.get("LPN_READER_URL", "").strip()
 if not READER.startswith("https://") or any(ch in READER for ch in " \"'<>"):
     READER = ""
+
+
+# ---- preprint abstracts: fetched here, published beside the app -----------
+# bioRxiv refuses requests from Cloudflare's servers (where the reader runs),
+# so the reader cannot fetch them. This runs on GitHub's servers: it asks
+# bioRxiv's official API once per preprint and writes a ~1 KB file the app
+# reads from its own site. Abstracts are what bioRxiv's API and feeds already
+# distribute openly; full papers are never copied.
+PREPRINT = re.compile(r"^https?://(?:www\.|connect\.)?(biorxiv|medrxiv)\.org/"
+                      r"(?:content/(?:early/\d{4}/\d{2}/\d{2}/)?|cgi/content/(?:short|abstract|full)/)"
+                      r"(?:10\.1101/)?(\d{4}\.\d{2}\.\d{2}\.\d{5,8}|\d{6})(?:v\d+)?", re.I)
+PREPRINT_API = os.environ.get("LPN_PREPRINT_API", "")   # tests only; real: https://api.<server>.org
+ABS_NEW_MAX = 80          # API calls per run, at most
+ABS_KEEP = 7 * 86400      # refresh a cached abstract weekly (new versions)
+ABS_RETRY = 3600          # after a failure, wait this long before asking again
+
+
+def preprint_id(link):
+    m = PREPRINT.match(link or "")
+    return (m.group(1).lower(), m.group(2)) if m else None
+
+
+def fetch_abstract(server, pid, timeout=15):
+    import urllib.request
+    base = PREPRINT_API or ("https://api.%s.org" % server)
+    url = "%s/details/%s/10.1101/%s/na/json" % (base.rstrip("/"), server, pid)
+    req = urllib.request.Request(url, headers={"User-Agent": "LowPingNews-site (github.com/ATinyGreenCell/LowPingNews)",
+                                               "Accept": "application/json", "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(2 * 1024 * 1024)
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            import gzip
+            raw = gzip.decompress(raw)
+        d = json.loads(raw.decode("utf-8", "replace"))
+    coll = d.get("collection") if isinstance(d, dict) else None
+    if not isinstance(coll, list) or not coll or not isinstance(coll[-1], dict):
+        return None
+    p = coll[-1]                                     # the latest posted version
+    abstract = "\n\n".join(clean(x, 4000) for x in str(p.get("abstract") or "").split("\n\n") if x.strip())
+    if not abstract:
+        return None
+    return {"v": 1, "server": server, "doi": "10.1101/" + pid, "abstract": abstract[:8000],
+            **{k: clean(p.get(k), 600) for k in ("authors", "date", "version", "category", "published")}}
+
+
+def write_abstracts(m, out_dir, links, now):
+    cache_f = os.path.join(m.CD, "abstracts.json")
+    cache = m.jread(cache_f, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    ids = sorted({x for x in (preprint_id(l) for l in links) if x})
+    adir = os.path.join(out_dir, "data", "abs")
+    os.makedirs(adir, exist_ok=True)
+    asked = written = 0
+    for server, pid in ids:
+        k = "%s-%s" % (server, pid)
+        c = cache.get(k) or {}
+        due = (now - c.get("t", 0)) > (ABS_KEEP if c.get("doc") else ABS_RETRY)
+        if due and asked < ABS_NEW_MAX:
+            asked += 1
+            try:
+                doc = fetch_abstract(server, pid)
+            except Exception:
+                doc = None
+            c = {"t": int(now), "doc": doc or c.get("doc")}   # a failed refresh keeps the old copy
+            cache[k] = c
+        if c.get("doc"):
+            with io.open(os.path.join(adir, k + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(c["doc"], ensure_ascii=False, separators=(",", ":")))
+            written += 1
+    keep = {"%s-%s" % i for i in ids}
+    m.jwrite(cache_f, {k: v for k, v in cache.items() if k in keep})   # only what is still listed
+    return asked, written
 
 
 def load_news():
@@ -101,6 +175,7 @@ def build(out_dir, now=None):
     data = os.path.join(out_dir, "data")
     os.makedirs(data, exist_ok=True)
     sizes = {}
+    all_links = []
     for c in cats:
         rows, seen, names = [], set(), []
         for name, it in sorted(by_cat[c], key=lambda r: -m.when_sort(r[1])):
@@ -113,6 +188,7 @@ def build(out_dir, now=None):
                 names.append(name)
             rows.append([names.index(name), title, clean(it.get("s"), SUMMARY),
                          m.safe_url(it.get("u") or "") or "", epoch(m, it, now)])
+            all_links.append(rows[-1][3])
             if len(rows) >= KEEP:
                 break
         doc = {"v": 1, "t": int(now), "app": m.VERSION, "cat": c, "cats": cat_list, "src": names,
@@ -124,6 +200,7 @@ def build(out_dir, now=None):
         with io.open(os.path.join(data, c + ".json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(body)
         sizes[c] = len(body.encode("utf-8"))
+    sizes["(abstracts)"] = write_abstracts(m, out_dir, all_links, now)
     return sizes
 
 
@@ -140,6 +217,8 @@ def main():
     copy_static(out)
     sizes = build(out)
     import gzip
+    asked, written = sizes.pop("(abstracts)")
+    print("  preprint abstracts: %d published, %d asked of bioRxiv this run" % (written, asked))
     for c, n in sorted(sizes.items()):
         raw = io.open(os.path.join(out, "data", c + ".json"), "rb").read()
         print("  %-8s %6.1f KB, %5.1f KB compressed" % (c, n / 1024.0, len(gzip.compress(raw)) / 1024.0))

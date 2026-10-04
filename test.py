@@ -2897,6 +2897,45 @@ WEB = os.path.join(HERE, "web")
 
 
 @test
+def t_web_build_publishes_preprint_abstracts(env, srv):
+    srv.feed("/bx", [item("Jasmonate expands the MYC2 cistrome", body="The transcription factor MYC2...",
+                          link="http://biorxiv.org/cgi/content/short/2026.10.02.679012v2?rss=1"),
+                     item("A preprint the API does not know", body="x",
+                          link="http://biorxiv.org/cgi/content/short/2026.10.02.000001v1?rss=1"),
+                     item("An ordinary story", body="x", link="https://news.example/a")])
+    api = "/details/biorxiv/10.1101/2026.10.02.679012/na/json"
+    srv.json(api, {"collection": [
+        {"version": "1", "abstract": "Old abstract.", "authors": "A", "date": "2026-10-01", "category": "plant biology"},
+        {"version": "2", "abstract": "MYC2 is central.\n\nWe mapped its binding.", "authors": "Lee, K.; Park, S.",
+         "date": "2026-10-02", "category": "plant biology", "published": "NA"}]})
+    tmp = tempfile.mkdtemp()
+    try:
+        fl = os.path.join(tmp, "feeds.json")
+        json.dump([{"id": "bx", "name": "bioRxiv plant", "url": srv.url("/bx"), "cats": ["bio"]}], io.open(fl, "w"))
+        e = dict(env, LPN_WEB_FEEDS=fl, LPN_PREPRINT_API=srv.url(""))
+
+        def build():
+            out = os.path.join(tmp, "site")
+            shutil.rmtree(out, ignore_errors=True)
+            r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=e, timeout=120)
+            assert r.returncode == 0, r.stderr[-400:]
+            return os.path.join(out, "data", "abs"), r.stdout.decode()
+        adir, log = build()
+        assert sorted(os.listdir(adir)) == ["biorxiv-2026.10.02.679012.json"], (os.listdir(adir), log, io.open(
+            os.path.join(tmp, "site", "data", "bio.json"), encoding="utf-8").read()[:600])
+        doc = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.02.679012.json"), encoding="utf-8"))
+        assert doc["abstract"] == "MYC2 is central.\n\nWe mapped its binding." and doc["version"] == "2", doc
+        assert "1 published, 2 asked" in log, log
+        srv.json(api, {"collection": [{"version": "3", "abstract": "Changed."}]})
+        adir, log = build()                                   # cached: bioRxiv is not asked again
+        doc = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.02.679012.json"), encoding="utf-8"))
+        assert doc["version"] == "2" and "0 asked" in log, (doc, log)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
 def t_web_build_is_small_safe_and_honest(env, srv):
     feeds = []
     for i in range(4):

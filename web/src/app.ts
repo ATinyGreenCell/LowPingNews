@@ -1,9 +1,6 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
-import {
-  APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow,
-  clock, wmo, placeParts, placeFits, liveAlerts,
-} from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -188,6 +185,16 @@ async function renderReader(it: Item, force = false): Promise<void> {
   if (!force && saved && saved.a.text && saved.a.complete) { show(saved.a, "", now() - saved.t); return; }
   const reader = S.digest ? S.digest.reader : "";
   if (!it.link) { show(null, "This feed gives no link to the full article.", -1); return; }
+  // a preprint: its abstract was published beside the app by the site build
+  // (bioRxiv refuses the reader's servers, but not GitHub's): ~1 KB, same site
+  const pre = preprintId(it.link);
+  if (pre) {
+    try {
+      const r = await fetch(abstractFile(pre));
+      const a = r.ok ? parseAbstractDoc(await r.json()) : null;
+      if (a && a.text) { saveArticle(it.key, a); show(a, "", -1); return; }
+    } catch { /* offline, or not published yet: the reader may still manage */ }
+  }
   if (!reader) { show(null, "Full-text reading is not set up for this app yet.", -1); return; }
   try {
     const r = await fetch(reader + "?cat=" + encodeURIComponent(S.view) + "&u=" + encodeURIComponent(it.link));

@@ -1,4 +1,4 @@
-export const APP_VERSION = "8.6";
+export const APP_VERSION = "8.7";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -84,6 +84,38 @@ export function parseArticle(raw) {
     const d = (raw && typeof raw === "object" ? raw : {});
     const text = typeof d.text === "string" ? d.text.split("\n\n").map((p) => cleanText(p, 6000)).filter(Boolean).join("\n\n").slice(0, 200000) : "";
     return { text, complete: d.complete === true, note: cleanText(d.note, 200), error: cleanText(d.error, 200) };
+}
+const PREPRINT = /^https?:\/\/(?:www\.|connect\.)?(biorxiv|medrxiv)\.org\/(?:content\/(?:early\/\d{4}\/\d{2}\/\d{2}\/)?|cgi\/content\/(?:short|abstract|full)\/)(?:10\.1101\/)?(\d{4}\.\d{2}\.\d{2}\.\d{5,8}|\d{6})(?:v\d+)?/i;
+export function preprintId(link) {
+    const m = PREPRINT.exec(link || "");
+    return m ? { server: m[1].toLowerCase(), id: m[2] } : null;
+}
+export function abstractFile(p) {
+    return "./data/abs/" + p.server + "-" + p.id + ".json";
+}
+const authorsShort = (a) => {
+    const names = a.split(/;\s*/).map((x) => x.trim()).filter(Boolean);
+    return names.length > 3 ? names.slice(0, 3).join("; ") + " and " + (names.length - 3) + " more" : names.join("; ");
+};
+export function parseAbstractDoc(raw) {
+    const none = { text: "", complete: false, note: "", error: "no abstract" };
+    if (!raw || typeof raw !== "object")
+        return none;
+    const d = raw;
+    const str = (k) => cleanText(d[k], 600);
+    const abs = cleanParas(d.abstract, 8000);
+    if (!abs)
+        return none;
+    const cat = str("category");
+    const meta = [authorsShort(str("authors")), cat && cat[0].toUpperCase() + cat.slice(1),
+        str("date") && "posted " + str("date"), str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
+    const paras = [meta, abs].filter(Boolean);
+    const pub = str("published");
+    if (pub && pub !== "NA" && /^10\.\S+$/.test(pub))
+        paras.push("Since published: https://doi.org/" + pub);
+    const host = d.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+    return { text: paras.join("\n\n"), complete: true, error: "",
+        note: "This is the abstract. The full paper is on " + host + ": open the original page." };
 }
 export function ago(sec) {
     if (!isFinite(sec) || sec < 0)

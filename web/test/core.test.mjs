@@ -100,5 +100,23 @@ test("alerts: drills, cancellations and expired ones never show; worst first", (
   assert.equal(C.liveAlerts({ nope: 1 }, NOW), null);
 });
 
+test("preprint links are recognised in every shape the feeds use", () => {
+  for (const u of ["http://biorxiv.org/cgi/content/short/2026.10.02.679012v1?rss=1",
+                   "https://www.biorxiv.org/content/10.1101/2026.10.02.679012v2",
+                   "http://biorxiv.org/content/early/2026/10/02/2026.10.02.679012"])
+    assert.deepEqual(C.preprintId(u), { server: "biorxiv", id: "2026.10.02.679012" }, u);
+  assert.deepEqual(C.preprintId("https://www.medrxiv.org/content/10.1101/339747v1"), { server: "medrxiv", id: "339747" });
+  assert.equal(C.preprintId("https://news.example/2026.10.02.679012"), null);
+  assert.equal(C.abstractFile({ server: "biorxiv", id: "2026.10.02.679012" }), "./data/abs/biorxiv-2026.10.02.679012.json");
+});
+test("an abstract file reads as who, when, which version, then the abstract", () => {
+  const a = C.parseAbstractDoc({ server: "biorxiv", abstract: "MYC2 is central.\n\nWe mapped it.", authors: "Lee, K.; Park, S.; Kim, H.; Ruiz, M.",
+                                 date: "2026-10-02", version: "2", category: "plant biology", published: "10.1038/x.1" });
+  assert.deepEqual(a.text.split("\n\n"), ["Lee, K.; Park, S.; Kim, H. and 1 more \u00b7 Plant biology \u00b7 posted 2026-10-02 \u00b7 version 2",
+                                          "MYC2 is central.", "We mapped it.", "Since published: https://doi.org/10.1038/x.1"]);
+  assert.ok(a.complete && /abstract/.test(a.note));
+  assert.equal(C.parseAbstractDoc({ abstract: "x", published: "javascript:alert(1)" }).text.includes("javascript"), false);
+  assert.equal(C.parseAbstractDoc(null).text, "");
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);
