@@ -901,6 +901,13 @@ itself to the top of the list, warm-cache paths that crashed because only cold
 ones were exercised, control characters reaching the terminal, and lines
 overflowing a 40-column screen.
 
+
+The suite runs four tests at a time (at least two, even on one core: most
+tests wait on a terminal, a local server or a timeout rather than compute).
+Timings from the last run spread the slow ones evenly. Failures are repeated,
+with their reasons, at the end, where they cannot scroll away.
+`LPN_TEST_JOBS=1` runs one at a time; a name filter (`python3 test.py weather`)
+always runs serially.
 ## License
 
 MIT

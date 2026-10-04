@@ -9,13 +9,13 @@
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
 
-const VERSION = "8.3";
+const VERSION = "8.4";
 const SITE = "https://atinygreencell.github.io/LowPingNews/";   // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024;     // stop reading a page here
 const TIMEOUT_MS = 10000;
 const MAX_PARAS = 120;
 
-interface Env { SITE?: string }
+interface Env { SITE?: string; TIMEOUT_MS?: string }
 interface Out { v: number; url: string; text: string; complete: boolean; note?: string; error?: string }
 
 // ---- HTML to text (a port of the terminal app's extract) ---------------
@@ -136,9 +136,9 @@ async function readCapped(r: Response): Promise<string> {
   return new TextDecoder("utf-8").decode(all);
 }
 
-async function fetchPage(url: string): Promise<{ html: string; status: number; type: string }> {
+async function fetchPage(url: string, timeoutMs: number): Promise<{ html: string; status: number; type: string }> {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const r = await fetch(url, { redirect: "follow", signal: ac.signal,
       headers: { "User-Agent": "LowPingNewsReader/" + VERSION + " (+github.com/ATinyGreenCell/LowPingNews)",
@@ -156,11 +156,11 @@ async function listed(site: string, cat: string, url: string): Promise<boolean> 
   return Array.isArray(d.items) && d.items.some((x) => Array.isArray(x) && x[3] === url);
 }
 
-export async function read(url: string): Promise<Out> {
+export async function read(url: string, timeoutMs: number = TIMEOUT_MS): Promise<Out> {
   let best: Out = { v: 1, url, text: "", complete: false };
   for (const u of fullTextUrls(url)) {
     let page;
-    try { page = await fetchPage(u); }
+    try { page = await fetchPage(u, timeoutMs); }
     catch (e) { best.error = (e as Error).name === "AbortError" ? "the site took too long" : "the site could not be reached"; continue; }
     if (!page.html) {
       best.error = page.status >= 400 ? "the site answered " + page.status : "not a web page (" + (page.type.split(";")[0] || "unknown") + ")";
@@ -203,7 +203,9 @@ export default {
     let ok = false;
     try { ok = await listed(site, cat, url); } catch { ok = false; }
     if (!ok) return reply({ v: 1, error: "not a story in the app right now" }, 404, allow);
-    const out = await read(url);
+    // an optional TIMEOUT_MS setting, bounded: 0.1 s to 30 s, default 10 s
+    const tmo = Math.min(30000, Math.max(100, Number(env.TIMEOUT_MS) || TIMEOUT_MS));
+    const out = await read(url, tmo);
     if (!out.text) return reply({ v: 1, url, text: "", complete: false, error: out.error || "no readable text on that page" }, 502, allow);
     if (cache) {
       await cache.put(key, new Response(JSON.stringify(out), { headers: { "Cache-Control": "public, max-age=21600" } }));

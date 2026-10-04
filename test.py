@@ -14,6 +14,79 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NEWS = os.path.join(HERE, "news")
 FAILED, RAN = [], 0
 
+# ---------------------------------------------------------------- parallel runs
+# Every test makes its own scratch folders and its own local server, so the
+# suite can run in several processes at once. With no filter given, this
+# process only plans and collects: the longest tests are spread across the
+# workers using timings saved from the last run. LPN_TEST_JOBS=1 runs it serially.
+_CHILD = os.environ.get("LPN_TEST_CHILD") == "1"
+_PLAN = set(json.load(open(os.environ["LPN_TEST_PLAN"]))) if _CHILD and os.environ.get("LPN_TEST_PLAN") else None
+_OUT = os.environ.get("LPN_TEST_OUT") if _CHILD else None
+_TIMES = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "lowpingnews-test-times.json")
+
+
+def _record(name, status, msg, secs):
+    if _OUT:
+        with open(_OUT, "a") as fh:
+            fh.write(json.dumps([name, status, msg, round(secs, 2)]) + "\n")
+
+
+def _run_parallel(jobs):
+    src = io.open(os.path.abspath(__file__), encoding="utf-8").read()
+    names = re.findall(r"^@test\s*\ndef t_(\w+)", src, re.M)
+    try:
+        past = json.load(open(_TIMES))
+    except Exception:
+        past = {}
+    plan = [[] for _ in range(jobs)]
+    load_ = [0.0] * jobs
+    for n in sorted(names, key=lambda n: -float(past.get(n, 1.0))):   # longest first, to the lightest worker
+        k = load_.index(min(load_))
+        plan[k].append(n)
+        load_[k] += float(past.get(n, 1.0))
+    tmp = tempfile.mkdtemp(prefix="lpn-tests-")
+    print("LowPingNews tests (%d at a time; LPN_TEST_JOBS=1 for one)" % jobs)
+    sys.stdout.flush()
+    t0, procs = time.time(), []
+    for k, part in enumerate(plan):
+        pf, of = os.path.join(tmp, "plan%d.json" % k), os.path.join(tmp, "out%d.jsonl" % k)
+        json.dump(part, open(pf, "w"))
+        e = dict(os.environ, LPN_TEST_CHILD="1", LPN_TEST_PLAN=pf, LPN_TEST_OUT=of, PYTHONUNBUFFERED="1")
+        procs.append((subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=e), of, part))
+    results = {}
+    for pr, of, part in procs:
+        rc = pr.wait()
+        got = {}
+        if os.path.exists(of):
+            for ln in open(of):
+                r = json.loads(ln)
+                got[r[0]] = r
+        for n in part:                              # a worker that died takes its tests with it: say so
+            results[n] = got.get(n) or [n, "error", "its worker stopped during or before this test (exit %d)" % rc, 0]
+    shutil.rmtree(tmp, ignore_errors=True)
+    bad = [results[n] for n in names if results[n][1] in ("fail", "error")]
+    skipped = [n for n in names if results[n][1] == "skip"]
+    try:
+        past.update({n: results[n][3] for n in names if results[n][3]})
+        os.makedirs(os.path.dirname(_TIMES), exist_ok=True)
+        json.dump(past, open(_TIMES, "w"))
+    except Exception:
+        pass
+    print("LowPingNews tests")
+    print("  %d run, %d failed%s, %.0fs" % (len(names) - len(skipped), len(bad),
+                                         (", %d skipped" % len(skipped)) if skipped else "", time.time() - t0))
+    for n, st, msg, _s in bad:                      # repeated here, where they cannot scroll away
+        print("  %s  %s\n        %s" % ("FAIL " if st == "fail" else "ERROR", n, msg))
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__" and not _CHILD and len(sys.argv) == 1:
+    # tests mostly wait (on a terminal, a server, a timeout), so even one core
+    # gains from two at once; four is plenty and keeps a phone responsive
+    _jobs = int(os.environ.get("LPN_TEST_JOBS") or max(2, min(4, os.cpu_count() or 1)))
+    if _jobs > 1:
+        _run_parallel(_jobs)
+
 
 def load():
     spec = importlib.util.spec_from_loader("news", SourceFileLoader("news", NEWS))
@@ -233,22 +306,29 @@ def test(fn):
     name = fn.__name__[2:]
     if len(sys.argv) > 1 and sys.argv[1] not in name:
         return fn
+    if _PLAN is not None and name not in _PLAN:
+        return fn                                   # another worker's test
     global RAN
     RAN += 1
     d = None
+    t0_ = time.time()
     try:
         d, env = sandbox()
         fn(env, Server())
         sys.stdout.write("  ok    %s\n" % name)
+        _record(name, "ok", "", time.time() - t0_)
     except Skip as e:
         SKIPPED.append(name)
         sys.stdout.write("  skip  %s\n        %s\n" % (name, e))
+        _record(name, "skip", str(e), time.time() - t0_)
     except AssertionError as e:
         FAILED.append(name)
         sys.stdout.write("  FAIL  %s\n        %s\n" % (name, e))
+        _record(name, "fail", str(e)[:300], time.time() - t0_)
     except Exception as e:
         FAILED.append(name)
         sys.stdout.write("  ERROR %s\n        %s: %s\n" % (name, type(e).__name__, e))
+        _record(name, "error", ("%s: %s" % (type(e).__name__, e))[:300], time.time() - t0_)
     finally:
         if d:
             shutil.rmtree(d, ignore_errors=True)
@@ -2938,6 +3018,8 @@ def t_version_is_consistent(env, srv):
     assert "lowpingnews" in readme.lower()
 
 
+if __name__ == "__main__" and _CHILD:
+    sys.exit(1 if FAILED else 0)                    # the parent prints the summary
 if __name__ == "__main__":
     print("LowPingNews tests")
     print("  %d run, %d failed%s" % (RAN, len(FAILED),

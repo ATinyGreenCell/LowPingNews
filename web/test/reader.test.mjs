@@ -36,8 +36,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (!p) return new Response("nope", { status: 404, headers: { "content-type": "text/html" } });
   return new Response(p.body, { headers: { "content-type": p.type } });
 };
-const ask = (u, origin = ORIGIN, cat = "top", method = "GET") =>
-  W.fetch(new Request("https://reader.example/?cat=" + cat + "&u=" + encodeURIComponent(u), { method, headers: origin ? { Origin: origin } : {} }));
+const ask = (u, origin = ORIGIN, cat = "top", method = "GET", env = {}) =>
+  W.fetch(new Request("https://reader.example/?cat=" + cat + "&u=" + encodeURIComponent(u), { method, headers: origin ? { Origin: origin } : {} }), env);
 
 await test("an article becomes paragraphs of plain text", async () => {
   const r = await ask("https://news.example/a");
@@ -66,9 +66,10 @@ await test("only the app may use it, only for listed stories", async () => {
 await test("non-pages, slow sites and huge pages fail cleanly", async () => {
   const pdf = await ask("https://news.example/pdf");
   assert.equal(pdf.status, 502); assert.match((await pdf.json()).error, /not a web page/);
-  const t0 = Date.now(); const slow = await ask("https://news.example/slow");
+  // the real limit is 10 s; the test sets 0.3 s rather than sit through it
+  const t0 = Date.now(); const slow = await ask("https://news.example/slow", ORIGIN, "top", "GET", { TIMEOUT_MS: "300" });
   assert.equal(slow.status, 502); assert.match((await slow.json()).error, /too long/);
-  assert.ok(Date.now() - t0 < 12000);
+  assert.ok(Date.now() - t0 < 3000, "the timeout setting was ignored");
   const huge = await (await ask("https://news.example/huge")).json();
   assert.ok(huge.text.length <= 2 * 1024 * 1024, "read past the cap");
 });

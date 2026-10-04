@@ -5,7 +5,7 @@
 // A plain script, not a module: classic service workers work in every browser.
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-const VERSION = "8.3";
+const VERSION = "8.4";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
 const FILES = ["./", "./index.html", "./app.js", "./core.js", "./manifest.webmanifest",
