@@ -1,4 +1,4 @@
-export const APP_VERSION = "8.4";
+export const APP_VERSION = "8.5";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;

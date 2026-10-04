@@ -182,7 +182,7 @@ function closeReader() {
     S.reading = null;
     renderNews();
 }
-async function renderReader(it) {
+async function renderReader(it, force = false) {
     const main = $("main");
     const back = el("button", "back", "\u2039 Back");
     back.onclick = () => history.back();
@@ -197,6 +197,8 @@ async function renderReader(it) {
                 body.append(el("p", "", p));
             if (!a.complete)
                 body.append(el("p", "note warn", a.note || "This may be only part of the article."));
+            else if (a.note)
+                body.append(el("p", "note", a.note));
             if (savedAgo >= 0)
                 body.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
         }
@@ -214,7 +216,7 @@ async function renderReader(it) {
         }
     };
     const saved = savedArticle(it.key);
-    if (saved && saved.a.text) {
+    if (!force && saved && saved.a.text && saved.a.complete) {
         show(saved.a, "", now() - saved.t);
         return;
     }
@@ -239,11 +241,16 @@ async function renderReader(it) {
             saveArticle(it.key, a);
             show(a, "", -1);
         }
+        else if (saved && saved.a.text)
+            show(saved.a, "", now() - saved.t);
         else
             show(null, "Could not get the text: " + (a.error || "the reader answered " + r.status) + ".", -1);
     }
     catch {
-        show(null, "Offline: this article has not been saved yet.", -1);
+        if (saved && saved.a.text)
+            show(saved.a, "", now() - saved.t);
+        else
+            show(null, "Offline: this article has not been saved yet.", -1);
     }
 }
 function renderTabs() {
@@ -481,7 +488,7 @@ function start() {
         if (S.view === "weather")
             void showWeather(true);
         else if (S.reading)
-            void renderReader(S.reading);
+            void renderReader(S.reading, true);
         else
             void loadNews(S.view, true);
     };

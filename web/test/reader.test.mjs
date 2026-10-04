@@ -25,12 +25,30 @@ const pages = {
   "https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1.full": { type: "text/html",
     body: "<p>Introduction to the work, long enough to be counted as a paragraph of body text.</p><p>Results section words. " + "r ".repeat(3000) + "</p><p>Methods and Discussion follow here, long enough.</p>" },
 };
-const listedUrls = Object.keys(pages).concat(["https://news.example/slow", "https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1"]);
+const TAGLINE = "bioRxiv - the preprint server for biology, operated by openRxiv, a nonprofit organization dedicated to advancing scientific communication";
+pages["https://news.example/tagline"] = { type: "text/html", body: '<html><head><meta property="og:description" content="' + TAGLINE + '"></head><body><div id="app"></div></body></html>' };
+pages["https://journal.example/paper"] = { type: "text/html", body: '<html><head><meta name="citation_abstract" content="' + "We show that the enzyme converts the pigment. ".repeat(6) + '"></head><body></body></html>' };
+pages["https://blocked.example/a"] = { type: "text/html", body: "<html><head><title>Just a moment...</title></head><body><script src='/cdn-cgi/challenge-platform/x.js'></script></body></html>" };
+const API = {
+  "https://api.biorxiv.org/details/biorxiv/10.1101/2026.10.01.612345/na/json": { collection: [
+    { version: "1", abstract: "Old version abstract.", authors: "A", date: "2026-09-30", category: "plant biology", published: "NA" },
+    { version: "2", abstract: "Violaxanthin de-epoxidases are central to photoprotection.\n\nHere we show a natural alga retains both enzymes.",
+      authors: "Smith, J.; Jones, A.; Lee, K.; Park, S.; Ruiz, M.", date: "2026-10-02", category: "plant biology", published: "10.1038/s41477-026-0001-x" }] },
+  "https://api.biorxiv.org/details/biorxiv/10.1101/339747/na/json": { collection: [{ version: "1", abstract: "An old-style DOI abstract.", authors: "B", date: "2018-06-05", category: "genomics", published: "NA" }] },
+  "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A12345678%20AND%20SRC%3AMED&resultType=core&format=json&pageSize=1":
+    { resultList: { result: [{ abstractText: "<h4>Background</h4>Plants make pigments.<h4>Results</h4>We found &amp; characterised an enzyme.",
+      authorString: "Smith J, Jones A", journalTitle: "Plant Cell", pubYear: "2026" }] } },
+};
+const listedUrls = Object.keys(pages).concat(["https://news.example/slow", "https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1",
+  "http://biorxiv.org/cgi/content/short/2026.10.01.612345v2?rss=1", "https://www.biorxiv.org/content/10.1101/339747v1",
+  "https://europepmc.org/article/MED/12345678"]);
 let fetched = [];
 globalThis.fetch = async (url, init = {}) => {
   url = String(url); fetched.push(url);
   if (url === SITE + "data/top.json") return new Response(JSON.stringify({ v: 1, items: listedUrls.map((u, i) => [0, "t" + i, "", u, 0]) }), { headers: { "content-type": "application/json" } });
   if (url.startsWith(SITE + "data/")) return new Response("", { status: 404 });
+  if (url in API) return new Response(JSON.stringify(API[url]), { headers: { "content-type": "application/json" } });
+  if (url.startsWith("https://api.biorxiv.org/") || url.startsWith("https://www.ebi.ac.uk/")) return new Response("{}", { status: 404 });
   if (url === "https://news.example/slow") return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))));
   const p = pages[url];
   if (!p) return new Response("nope", { status: 404, headers: { "content-type": "text/html" } });
@@ -78,6 +96,38 @@ await test("bioRxiv: the full text page is tried first", async () => {
   const d = await (await ask("https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1")).json();
   assert.ok(fetched.includes("https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1.full"));
   assert.ok(d.complete, "a paper with its sections is complete");
+});
+await test("a bioRxiv RSS link gets the API's abstract, latest version, authors and journal", async () => {
+  fetched = [];
+  const d = await (await ask("http://biorxiv.org/cgi/content/short/2026.10.01.612345v2?rss=1")).json();
+  assert.ok(fetched.includes("https://api.biorxiv.org/details/biorxiv/10.1101/2026.10.01.612345/na/json"));
+  assert.ok(!fetched.some((u) => u.includes("www.biorxiv.org")), "scraped the page despite the API answering");
+  assert.ok(d.complete && /This is the abstract/.test(d.note));
+  const p = d.text.split("\n\n");
+  assert.match(p[0], /^Smith, J\.; Jones, A\.; Lee, K\. and 2 more \u00b7 Plant biology \u00b7 posted 2026-10-02 \u00b7 version 2$/);
+  assert.equal(p[1], "Violaxanthin de-epoxidases are central to photoprotection.");
+  assert.ok(!d.text.includes("Old version"), "an older version's abstract was used");
+  assert.match(d.text, /Since published: https:\/\/doi\.org\/10\.1038/);
+});
+await test("old six-digit bioRxiv DOIs work too", async () => {
+  const d = await (await ask("https://www.biorxiv.org/content/10.1101/339747v1")).json();
+  assert.match(d.text, /An old-style DOI abstract/);
+});
+await test("Europe PMC: the abstract in sections, entities decoded", async () => {
+  const d = await (await ask("https://europepmc.org/article/MED/12345678")).json();
+  assert.deepEqual(d.text.split("\n\n"), ["Smith J; Jones A \u00b7 Plant Cell \u00b7 2026", "Background", "Plants make pigments.",
+                                         "Results", "We found & characterised an enzyme."]);
+});
+await test("a site-wide tagline is never passed off as the article", async () => {
+  const r = await ask("https://news.example/tagline");
+  assert.equal(r.status, 502);
+  assert.ok(!JSON.stringify(await r.json()).includes("nonprofit"));
+  const j = await (await ask("https://journal.example/paper")).json();
+  assert.match(j.text, /^We show that the enzyme converts the pigment/, "a journal's citation_abstract should be used");
+});
+await test("an anti-bot page is named, not read", async () => {
+  const r = await ask("https://blocked.example/a");
+  assert.equal(r.status, 502); assert.match((await r.json()).error, /blocked automated reading/);
 });
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");

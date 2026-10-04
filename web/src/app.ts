@@ -157,7 +157,7 @@ function closeReader(): void {
   renderNews();
 }
 
-async function renderReader(it: Item): Promise<void> {
+async function renderReader(it: Item, force = false): Promise<void> {
   const main = $("main");
   const back = el("button", "back", "\u2039 Back");
   back.onclick = () => history.back();
@@ -170,6 +170,7 @@ async function renderReader(it: Item): Promise<void> {
     if (a && a.text) {
       for (const p of a.text.split("\n\n")) body.append(el("p", "", p));
       if (!a.complete) body.append(el("p", "note warn", a.note || "This may be only part of the article."));
+      else if (a.note) body.append(el("p", "note", a.note));          // e.g. "This is the abstract."
       if (savedAgo >= 0) body.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
     } else {
       if (it.summary) body.append(el("p", "", it.summary));
@@ -181,8 +182,10 @@ async function renderReader(it: Item): Promise<void> {
       body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
     }
   };
+  // a complete saved copy is reused; a partial one (a paywall, a tagline, an
+  // older reader's best effort) is fetched again, and kept only for offline
   const saved = savedArticle(it.key);
-  if (saved && saved.a.text) { show(saved.a, "", now() - saved.t); return; }
+  if (!force && saved && saved.a.text && saved.a.complete) { show(saved.a, "", now() - saved.t); return; }
   const reader = S.digest ? S.digest.reader : "";
   if (!it.link) { show(null, "This feed gives no link to the full article.", -1); return; }
   if (!reader) { show(null, "Full-text reading is not set up for this app yet.", -1); return; }
@@ -192,9 +195,11 @@ async function renderReader(it: Item): Promise<void> {
     try { raw = await r.json(); } catch { /* not JSON */ }
     const a = parseArticle(raw);
     if (a.text) { saveArticle(it.key, a); show(a, "", -1); }
+    else if (saved && saved.a.text) show(saved.a, "", now() - saved.t);
     else show(null, "Could not get the text: " + (a.error || "the reader answered " + r.status) + ".", -1);
   } catch {
-    show(null, "Offline: this article has not been saved yet.", -1);
+    if (saved && saved.a.text) show(saved.a, "", now() - saved.t);
+    else show(null, "Offline: this article has not been saved yet.", -1);
   }
 }
 
@@ -411,7 +416,7 @@ async function renderForecast(sp: Spot, box: HTMLElement, force: boolean): Promi
 function start(): void {
   $("refresh").onclick = () => {
     if (S.view === "weather") void showWeather(true);
-    else if (S.reading) void renderReader(S.reading);
+    else if (S.reading) void renderReader(S.reading, true);         // in an article: fetch it afresh
     else void loadNews(S.view, true);
   };
   $("update").onclick = () => location.reload();

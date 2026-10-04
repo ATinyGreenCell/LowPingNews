@@ -8,7 +8,7 @@
 //
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
-const VERSION = "8.4";
+const VERSION = "8.5";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -94,8 +94,13 @@ export function metaFallback(html) {
         if (body.length > 200)
             return body;
     }
-    for (const re of [/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{80,})/i,
-        /<meta[^>]+name=["']description["'][^>]+content=["']([^"']{80,})/i]) {
+    // journals and preprint servers tag the abstract itself; a page's general
+    // description is often a site-wide tagline ("bioRxiv - the preprint server
+    // for biology..."), so it must be long to count
+    for (const re of [/<meta[^>]+name=["']citation_abstract["'][^>]+content=["']([^"']{80,})/i,
+        /<meta[^>]+name=["']dc\.description["'][^>]+content=["']([^"']{80,})/i,
+        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{160,})/i,
+        /<meta[^>]+name=["']description["'][^>]+content=["']([^"']{160,})/i]) {
         const d = re.exec(html);
         if (d)
             return tidy(d[1]);
@@ -113,6 +118,73 @@ export function looksComplete(txt, url) {
         return marks >= 2 && txt.length > 4000;
     }
     return txt.length > 1200 && paras.length >= 4;
+}
+/** An anti-bot "checking your browser" page: there is no article on it. */
+export function isChallenge(html) {
+    return /<title>\s*(Just a moment|Attention Required|Access denied|Please wait)/i.test(html) ||
+        /challenge-platform|cf-chl-|cf_chl_opt|captcha-delivery/i.test(html.slice(0, 20000));
+}
+// ---- preprints and papers: their own APIs beat scraping -----------------
+const PREPRINT = /^https?:\/\/(?:www\.|connect\.)?(biorxiv|medrxiv)\.org\/(?:content\/|cgi\/content\/(?:short|abstract|full)\/)(?:10\.1101\/)?(\d{4}\.\d{2}\.\d{2}\.\d{5,8}|\d{6})(?:v\d+)?/i;
+const EPMC = /^https?:\/\/(?:www\.)?europepmc\.org\/(?:abstract|article)\/(MED|PMC|PPR|AGR|CBA|CTX|ETH|HIR|PAT)\/([A-Za-z0-9]{1,20})/i;
+export function preprintDoi(u) {
+    const m = PREPRINT.exec(u);
+    return m ? { server: m[1].toLowerCase(), doi: "10.1101/" + m[2] } : null;
+}
+function getJSON(url, timeoutMs) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    return fetch(url, { signal: ac.signal, headers: { Accept: "application/json",
+            "User-Agent": "LowPingNewsReader/" + VERSION + " (+github.com/ATinyGreenCell/LowPingNews)" } })
+        .then((r) => (r.ok ? r.json() : null)).finally(() => clearTimeout(timer));
+}
+const authorsShort = (a) => {
+    const names = a.split(/;\s*/).map((x) => x.trim()).filter(Boolean);
+    return names.length > 3 ? names.slice(0, 3).join("; ") + " and " + (names.length - 3) + " more" : names.join("; ");
+};
+/** bioRxiv/medRxiv: the official API's abstract, authors and dates. */
+export async function preprintAbstract(u, timeoutMs) {
+    const id = preprintDoi(u);
+    if (!id)
+        return null;
+    const d = await getJSON("https://api." + id.server + ".org/details/" + id.server + "/" + id.doi + "/na/json", timeoutMs)
+        .catch(() => null);
+    const all = d && Array.isArray(d.collection) ? d.collection : [];
+    const p = all[all.length - 1]; // the latest posted version
+    const abs = p && typeof p.abstract === "string" ? p.abstract : "";
+    if (!abs.trim())
+        return null;
+    const str = (k) => (p && typeof p[k] === "string" ? tidy(p[k]) : "");
+    const meta = [authorsShort(str("authors")), str("category") && str("category")[0].toUpperCase() + str("category").slice(1),
+        str("date") && "posted " + str("date"), str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
+    const paras = [meta, ...abs.split(/\n\s*\n/).map(tidy)].filter(Boolean);
+    const pub = str("published");
+    if (pub && pub !== "NA")
+        paras.push("Since published: https://doi.org/" + pub);
+    const host = id.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+    return { v: 1, url: u, text: paras.join("\n\n"), complete: true,
+        note: "This is the abstract. The full paper is on " + host + ": open the original page." };
+}
+/** Europe PMC: its REST API's abstract. */
+export async function epmcAbstract(u, timeoutMs) {
+    const m = EPMC.exec(u);
+    if (!m)
+        return null;
+    const q = encodeURIComponent("EXT_ID:" + m[2] + " AND SRC:" + m[1].toUpperCase());
+    const d = await getJSON("https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=" + q +
+        "&resultType=core&format=json&pageSize=1", timeoutMs).catch(() => null);
+    const r = d && d.resultList && Array.isArray(d.resultList.result) ? d.resultList.result[0] : null;
+    const html = r && typeof r.abstractText === "string" ? r.abstractText : "";
+    if (!html.trim())
+        return null;
+    // abstracts come as light HTML: <h4>Background</h4> sections, <p>, <br>
+    const paras = html.replace(/<\/?(h\d|p|br|div)[^>]*>/gi, "\n\n").replace(/<[^>]+>/g, "")
+        .split(/\n\s*\n/).map(tidy).filter(Boolean);
+    const meta = [typeof r.authorString === "string" ? authorsShort(tidy(r.authorString.replace(/,\s*/g, "; "))) : "",
+        typeof r.journalTitle === "string" ? tidy(r.journalTitle) : "",
+        typeof r.pubYear === "string" ? tidy(r.pubYear) : ""].filter(Boolean).join(" \u00b7 ");
+    return { v: 1, url: u, text: [meta, ...paras].filter(Boolean).join("\n\n"), complete: true,
+        note: "This is the abstract. Open the original page for the full paper, where it is free to read." };
 }
 /** Where a site keeps the whole article, best first. */
 export function fullTextUrls(u) {
@@ -194,6 +266,10 @@ async function listed(site, cat, url) {
     return Array.isArray(d.items) && d.items.some((x) => Array.isArray(x) && x[3] === url);
 }
 export async function read(url, timeoutMs = TIMEOUT_MS) {
+    // a paper's own API first: clean, reliable, and never an anti-bot wall
+    const api = (await preprintAbstract(url, timeoutMs).catch(() => null)) || (await epmcAbstract(url, timeoutMs).catch(() => null));
+    if (api)
+        return api;
     let best = { v: 1, url, text: "", complete: false };
     for (const u of fullTextUrls(url)) {
         let page;
@@ -206,6 +282,10 @@ export async function read(url, timeoutMs = TIMEOUT_MS) {
         }
         if (!page.html) {
             best.error = page.status >= 400 ? "the site answered " + page.status : "not a web page (" + (page.type.split(";")[0] || "unknown") + ")";
+            continue;
+        }
+        if (isChallenge(page.html)) {
+            best.error = "the site blocked automated reading";
             continue;
         }
         const text = extract(page.html);

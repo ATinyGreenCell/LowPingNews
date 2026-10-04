@@ -86,6 +86,13 @@ an open proxy.
 
 Until then, a story shows its summary and a link to the original page.
 
+Preprints and papers are read through their own services rather than their web
+pages: bioRxiv and medRxiv links through api.biorxiv.org, Europe PMC links
+through its REST API. You get the authors, the posting date and version, and
+the abstract (labelled as such); bioRxiv's pages sit behind an anti-bot check
+that would otherwise return only the site's tagline. When the reader updates,
+paste the new `web/reader/reader.js` into the Worker again and Deploy.
+
 The app is TypeScript in `web/src`, compiled to plain JavaScript in `web/static`
 (no frameworks, no dependencies); `web/build_digest.py` builds the news files.
 Scheduled builds stop if the repository sees no activity for 60 days; the app
