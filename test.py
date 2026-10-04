@@ -3009,6 +3009,114 @@ def t_sync_takes_the_web_archive_only_when_it_matches(env, srv):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+class _FakeCloudflare:
+    """Just enough of api.cloudflare.com to deploy a Worker: GET, PUT, POST."""
+    def __init__(self, good="T" * 40, refuse=False):
+        import http.server, socketserver, threading
+        outer, self.good, self.refuse, self.uploads, self.calls = self, good, refuse, [], []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _reply(self, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def _any(self):
+                outer.calls.append((self.command, self.path))
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if self.headers.get("Authorization") != "Bearer " + outer.good:
+                    return self._reply({"success": False, "errors": [{"message": "Invalid API Token"}]})
+                p = self.path.split("?")[0]
+                if p.endswith("/user/tokens/verify"):
+                    return self._reply({"success": True})
+                if p.endswith("/accounts"):
+                    return self._reply({"success": True, "result": [{"id": "acct0123abcd"}]})
+                if p.endswith("/workers/scripts/lowpingnews-reader") and self.command == "PUT":
+                    outer.uploads.append((dict(self.headers), body))
+                    if outer.refuse:
+                        return self._reply({"success": False, "errors": [{"message": "Script too large"}]})
+                    return self._reply({"success": True})
+                if p.endswith("/subdomain") and self.command == "POST":
+                    return self._reply({"success": True})
+                if p.endswith("/accounts/acct0123abcd/workers/subdomain"):
+                    return self._reply({"success": True, "result": {"subdomain": "sebastian"}})
+                self._reply({"success": False, "errors": [{"message": "unexpected " + p}]})
+            do_GET = do_PUT = do_POST = _any
+
+        class TS(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+        self.httpd = TS(("127.0.0.1", 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.api = "http://127.0.0.1:%d/client/v4" % self.httpd.server_address[1]
+
+
+@test
+def t_the_reader_deploys_from_the_terminal(env, srv):
+    tmp = tempfile.mkdtemp()
+    try:
+        repo = os.path.join(tmp, "repo")                 # no .git: can never touch a real repository
+        os.makedirs(os.path.join(repo, "web", "reader"))
+        reader = os.path.join(WEB, "reader", "reader.js")
+        shutil.copy(reader, os.path.join(repo, "web", "reader", "reader.js"))
+        rv = re.search(r'const VERSION = "([^"]+)"', io.open(reader).read()).group(1)
+        cf = _FakeCloudflare()
+        base = dict(env, LPN_REPO=repo, LPN_CF_API=cf.api, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"),
+                    LPN_CF_VERIFY_TRIES="0", HOME=tmp)
+
+        def deploy(**extra):
+            r = subprocess.run(["sh", os.path.join(HERE, "lowpingnews"), "reader", "deploy"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(base, **extra), timeout=60)
+            return r.returncode, r.stdout.decode("utf-8", "replace")
+        rc, out = deploy(CLOUDFLARE_API_TOKEN="not a token!")
+        assert rc != 0 and "does not look like" in out and not cf.uploads, out
+        rc, out = deploy(CLOUDFLARE_API_TOKEN="X" * 40)
+        assert rc != 0 and "did not accept" in out and not cf.uploads, out
+        rc, out = deploy()
+        assert rc != 0 and "in a terminal once" in out, "no token and no terminal: say how, do not hang"
+        rc, out = deploy(CLOUDFLARE_API_TOKEN="T" * 40)
+        assert rc == 0, out
+        assert "reader v%s uploaded to https://lowpingnews-reader.sebastian.workers.dev" % rv in out, out
+        hdrs, body = cf.uploads[-1]
+        assert hdrs.get("Content-Type", "").startswith("multipart/form-data")
+        assert b'name="metadata"' in body and b'"main_module":"reader.js"' in body
+        assert b'name="reader.js"' in body and b"application/javascript+module" in body
+        assert io.open(reader, "rb").read() in body, "the reader was not uploaded whole"
+        state = os.path.join(tmp, "cfg", "lowpingnews", "reader-deployed")
+        assert os.path.exists(state), "the deployed version should be remembered"
+        cf.refuse = True
+        rc, out = deploy(CLOUDFLARE_API_TOKEN="T" * 40)
+        assert rc != 0 and "refused the upload: Script too large" in out, out
+        # the first real run: the token pasted at a hidden prompt, then remembered
+        import pty, select, stat
+        cf.refuse = False
+        shutil.rmtree(os.path.join(tmp, "cfg"), ignore_errors=True)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ.update(base)
+            os.execvp("sh", ["sh", os.path.join(HERE, "lowpingnews"), "reader", "deploy"])
+        seen = _read_until(fd, lambda b: b"token (hidden):" in b, most=20.0)
+        os.write(fd, ("T" * 40 + "\n").encode())
+        seen += _read_until(fd, lambda b: b"uploaded" in b or b"lowpingnews:" in b, most=30.0)
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        assert b"uploaded" in seen and b"T" * 40 not in seen, "the token must not be echoed: %r" % seen[-300:]
+        tf = os.path.join(tmp, "cfg", "lowpingnews", "cloudflare-token")
+        assert stat.S_IMODE(os.stat(tf).st_mode) == 0o600, "the token file must be readable only by its owner"
+        n = len(cf.uploads)
+        rc, out = deploy()                                  # no token given: the saved one is used
+        assert rc == 0 and len(cf.uploads) == n + 1 and "token (hidden)" not in out, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @test
 def t_version_is_consistent(env, srv):
     m = load()

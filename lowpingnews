@@ -367,6 +367,11 @@ cmd_release() {
     say "gh not installed - tag pushed, create the release on the web"
   fi
   say "released v$v"
+  # the reader changed and a token is saved: deploy it too, so it never lags
+  if [ -f "$REPO/web/reader/reader.js" ] && { [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || [ -f "$CF_TOKEN_FILE" ]; } \
+     && [ "$(reader_sum)" != "$(cat "$CF_STATE" 2>/dev/null)" ]; then
+    ( cmd_reader_deploy ) || say "(the reader was not deployed; try: lowpingnews reader deploy)"
+  fi
 }
 
 set_shebang() {   # portable: sed -i takes different arguments on GNU and BSD (macOS)
@@ -460,7 +465,109 @@ cmd_web() {
   say "in a few minutes: https://$(echo "$owner" | tr 'A-Z' 'a-z').github.io/$repo/"
 }
 
+# ---- the article reader on Cloudflare: deployed from here, no web editor ----
+CF_API="${LPN_CF_API:-https://api.cloudflare.com/client/v4}"
+CF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/lowpingnews"
+CF_TOKEN_FILE="$CF_DIR/cloudflare-token"
+CF_STATE="$CF_DIR/reader-deployed"        # checksum of the reader last deployed
+READER_NAME="${LPN_READER_NAME:-lowpingnews-reader}"
+
+cf_json() {   # cf_json a.0.b < json  ->  that value, or nothing
+  "$PY" -c 'import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k in sys.argv[1].split("."):
+    if isinstance(d, list) and k.isdigit():
+        d = d[int(k)] if int(k) < len(d) else None
+    elif isinstance(d, dict):
+        d = d.get(k)
+    else:
+        d = None
+if d is not None:
+    print(str(d).lower() if isinstance(d, bool) else d)' "$1"
+}
+cf_call() { curl -sS --max-time 60 -H "Authorization: Bearer $tok" "$@"; }
+
+cf_token() {
+  tok="${CLOUDFLARE_API_TOKEN:-}"
+  [ -n "$tok" ] || { [ -f "$CF_TOKEN_FILE" ] && tok="$(cat "$CF_TOKEN_FILE")"; }
+  new_tok=0
+  if [ -z "$tok" ]; then
+    [ -t 0 ] || die "no Cloudflare token yet: run  lowpingnews reader deploy  in a terminal once"
+    say "Paste a Cloudflare API token made from the \"Edit Cloudflare Workers\" template"
+    say "(Cloudflare: My Profile > API Tokens > Create Token). Kept in $CF_TOKEN_FILE, readable only by you."
+    # echo off BEFORE the prompt shows: anything pasted the moment it appears
+    # (or typed ahead) would otherwise be printed to the screen
+    stty -echo 2>/dev/null
+    trap 'stty echo 2>/dev/null' EXIT INT TERM
+    printf "  token (hidden): "; read -r tok; stty echo 2>/dev/null; trap - EXIT INT TERM; echo
+    new_tok=1
+  fi
+  tok="$(printf '%s' "$tok" | tr -d ' \r\n\t')"
+  case "$tok" in ""|*[!A-Za-z0-9_-]*) die "that does not look like a Cloudflare API token" ;; esac
+  [ ${#tok} -ge 30 ] || die "that is too short to be a Cloudflare API token"
+  [ "$(cf_call "$CF_API/user/tokens/verify" | cf_json success)" = "true" ] \
+    || die "Cloudflare did not accept that token (mistyped, expired or revoked)"
+  if [ "$new_tok" = 1 ]; then
+    mkdir -p "$CF_DIR" && (umask 077; printf '%s\n' "$tok" > "$CF_TOKEN_FILE") && chmod 600 "$CF_TOKEN_FILE"
+    say "token checked and saved"
+  fi
+}
+
+cf_account() {
+  acct="${CLOUDFLARE_ACCOUNT_ID:-}"
+  [ -n "$acct" ] || acct="$(cf_call "$CF_API/accounts?per_page=5" | cf_json result.0.id)"
+  case "$acct" in ""|*[!A-Za-z0-9]*) die "could not find your Cloudflare account with that token
+  (the \"Edit Cloudflare Workers\" template includes the access this needs)" ;; esac
+}
+
+reader_sum() { cksum < "$REPO/web/reader/reader.js" 2>/dev/null | cut -d' ' -f1; }
+
+cmd_reader_deploy() {
+  f="$REPO/web/reader/reader.js"
+  [ -f "$f" ] || die "no $f - run lpn sync for the web app first"
+  rv="$(sed -n 's/^const VERSION = "\(.*\)";/\1/p' "$f" | head -1)"
+  { [ -n "$rv" ] && grep -q "export default" "$f"; } || die "$f does not look like the reader"
+  command -v curl >/dev/null 2>&1 || die "needs curl (pkg install curl)"
+  cf_token
+  cf_account
+  out="$(cf_call -X PUT "$CF_API/accounts/$acct/workers/scripts/$READER_NAME" \
+    -F "metadata={\"main_module\":\"reader.js\",\"compatibility_date\":\"2024-09-23\"};type=application/json" \
+    -F "reader.js=@$f;type=application/javascript+module")" || die "could not reach Cloudflare"
+  if [ "$(printf '%s' "$out" | cf_json success)" != "true" ]; then
+    die "Cloudflare refused the upload: $(printf '%s' "$out" | cf_json errors.0.message)"
+  fi
+  # its workers.dev address: on (a new Worker can start with it off), then found
+  cf_call -X POST "$CF_API/accounts/$acct/workers/scripts/$READER_NAME/subdomain" \
+    -H "Content-Type: application/json" --data '{"enabled":true}' >/dev/null 2>&1 || true
+  sub="$(cf_call "$CF_API/accounts/$acct/workers/subdomain" | cf_json result.subdomain)"
+  mkdir -p "$CF_DIR" && reader_sum > "$CF_STATE"
+  url=""
+  case "$sub" in ""|*[!A-Za-z0-9-]*) ;; *) url="https://$READER_NAME.$sub.workers.dev" ;; esac
+  say "reader v$rv uploaded${url:+ to $url}"
+  [ -n "$url" ] || return 0
+  # live? the reader names its version in every answer
+  slug="$(git -C "$REPO" remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\([^/]*/[^/.]*\).*#\1#p')"
+  origin="https://$(echo "${slug%%/*}" | tr 'A-Z' 'a-z').github.io"
+  n=0; live=""
+  while [ "$n" -lt "${LPN_CF_VERIFY_TRIES:-4}" ]; do
+    live="$(curl -s -o /dev/null -D - --max-time 8 -H "Origin: $origin" "$url/?cat=top&u=https%3A%2F%2Fexample.org%2F" 2>/dev/null \
+            | tr -d '\r' | sed -n 's/^[Xx]-[Ll][Pp][Nn]-[Rr]eader: *//p' | head -1)"
+    [ "$live" = "$rv" ] && break
+    n=$((n + 1)); sleep 2
+  done
+  if [ "$live" = "$rv" ]; then say "v$rv is live"
+  else say "(not answering as v$rv yet - Cloudflare can take a minute; nothing else to do)"; fi
+  # first deploy, or a new address: tell the app where its reader is
+  if [ -n "$slug" ] && command -v gh >/dev/null 2>&1; then
+    [ "$(gh variable get READER_URL -R "$slug" 2>/dev/null)" = "$url" ] || cmd_reader "$url"
+  fi
+}
+
 cmd_reader() {   # cmd_reader URL: point the web app at its article reader
+  if [ "${1:-}" = "deploy" ]; then cmd_reader_deploy; return; fi
   command -v gh >/dev/null 2>&1 || die "needs gh (pkg install gh), signed in: gh auth login"
   case "${1:-}" in https://*) ;; *) die "usage: lowpingnews reader https://lowpingnews-reader.NAME.workers.dev" ;; esac
   slug="$(git -C "$REPO" remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\([^/]*/[^/.]*\).*#\1#p')"
@@ -507,6 +614,7 @@ dev:
   update          install the latest release from GitHub
   web             put the phone web app online (GitHub Pages) and print its address
   reader URL      give the web app its article reader (a Cloudflare Worker)
+  reader deploy   upload the article reader to Cloudflare (asks for an API token once)
   status          installed / repo / newest download / git, and flag mismatches
   sync            newest VALID download -> repo -> install  (never picks by filename)
   install         repo -> PATH, verifying the version actually landed

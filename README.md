@@ -78,11 +78,15 @@ address, and only for links in the app's current headline files, so it is not
 an open proxy.
 
 1. Sign up at dash.cloudflare.com (free plan).
-2. Workers & Pages > Create > Create Worker, name it `lowpingnews-reader`, Deploy.
-3. Edit code: replace everything with the contents of
-   `https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/web/reader/reader.js`
-   (open it in the phone's browser, select all, copy), then Deploy.
-4. Copy the Worker's address and tell the app: `lpn reader https://lowpingnews-reader.NAME.workers.dev`
+2. Make an API token: My Profile > API Tokens > Create Token > use the
+   **Edit Cloudflare Workers** template > Continue > Create Token. Copy it.
+3. In Termux: `lpn reader deploy`, and paste the token when asked (it is
+   hidden as you paste, checked with Cloudflare, and kept in your config folder,
+   readable only by you).
+
+That uploads the reader, finds its address, confirms the new version is live,
+and points the app at it. After that, `lpn release` redeploys the reader by
+itself whenever it has changed - no Cloudflare editor, no copying and pasting.
 
 Until then, a story shows its summary and a link to the original page.
 
@@ -90,8 +94,8 @@ Preprints and papers are read through their own services rather than their web
 pages: bioRxiv and medRxiv links through api.biorxiv.org, Europe PMC links
 through its REST API. You get the authors, the posting date and version, and
 the abstract (labelled as such); bioRxiv's pages sit behind an anti-bot check
-that would otherwise return only the site's tagline. When the reader updates,
-paste the new `web/reader/reader.js` into the Worker again and Deploy.
+that would otherwise return only the site's tagline. `lpn release` keeps the
+deployed reader up to date.
 
 The app is TypeScript in `web/src`, compiled to plain JavaScript in `web/static`
 (no frameworks, no dependencies); `web/build_digest.py` builds the news files.

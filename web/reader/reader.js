@@ -8,7 +8,7 @@
 //
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
-const VERSION = "8.5";
+const VERSION = "8.6";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -303,7 +303,8 @@ export async function read(url, timeoutMs = TIMEOUT_MS) {
 }
 function reply(body, status, origin, cache = 0) {
     const h = new Headers({ "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": origin,
-        Vary: "Origin", "X-Content-Type-Options": "nosniff" });
+        Vary: "Origin", "X-Content-Type-Options": "nosniff", "X-LPN-Reader": VERSION,
+        "Access-Control-Expose-Headers": "X-LPN-Reader" });
     h.set("Cache-Control", cache ? "public, max-age=" + cache : "no-store");
     return new Response(JSON.stringify(body), { status, headers: h });
 }
@@ -313,7 +314,7 @@ export default {
         const allow = new URL(site).origin;
         const origin = req.headers.get("Origin") || "";
         if (origin !== allow)
-            return new Response("This reader serves the LowPingNews app only.", { status: 403 });
+            return new Response("This reader serves the LowPingNews app only.", { status: 403, headers: { "X-LPN-Reader": VERSION } });
         if (req.method === "OPTIONS") {
             return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": allow, "Access-Control-Allow-Methods": "GET",
                     "Access-Control-Max-Age": "86400", Vary: "Origin" } });
