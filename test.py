@@ -132,7 +132,40 @@ class Server(object):
         self.routes[path] = handler
 
 
-def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",), raw=False):
+def _read_until(fd, done=None, least=0.0, quiet=0.6, most=20.0, settle_after=None):
+    """Read a pty until `done(bytes)` is true, or - without `done` - until the
+    program has been quiet for `quiet` seconds after at least `least`. Fixed
+    sleeps passed on a fast machine and failed mid-suite on a warm phone."""
+    import select
+    out, start, last = b"", time.time(), time.time()
+    while True:
+        now = time.time()
+        if now - start >= most:
+            return out
+        if done is not None and done(out):
+            return out
+        # a screen too small to show the awaited text: accept one that has
+        # drawn something and then stayed still for a good while
+        if done is not None and settle_after is not None and out and \
+                now - start >= settle_after and now - last >= 1.5:
+            return out
+        # quiet counts from the last output or, if a key drew nothing at all
+        # (Enter on an empty list), from when we started waiting
+        if done is None and now - start >= least and now - last >= quiet:
+            return out
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return out
+            if not chunk:
+                return out
+            out += chunk
+            last = time.time()
+
+
+def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",), raw=False, ready=None):
     """Run the curses interface on a pty and feed it real keystrokes."""
     import fcntl, pty, select, struct, termios
     pid, fd = pty.fork()
@@ -153,13 +186,18 @@ def _drive_tui(env, keys, rows=24, cols=64, settle=0.7, args=("--tui",), raw=Fal
                 except OSError:
                     break
         return out
-    buf += pump(2.0)
+    # until the first full screen: its key line ends in "quit" (reader) or
+    # "back" (feed editor). Quiet alone is not enough - startup has a silent
+    # stretch while the first load runs.
+    buf += _read_until(fd, ready or (lambda b: b"quit" in b or b"q back" in b), most=20.0,
+                       settle_after=None if ready else 3.0)
+    buf += _read_until(fd, least=0.2, quiet=0.3, most=3.0)
     for k in keys:
         try:
             os.write(fd, k)
         except OSError:
             break
-        buf += pump(settle)
+        buf += _read_until(fd, least=settle, quiet=0.4, most=10.0)
     try:
         os.close(fd)
     except Exception:
@@ -183,6 +221,14 @@ def item(title, when=None, body="Summary text.", link=NOWHERE + "/a"):
             "<description>%s</description>%s</item>" % (title, link, body, d))
 
 
+class Skip(Exception):
+    """A test that needs something optional which is not installed. Reported
+    as skipped, with the reason; never counted as a pass or a failure."""
+
+
+SKIPPED = []
+
+
 def test(fn):
     name = fn.__name__[2:]
     if len(sys.argv) > 1 and sys.argv[1] not in name:
@@ -194,6 +240,9 @@ def test(fn):
         d, env = sandbox()
         fn(env, Server())
         sys.stdout.write("  ok    %s\n" % name)
+    except Skip as e:
+        SKIPPED.append(name)
+        sys.stdout.write("  skip  %s\n        %s\n" % (name, e))
     except AssertionError as e:
         FAILED.append(name)
         sys.stdout.write("  FAIL  %s\n        %s\n" % (name, e))
@@ -773,7 +822,9 @@ def t_ping_meter_picks_fastest_and_survives_outage(env, srv):
     pm = m.PingMeter(every=5, refs=(("127.0.0.1", 1, "dead"), ("127.0.0.1", port, "live")))
     pm.every = 0.05
     pm.start()
-    time.sleep(0.6)
+    end = time.time() + 8                     # poll: a warm phone is slower, not wrong
+    while time.time() < end and pm.reading()[3] != "ok":
+        time.sleep(0.1)
     ms, _smp, ref, state = pm.reading()
     pm.close()
     assert state == "ok" and ref == "live", (state, ref)
@@ -976,7 +1027,9 @@ def t_tui_banner_shows_data_age(env, srv):
     _restamp(env, "a", time.time() - 5 * 3600)
     srv.routes.clear()
     e = dict(env); e["LPN_NO_PING"] = "1"
-    out = _drive_tui(e, [b"q"], cols=80)
+    # wait for the load to finish, not for a guessed time: on a slow phone the
+    # first screen appears well before the stale note does
+    out = _drive_tui(e, [b"q"], cols=80, ready=lambda b: b"stale" in b)
     assert "stale 5h" in out, "TUI hid that its data was 5h old"
 
 
@@ -1005,10 +1058,10 @@ def t_tui_refreshes_stale_data_on_its_own(env, srv):
                     buf[0] += os.read(fd, 65536)
                 except OSError:
                     return
-    pump(2.0)
+    buf[0] += _read_until(fd, lambda b: b"Morning edition" in b)
     mark = len(buf[0])
     ver[0] = ["Evening edition %d" % i for i in range(3)] + ver[0]
-    pump(6.0)
+    buf[0] += _read_until(fd, lambda b: b"Evening edition" in b and b"Morning edition" in b, most=25.0)
     try:
         os.write(fd, b"q")
     except OSError:
@@ -1153,7 +1206,9 @@ def t_idle_reader_spends_nothing(env, srv):
     pump(6.0)                                    # stale, but nobody is looking
     idle = len(srv.seen) - at_open
     os.write(fd, b"j")                           # someone is back
-    pump(4.0)
+    deadline = time.time() + 15                   # until it refreshes, however slow
+    while len(srv.seen) <= at_open + idle and time.time() < deadline:
+        pump(0.2)
     back = len(srv.seen) - at_open - idle
     try:
         os.write(fd, b"q")
@@ -1896,19 +1951,104 @@ def t_weather_icons_are_one_cell_glyphs(env, srv):
     assert max(len(n) for n, _i in m.WMO.values()) <= 14
 
 
+def _tui_frames(env, keys, cols=48, rows=24, pause=0.5, args=("--tui",)):
+    """Screens after each key, read from pyte's buffer: its .display helper
+    breaks on overwritten double-width characters."""
+    import fcntl, pty, select, struct, termios
+    try:
+        import pyte                      # a terminal emulator: only these tests need it
+    except ImportError:
+        raise Skip("needs the pyte terminal emulator: pip install pyte")
+    scr = pyte.Screen(cols, rows)
+    st_ = pyte.ByteStream(scr)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(env)
+        os.execv(NEWS, ["news"] + list(args))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def pump(t_):
+        end = time.time() + t_
+        while time.time() < end:
+            r, _w, _x = select.select([fd], [], [], 0.1)
+            if r:
+                try:
+                    st_.feed(os.read(fd, 65536))
+                except OSError:
+                    return
+
+    def disp():
+        return ["".join((scr.buffer[y][x].data or "") for x in range(scr.columns)).rstrip()
+                for y in range(scr.lines)]
+    st_.feed(_read_until(fd, lambda b: b"quit" in b or b"q back" in b, most=20.0, settle_after=3.0)
+             + _read_until(fd, least=0.2, quiet=0.3, most=3.0))
+    shots = [disp()]
+    for k in keys:
+        os.write(fd, k)
+        st_.feed(_read_until(fd, least=pause, quiet=0.4, most=10.0))
+        shots.append(disp())
+    try:
+        os.write(fd, b"q"); pump(0.3); os.close(fd); os.waitpid(pid, 0)
+    except Exception:
+        pass
+    return shots
+
+
+def _card_feeds(srv, env):
+    srv.feed("/a", [item("Researchers engineer a stable blue anthocyanin pigment in petunia "
+                         "flowers using a bacterial enzyme pathway", when="2026-10-03T07:00:00Z",
+                         body="Scientists report a single bacterial enzyme that converts cyanidin."),
+                    item("Short one", when="2026-10-03T06:00:00Z", body=""),
+                    item("\u6771\u4eac\u3067\u65b0\u3057\u3044\u690d\u7269\u306e\u9752\u8272\u8272"
+                         "\u7d20\u304c\u767a\u898b\u3055\u308c\u3001\u7814\u7a76\u8005\u305f\u3061"
+                         "\u304c\u305d\u306e\u4ed5\u7d44\u307f\u3092\u8abf\u3079\u3066\u3044\u308b",
+                         when="2026-10-03T05:00:00Z")]
+             + [item("Filler story number %d with a moderately long headline to wrap" % i,
+                     when="2026-10-02T%02d:00:00Z" % i) for i in range(12)])
+    srv.feed("/b", [item("Science category story")])
+    sources(env, [{"id": "a", "name": "bioRxiv plant", "kind": "rss", "cats": ["top"], "url": srv.url("/a")},
+                  {"id": "b", "name": "Nature", "kind": "rss", "cats": ["science"], "url": srv.url("/b")}])
+
+
+_SEL = re.compile("\u258c\\s*(\\d+) ")
+_HEAD = re.compile("[\u258c ]\\s*(\\d+) [\u2022 \u2605]")
+
+
 @test
-def t_titles_scroll_sideways_with_either_arrow_encoding(env, srv):
-    long_ = ("Researchers engineer a stable blue anthocyanin pigment in petunia "
-             "flowers using a bacterial enzyme pathway")
-    srv.feed("/f", [item(long_)])
-    sources(env, [{"id": "a", "name": "bioRxiv plant", "kind": "rss", "cats": ["top"],
-                   "url": srv.url("/f")}])
+def t_titles_wrap_into_cards_that_need_no_sideways_scrolling(env, srv):
+    import unicodedata
+    _card_feeds(srv, env)
     e = dict(env); e["LPN_NO_PING"] = "1"
-    for seq in (b"\x1bOC", b"\x1b[C", b"l"):
-        out = _drive_tui(e, [seq, b"q"], cols=48)
-        assert "\u00abngineer" in out, "%r did not scroll the titles" % seq
-    out = _drive_tui(e, [b"\x1b[5~", b"\x1b[Z", b"j", b"q"], cols=48)
-    assert "j/k" in out and "Traceback" not in out
+    shots = _tui_frames(e, [b"j"] * 10 + [b"v", b"v"])
+    first = shots[0]
+    flat = " ".join(" ".join(l.replace("\u258c", " ") for l in first).split())
+    assert "Researchers engineer a stable blue anthocyanin pigment in petunia flowers " \
+           "using a bacterial enzyme pathway" in flat, "the whole title should be readable"
+    width = lambda l: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in l)
+    assert all(width(l) <= 48 for sh in shots for l in sh), "a line ran off the screen"
+    assert "\u7814\u7a76" in "".join(first), "the Japanese title should wrap, not vanish"
+    sel = [int(m.group(1)) for sh in shots[1:11] for m in [_SEL.search("\n".join(sh))] if m]
+    assert sel == list(range(2, 12)), "j should move one card at a time: %s" % sel
+    for sh in shots:
+        nums = [int(m.group(1)) for l in sh for m in [_HEAD.match(l)] if m]
+        assert nums == list(range(nums[0], nums[0] + len(nums))), "a frame was scrambled: %s" % nums
+        assert sum(1 for l in sh if _SEL.match(l)) <= 1, "two selection bars in one frame"
+    n_cards = lambda sh: sum(1 for l in sh if _HEAD.match(l))
+    assert n_cards(shots[11]) > n_cards(shots[10]) and not any("Summary text." in l for l in shots[11]), \
+        "v should hide summaries and fit more cards"
+    assert any("Summary text." in l for l in shots[12]), "v again should bring them back"
+
+
+@test
+def t_arrows_change_category_in_either_encoding(env, srv):
+    _card_feeds(srv, env)
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    shots = _tui_frames(e, [b"\x1b[C", b"\x1b[D", b"\x1bOC", b"\x1bOD", b"l", b"h", b"\x1b[5~"])
+    banner = lambda sh: next(l for l in sh if "LowPingNews" in l)
+    seen = [("SCIENCE" in banner(sh), "TOP" in banner(sh)) for sh in shots[1:7]]
+    assert seen == [(True, False), (False, True)] * 3, seen
+    assert any("LowPingNews" in l for l in shots[7]) and "Traceback" not in "".join(shots[7]), \
+        "an unrelated key sequence should be ignored, not quit"
 
 
 # ---------------------------------------------------------------- NOAA radio
@@ -2187,6 +2327,260 @@ def t_location_flags_are_refused_by_the_news_list(env, srv):
     assert not os.path.exists(os.path.join(env["XDG_CONFIG_HOME"], "lowpingnews", "loc.json"))
 
 
+# ---------------------------------------------------------------- weak signal
+def _bulky_feed(tag, n=60):
+    import random
+    rnd = random.Random(7)
+    w = "petunia anthocyanin enzyme duckweed plastid callus promoter vector biolistic".split()
+    its = "".join(
+        "<item><title>%s story %d %s</title><link>%s/%d</link><description>%s</description>"
+        "<pubDate>Sat, 03 Oct 2026 %02d:%02d:00 GMT</pubDate></item>" % (
+            tag, i, " ".join(rnd.choice(w) for _ in range(6)), NOWHERE, i,
+            " ".join(rnd.choice(w) + str(rnd.randint(0, 999)) for _ in range(40)), 23 - i // 60, 59 - i % 60)
+        for i in range(n))
+    return ('<?xml version="1.0"?><rss version="2.0"><channel><title>F</title>%s</channel></rss>'
+            % its).encode()
+
+
+class _Flaky:
+    """One gzipped document over a bad link: `cuts` drops each connection after
+    that many body bytes; ranges honoured only with a matching If-Range."""
+    def __init__(self, doc, etag='"v1"', cuts=(), ranges=True, bad_range=False, die_first=0):
+        import gzip
+        self.gz, self.etag, self.cuts = gzip.compress(doc), etag, list(cuts)
+        self.ranges, self.bad_range, self.die = ranges, bad_range, die_first
+        self.log, self.sent = [], 0
+
+    def __call__(self, h):
+        rng, ifr = h.headers.get("Range"), h.headers.get("If-Range")
+        self.log.append(rng)
+        if self.die > 0:
+            self.die -= 1
+            h.close_connection = True
+            return
+        start = int(rng.split("=")[1].split("-")[0]) if (rng and self.ranges and ifr == self.etag) else 0
+        body = self.gz[start:]
+        h.send_response(206 if start else 200)
+        for k, v in (("Content-Type", "application/rss+xml"), ("Content-Encoding", "gzip"),
+                     ("ETag", self.etag), ("Accept-Ranges", "bytes"), ("Content-Length", str(len(body)))):
+            h.send_header(k, v)
+        if start:
+            s0 = start + (5 if self.bad_range else 0)
+            h.send_header("Content-Range", "bytes %d-%d/%d" % (s0, len(self.gz) - 1, len(self.gz)))
+        h.end_headers()
+        cut = self.cuts.pop(0) if self.cuts else None
+        out = body if cut is None else body[:cut]
+        h.wfile.write(out)
+        h.wfile.flush()
+        self.sent += len(out)
+        if cut is not None:
+            h.close_connection = True
+
+
+def _one_feed(srv, env, handler, cats=("top",)):
+    sources(env, [{"id": "f", "name": "F", "kind": "rss", "cats": list(cats), "url": srv.url("/f")}])
+    srv.routes["/f"] = handler
+
+
+def _fcache(env):
+    import glob
+    p = glob.glob(os.path.join(env["XDG_CACHE_HOME"], "*", "f.json"))
+    return (json.load(io.open(p[0], encoding="utf-8")) if p else {}), p[0][:-5] + ".part" if p else None
+
+
+@test
+def t_a_cut_download_resumes_and_each_byte_is_paid_once(env, srv):
+    import gzip
+    doc = _bulky_feed("A")
+    size = len(gzip.compress(doc))
+    f = _Flaky(doc, cuts=[6000])
+    _one_feed(srv, env, f)
+    run(env, "-t")
+    c, _p = _fcache(env)
+    assert len(c["items"]) == 40 and not c.get("p"), "a single cut should be finished in the same run"
+    assert f.log == [None, "bytes=6000-"] and f.sent == size, (f.log, f.sent, size)
+
+
+@test
+def t_a_download_cut_every_time_finishes_on_the_next_run(env, srv):
+    import gzip
+    doc = _bulky_feed("A")
+    size = len(gzip.compress(doc))
+    f = _Flaky(doc, cuts=[3000, 2500, 2500])
+    _one_feed(srv, env, f)
+    run(env, "-t")
+    c, part = _fcache(env)
+    assert c.get("p") == 1 and c["items"], "the complete items should be shown meanwhile"
+    assert os.path.getsize(part) == 8000, "the received bytes should be kept"
+    run(env, "-t")
+    c, part = _fcache(env)
+    assert f.log[-1] == "bytes=8000-", "the next run should ask only for the rest: %s" % f.log
+    assert len(c["items"]) == 40 and not c.get("p") and not os.path.exists(part)
+    assert f.sent == size, "paid %d bytes for a %d-byte feed" % (f.sent, size)
+
+
+@test
+def t_resumed_downloads_are_never_spliced(env, srv):
+    doc, doc2 = _bulky_feed("A"), _bulky_feed("B")
+    f = _Flaky(doc, etag='W/"v1"', cuts=[6000])          # weak: bodies may differ
+    _one_feed(srv, env, f)
+    run(env, "-t")
+    assert all(r is None for r in f.log), "resumed with a weak validator"
+    f = _Flaky(doc, cuts=[6000])                          # changed between attempts
+    orig, n = f.__call__, [0]
+
+    def changer(h):
+        import gzip
+        n[0] += 1
+        if n[0] == 2:
+            f.gz, f.etag = gzip.compress(doc2), '"v2"'
+        return orig(h)
+    _one_feed(srv, env, changer)
+    run(env, "-t", "-f")
+    c, _p = _fcache(env)
+    assert {x["ti"].split()[0] for x in c["items"]} == {"B"} and len(c["items"]) == 40, "spliced"
+    f = _Flaky(doc, cuts=[6000], bad_range=True)          # 206 for the wrong bytes
+    _one_feed(srv, env, f)
+    run(env, "-t", "-f")
+    c, _p = _fcache(env)
+    assert len(c["items"]) == 40 and not c.get("p") and f.log[-1] is None, f.log
+
+
+@test
+def t_a_silently_dropped_connection_is_retried(env, srv):
+    f = _Flaky(_bulky_feed("A"), die_first=2)            # two flickers in a row
+    _one_feed(srv, env, f)
+    run(env, "-t")
+    c, _p = _fcache(env)
+    assert len(c.get("items") or []) == 40 and len(f.log) == 3, f.log
+
+
+@test
+def t_only_signal_failures_are_retried(env, srv):
+    """Retrying a refused connection cannot help and once cost every load of a
+    dead feed 2.4 s - long enough to stall the reader and fail tests mid-suite."""
+    import errno, socket, ssl, urllib.error, http.client
+    m = load()
+    for e, want in ((urllib.error.URLError(ConnectionRefusedError(111, "refused")), False),
+                    (urllib.error.URLError(socket.gaierror(socket.EAI_NONAME, "no such name")), False),
+                    (urllib.error.URLError(ssl.SSLCertVerificationError("bad certificate")), False),
+                    (urllib.error.URLError(socket.timeout("timed out")), True),
+                    (urllib.error.URLError(ConnectionResetError(104, "reset")), True),
+                    (http.client.RemoteDisconnected("empty reply"), True),
+                    (urllib.error.URLError(OSError(errno.ENETUNREACH, "unreachable")), True),
+                    (urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, "try again")), True)):
+        assert m.transient(e) == want, "%r should %sbe retried" % (e, "" if want else "not ")
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"], "url": NOWHERE + "/dead"}])
+    t0 = time.time()
+    run(env, "-t", "-f")
+    assert time.time() - t0 < 1.8, "a refused feed took %.1fs: it was retried" % (time.time() - t0)
+
+
+@test
+def t_quiet_feeds_are_checked_less_often(env, srv):
+    srv.feed("/f", [item("Quiet story %d" % i) for i in range(5)], etag='"q1"')
+    sources(env, [{"id": "f", "name": "F", "kind": "rss", "cats": ["top"], "url": srv.url("/f")}])
+    run(env, "-t")
+
+    def aged(sec):
+        c, _p = _fcache(env)
+        c["t"] = int(time.time()) - sec
+        json.dump(c, io.open(_p[:-5] + ".json", "w", encoding="utf-8"))
+    qs = []
+    for _i in range(3):
+        aged(30000); run(env, "-t"); qs.append(_fcache(env)[0].get("q"))
+    assert qs == [1, 2, 3], qs
+    n = len(srv.seen); aged(5000)
+    out, _e, _rc = run(env, "-t")
+    assert len(srv.seen) == n, "a quiet feed was rechecked at its old interval"
+    assert "stale" not in out.lower()
+    run(env, "-t", "-f")
+    assert len(srv.seen) == n + 1, "-f must always fetch"
+    aged(11000); run(env, "-t")
+    assert len(srv.seen) == n + 2, "the 3-hour cap did not hold"
+    srv.feed("/f", [item("Breaking %d" % i) for i in range(5)], etag='"q2"')
+    aged(11000); run(env, "-t")
+    assert _fcache(env)[0].get("q") == 0, "a change should snap the interval back"
+    m = load()
+    assert m.ttl_eff({"cats": ["alerts"]}, {"q": 3}) == m.TTL, "alert feeds must never back off"
+
+
+@test
+def t_dns_falls_back_only_when_the_lookup_fails(env, srv):
+    import socket
+    m = load()
+    m.DNSF = os.path.join(env["XDG_CACHE_HOME"], "dns_test.json")
+    real, mode = socket.getaddrinfo, {"fail": False}
+
+    def fake(host, port, *a, **k):
+        if mode["fail"]:
+            raise socket.gaierror(-3, "Temporary failure in name resolution")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", port))]
+    socket.getaddrinfo = fake
+    try:
+        m._DNS["c"] = {}
+        m.dns_install()
+        socket.getaddrinfo("feeds.example.org", 443)
+        mode["fail"] = True
+        assert socket.getaddrinfo("feeds.example.org", 443)[0][4] == ("192.0.2.10", 443)
+        for host, age in (("never-seen.example.org", 0), ("feeds.example.org", 15 * 86400)):
+            m._DNS["c"].get(host, {}).update({"t": int(time.time()) - age} if age else {})
+            try:
+                socket.getaddrinfo(host, 443)
+                raise AssertionError("%s should not have resolved" % host)
+            except socket.gaierror:
+                pass
+        mode["fail"] = False
+        socket.getaddrinfo("127.0.0.1", 80)
+        assert "127.0.0.1" not in m._DNS["c"], "IP literals are not lookups"
+    finally:
+        socket.getaddrinfo = real
+
+
+@test
+def t_the_suite_needs_only_the_standard_library(env, srv):
+    """Phones run this suite before every release. Two tests once imported a
+    library the phone did not have, and every release failed there."""
+    import ast
+    std = getattr(sys, "stdlib_module_names", None)
+    if not std:
+        raise Skip("needs Python 3.10+ to list the standard library")
+    tree = ast.parse(io.open(os.path.join(HERE, "test.py"), encoding="utf-8").read())
+    guarded = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and any(
+                isinstance(h.type, ast.Name) and h.type.id in ("ImportError", "ModuleNotFoundError")
+                for h in node.handlers):
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    guarded.add(id(sub))
+    bare = []
+    for node in ast.walk(tree):
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import) else
+                 [node.module] if isinstance(node, ast.ImportFrom) and node.module and not node.level
+                 else [])
+        for n in names:
+            if n.split(".")[0] not in std and id(node) not in guarded:
+                bare.append("%s (line %d)" % (n, node.lineno))
+    assert not bare, "imports outside the standard library must skip when missing: " + ", ".join(bare)
+
+
+@test
+def t_the_way_out_is_always_on_screen(env, srv):
+    """The key line once ran past a phone's width, cutting off "q quit" in the
+    reader and "q back" in the feed editor."""
+    m = load()
+    for w in (100, 64, 48, 40, 32, 24):
+        line = m.fit_keys(["j/k", "enter read", "s star", "o open", "r refresh", "<> cat",
+                           "v view", "f feeds", "q quit"],
+                          ["j/k", "v view", "r refresh", "o open", "f feeds", "s star"], w - 1)
+        assert line.endswith("q quit") and (len(line) <= w - 1 or w < 30), (w, line)
+    srv.feed("/f", [item("Story %d" % i) for i in range(3)])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"], "url": srv.url("/f")}])
+    assert "q quit" in _drive_tui(env, [b"q"], cols=48), "the reader hid its quit key at 48 columns"
+    assert "q back" in _drive_tui(env, [b"q"], cols=48, args=("catalog",)), "the editor hid its way out"
+
+
 @test
 def t_version_is_consistent(env, srv):
     m = load()
@@ -2198,7 +2592,8 @@ def t_version_is_consistent(env, srv):
 
 if __name__ == "__main__":
     print("LowPingNews tests")
-    print("  %d run, %d failed" % (RAN, len(FAILED)))
+    print("  %d run, %d failed%s" % (RAN, len(FAILED),
+                                      (", %d skipped" % len(SKIPPED)) if SKIPPED else ""))
     if FAILED:
         print("  failing: " + ", ".join(FAILED))
     sys.exit(1 if FAILED else 0)

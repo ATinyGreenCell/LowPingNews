@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "7.5"
+VERSION = "7.9"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -95,6 +95,11 @@ CFG = CFD + "/sources.json"
 RADIOCF = CFD + "/radio.json"
 LAST = CD + "/last.json"
 TTL = 900                      # a feed younger than this is reused, no request
+TTLMAX = 3 * 3600              # a quiet feed is checked less often, up to this
+RESUME_MIN = 2048              # a cut transfer this big is kept and resumed
+PARTTTL = 3600                 # ...for up to an hour
+RETRY_GAPS = (0.6, 1.8)        # retries when nothing arrived: a weak signal flickers
+RETRY_WINDOW = 14              # seconds one feed may spend retrying and resuming
 DEADLINE = 20                  # hard ceiling on the whole fetch round
 MAXPAR = 6                     # concurrent fetches; a phone radio is not a datacentre
 HARDCAP = 300                  # absolute ceiling on one fetch round
@@ -656,13 +661,40 @@ class OfflineError(OSError):
 LAST_URL = [""]            # where the last get() actually ended up, after redirects
 
 
-def get(url, t=10, extra=None, cap=FEEDCAP, tap=None, soft=False, until=None):
-    """-> (body, headers, wire_bytes, partial). Raises HTTPError(304) when unchanged."""
+class ResumeMismatch(ValueError):
+    """The server answered a resume with bytes that do not continue ours."""
+
+
+def strong_validator(headers):
+    """A validator that promises byte-identical bodies, or None. Servers that
+    compress on the fly mark their ETags weak (W/), which is exactly the case
+    where splicing two downloads together would be unsafe."""
+    et = (headers.get("ETag") or "").strip()
+    if et and not et.startswith("W/"):
+        return et
+    enc = (headers.get("Content-Encoding") or "").lower()
+    if headers.get("Last-Modified") and enc in ("", "identity"):
+        return headers["Last-Modified"]
+    return None
+
+
+def get(url, t=10, extra=None, cap=FEEDCAP, tap=None, soft=False, until=None,
+        resume=None, raw_out=None):
+    """-> (body, headers, wire_bytes, partial). Raises HTTPError(304) when unchanged.
+    resume={"raw", "v", "enc"} asks only for the bytes after the ones we have,
+    guarded by If-Range: a changed document comes back whole, never spliced.
+    raw_out, a dict, receives the raw received bytes so a cut transfer can
+    be resumed later."""
     if OFFLINE[0]:
         # one choke point: a caller that forgets --offline cannot reach the net
         raise OfflineError("offline")
     h = {"Accept-Encoding": "gzip, deflate", "User-Agent": UA}
     h.update(extra or {})
+    if resume:
+        h["Range"] = "bytes=%d-" % len(resume["raw"])
+        h["If-Range"] = resume["v"]
+        for k in ("If-None-Match", "If-Modified-Since"):
+            h.pop(k, None)                 # If-Range does the validating
     import urllib.error, urllib.parse, urllib.request, zlib
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         raise ValueError("refusing non-http url")
@@ -694,11 +726,21 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None, soft=False, until=None):
         # Read in chunks and keep whatever arrived. On a dying link the useful
         # question is not "did it finish" but "how much of it is usable".
         import http.client
-        buf, partial = bytearray(), False
+        buf, partial = bytearray(), False      # the prefix joins after the read
         # `until` looks at what the bytes SAY: if they arrive compressed (servers
         # gzip ranged responses too), test the decompressed stream, or a marker
         # like </head> never matches and the read runs on to the cap
         enc_ = (f.headers.get("Content-Encoding") or "").lower()
+        prefix = b""
+        if resume:
+            status_ = getattr(f, "status", None) or f.getcode()
+            if status_ == 206:
+                cr = (f.headers.get("Content-Range") or "").replace(" ", "")
+                if not cr.startswith("bytes%d-" % len(resume["raw"])) or \
+                        enc_ != (resume.get("enc") or ""):
+                    raise ResumeMismatch("resume did not continue the same bytes")
+                prefix = resume["raw"]
+            # a 200 means the document changed or ranges are ignored: take it whole
         dz = None
         if until is not None and enc_ in ("gzip", "x-gzip", "deflate"):
             dz = zlib.decompressobj(16 + zlib.MAX_WBITS if "gzip" in enc_ else zlib.MAX_WBITS)
@@ -740,13 +782,18 @@ def get(url, t=10, extra=None, cap=FEEDCAP, tap=None, soft=False, until=None):
             if not buf:
                 raise                            # nothing arrived: a real failure
             partial = True
-        b = bytes(buf)
+        got_now = len(buf)                     # bytes this request carried
+        b = prefix + bytes(buf)
+        if raw_out is not None:
+            raw_out.update({"raw": b, "enc": enc_, "v": strong_validator(f.headers),
+                            "cut": bool(partial and not soft and until is None),
+                            "resumed": bool(prefix)})
         stopped_early = bool(partial and (soft or until is not None))
         try:
             LAST_URL[0] = f.geturl()
         except Exception:
             LAST_URL[0] = url
-        wire = len(b)                     # compressed body; the full cost is est_wire()
+        wire = got_now                    # compressed bytes received; resumed ones were paid before
         # stopping early does not recall what is already in flight: up to a
         # receive window more arrives and is billed. Measured ~9 KB at PROBEWIN.
         account(wire + (PROBEWIN + 1024 if stopped_early else 0), f.headers)
@@ -875,6 +922,112 @@ def parse_hn(raw):
     return out
 
 
+def transient(e):
+    """Is this the kind of failure a flickering signal causes, worth retrying?
+    A refused connection, a bad certificate or a name that does not exist is
+    a definite answer: retrying it only stalls - a dead feed once cost every
+    load 2.4 s of pointless retries."""
+    import errno, socket, http.client
+    r = getattr(e, "reason", None) or e          # urllib wraps the real cause
+    if isinstance(r, str):
+        return "timed out" in r.lower()
+    if isinstance(r, ConnectionRefusedError):
+        return False
+    if isinstance(r, socket.gaierror):
+        return getattr(r, "errno", None) == getattr(socket, "EAI_AGAIN", -3)
+    if isinstance(r, (socket.timeout, TimeoutError, ConnectionResetError, ConnectionAbortedError,
+                      BrokenPipeError, http.client.RemoteDisconnected, http.client.IncompleteRead)):
+        return True
+    if isinstance(r, OSError):
+        return getattr(r, "errno", None) in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN,
+                                              errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED)
+    return False
+
+
+def ttl_eff(src, c):
+    """Check quiet feeds less often. Every check that finds nothing new doubles
+    the wait, to 8x (15 min -> 2 h); any change snaps it back. A check that
+    finds nothing still pays a handshake (~6.7 KB), so this is the biggest
+    saving there is. Alert feeds never back off; -f always fetches."""
+    base = src.get("ttl") or TTL
+    if not c or "alerts" in (src.get("cats") or []):
+        return base
+    q = max(0, min(int(c.get("q") or 0), 3))
+    return min(base * (2 ** q), max(base, TTLMAX))
+
+
+DNSF = os.path.join(CD, "dns.json")
+DNSAGE = 14 * 86400
+_DNS = {"c": None, "dirty": False}
+
+
+def dns_install():
+    """A failed lookup falls back to the last address that worked for that
+    host. On a weak signal the lookup is often the step that fails - one lost
+    packet stalls it for seconds - while a connection would have got through.
+    Healthy lookups always win: CDNs rotate addresses, so this is never used
+    to skip DNS, only to survive it failing."""
+    import socket, atexit, ipaddress
+    real = socket.getaddrinfo
+    if getattr(real, "_lpn", False):
+        return
+    if _DNS["c"] is None:
+        _DNS["c"] = jread(DNSF, {})
+        if not isinstance(_DNS["c"], dict):
+            _DNS["c"] = {}
+
+    def literal(h):
+        try:
+            ipaddress.ip_address(str(h).split("%")[0])
+            return True
+        except ValueError:
+            return False
+
+    def gai(host, port, family=0, type=0, proto=0, flags=0):
+        h = host.decode() if isinstance(host, bytes) else host
+        try:
+            res = real(host, port, family, type, proto, flags)
+        except socket.gaierror:
+            ent = _DNS["c"].get(h) if isinstance(h, str) else None
+            if not ent or age_of(ent.get("t")) >= DNSAGE:
+                raise
+            NETSTAT["dnsfb"] = NETSTAT.get("dnsfb", 0) + 1
+            p = int(port) if str(port or "").isdigit() else 0
+            out = []
+            for fam, ip in ent.get("a") or []:
+                if family and fam != family:
+                    continue
+                addr = (ip, p) if fam == socket.AF_INET else (ip, p, 0, 0)
+                out.append((fam, type or socket.SOCK_STREAM, proto or 6, "", addr))
+            if not out:
+                raise
+            return out
+        if isinstance(h, str) and h and not literal(h):
+            addrs = [[r[0], r[4][0]] for r in res if r[0] in (socket.AF_INET, socket.AF_INET6)][:4]
+            ent = _DNS["c"].get(h) or {}
+            if addrs and (ent.get("a") != addrs or age_of(ent.get("t")) > 86400):
+                _DNS["c"][h] = {"a": addrs, "t": int(time.time())}
+                _DNS["dirty"] = True
+        return res
+    gai._lpn = True
+    socket.getaddrinfo = gai
+
+    def save():
+        if _DNS["dirty"]:
+            c_ = _DNS["c"]
+            if len(c_) > 200:                  # keep the most recently confirmed
+                c_ = dict(sorted(c_.items(), key=lambda kv: -int(kv[1].get("t") or 0))[:200])
+            jwrite(DNSF, c_)
+    atexit.register(save)
+
+
+def drop_part(cf):
+    try:
+        os.remove(cf[:-5] + ".part")
+    except OSError:
+        pass
+
+
 def load(src, fresh, bag):
     """Fetch or reuse one source. Never raises - records the failure instead."""
     cf = "%s/%s.json" % (CD, src["id"])
@@ -882,7 +1035,7 @@ def load(src, fresh, bag):
     c = jread(cf, {})                      # once: it decides freshness and validators
     if not isinstance(c.get("items"), list):
         c = None
-    if c is not None and not fresh and age_of(c.get("t")) < ttl:
+    if c is not None and not fresh and age_of(c.get("t")) < ttl_eff(src, c):
         bag[src["id"]] = (c["items"], 0, 0, 0, 0)     # a future stamp is not fresh
         return
     import urllib.error
@@ -901,30 +1054,69 @@ def load(src, fresh, bag):
     t_start = time.time()
     tapper = lambda n: PROG.__setitem__(src["id"], n)
     PROG.setdefault(src["id"], 0)
+    # bytes kept from a transfer that was cut last time: ask only for the rest
+    resume = None
+    rs = (c or {}).get("rs")
+    if rs:
+        try:
+            raw_p = open(cf[:-5] + ".part", "rb").read()
+            if len(raw_p) == rs.get("n") and age_of(rs.get("t")) < PARTTTL and rs.get("v"):
+                resume = {"raw": raw_p, "v": rs["v"], "enc": rs.get("enc", "")}
+        except (OSError, TypeError):
+            pass
+    ro = {}
     try:
         try:
             trim = c.get("trim", 2) if c else 2
             probe = dict(c or {}, trim=trim)
+            fails, resumes, loops, wire_tot = 0, 0, 0, 0
             while True:
+                loops += 1
+                if loops > 8:
+                    raise ValueError("gave up after repeated attempts")
+                ro = {}
                 try:
-                    raw, rh, wire, part = get(request_url(src, probe), extra=val,
-                                              tap=tapper, t=src.get("timeout") or 10)
-                    break
+                    raw, rh, wire, part = get(request_url(src, probe), extra=val, tap=tapper,
+                                              t=src.get("timeout") or 10, resume=resume, raw_out=ro)
                 except urllib.error.HTTPError as he_:
                     # a server that rejects the trimmed query: step down once
                     if he_.code == 400 and src.get("kind") == "hn" and probe["trim"] > 0:
                         probe["trim"] -= 1
                         continue
+                    if he_.code == 416 and resume:     # our kept bytes do not fit: start over
+                        resume = None
+                        drop_part(cf)
+                        continue
                     raise                  # a real HTTP answer: do not retry
-                except Exception:
-                    time.sleep(0.4)        # transient drop on a weak signal
-                    raw, rh, wire, part = get(request_url(src, probe), extra=val,
-                                              tap=tapper, t=src.get("timeout") or 10)
-                    break
+                except ResumeMismatch:
+                    resume = None              # never splice: fetch it whole instead
+                    drop_part(cf)
+                    continue
+                except Exception as e_:
+                    # nothing arrived at all: a weak signal flickers, so try again
+                    # after a pause - but only while there is time for it, and
+                    # only for failures a flicker causes
+                    if not transient(e_):
+                        raise
+                    fails += 1
+                    if fails > len(RETRY_GAPS) or time.time() - t_start > RETRY_WINDOW:
+                        raise
+                    time.sleep(RETRY_GAPS[fails - 1])
+                    continue
+                wire_tot += wire
+                # cut partway? continue from where it stopped, while there is time
+                if part and ro.get("cut") and ro.get("v") and len(ro["raw"]) >= RESUME_MIN \
+                        and resumes < 2 and time.time() - t_start < RETRY_WINDOW:
+                    resumes += 1
+                    resume = {"raw": ro["raw"], "v": ro["v"], "enc": ro["enc"]}
+                    continue
+                break
+            wire = wire_tot
             trim = probe["trim"]
         except urllib.error.HTTPError as he:
             if he.code == 304 and c:
                 c["t"] = int(time.time())
+                c["q"] = int(c.get("q") or 0) + 1      # quiet: check less often
                 jwrite(cf, c)
                 bag[src["id"]] = (c["items"], 0, 0, 1, 0)
                 DONE.add(src["id"])
@@ -945,6 +1137,21 @@ def load(src, fresh, bag):
         if not items:
             raise ValueError("no items parsed")
         rec = {"t": int(time.time()), "items": items, "w": wire}
+        if not part and c:
+            same = [key(x["ti"]) for x in (c.get("items") or [])[:5]] == \
+                   [key(x["ti"]) for x in items[:5]]
+            rec["q"] = (int(c.get("q") or 0) + 1) if same else 0
+        if part and ro.get("cut") and ro.get("v") and len(ro.get("raw") or b"") >= RESUME_MIN:
+            try:                           # keep the bytes: next time ask for the rest
+                with open(cf[:-5] + ".part", "wb") as fh:
+                    fh.write(ro["raw"])
+                rec["rs"] = {"n": len(ro["raw"]), "v": ro["v"], "enc": ro["enc"], "t": int(time.time())}
+                # finishing costs only the missing bytes now: due again at once
+                rec["due_now"] = 1
+            except OSError:
+                pass
+        else:
+            drop_part(cf)
         if src.get("kind") == "hn":
             rec["trim"] = trim             # remember what this server accepts
         if part:
@@ -952,6 +1159,8 @@ def load(src, fresh, bag):
             # confirm a copy we never fully received. Also expire it quickly.
             rec["p"] = 1
             rec["t"] = int(time.time()) - max(0, (src.get("ttl") or TTL) - 120)
+            if rec.pop("due_now", None):
+                rec["t"] = int(time.time()) - (src.get("ttl") or TTL)
         else:
             if rh.get("ETag"):
                 rec["et"] = rh["ETag"]
@@ -3291,6 +3500,10 @@ def main():
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     except Exception:
         pass
+    try:
+        dns_install()                      # a failed lookup may use the last good address
+    except Exception:
+        pass
     if sys.argv[1:2] and sys.argv[1] in ("catalog", "feeds"):
         return cmd_catalog(sys.argv[2:])
     a = fastparse(sys.argv[1:])
@@ -3802,8 +4015,12 @@ def feeds_screen(scr, put, C, a, jump=None):
                                            e["name"][:max(6, w - 32)], size, host[:14])
             at = curses.A_REVERSE if i == sel else (C(2) if on else C(0))
             put(n + 1, 0, line.ljust(w - 1), w - 1, at)
-        hint = state_["msg"] or ((" tap or space: tick" if mouse else " space: tick") +
-                                 "  a add URL  t to category  d delete  u update list  q back")
+        # fitted like the reader's: cut off at phone width, "q back" - the
+        # way out - used to be the part that disappeared
+        hint = state_["msg"] or fit_keys(
+            ["tap or space: tick" if mouse else "space: tick", "a add URL", "t to category",
+             "d delete", "u update list", "q back"],
+            ["u update list", "t to category", "d delete", "a add URL"], w - 1)
         put(h - 1, 0, hint.ljust(w - 1), w - 1, C(4))
         scr.refresh()
         scr.timeout(-1)
@@ -3929,6 +4146,81 @@ def feeds_screen(scr, put, C, a, jump=None):
     return state_["changed"]
 
 
+def cells(t):
+    import unicodedata
+    return sum(0 if unicodedata.combining(ch) else
+               2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in t)
+
+
+def wrap_cells(text, width):
+    """Word-wrap by screen cells, not characters: a CJK title has no spaces
+    and every character is two cells wide. Long words are split, never lost."""
+    width = max(4, width)
+    lines, cur, cw = [], "", 0
+    for word in str(text).split():
+        ww = cells(word)
+        while ww > width:                       # a word longer than the line
+            room = width - cw - (1 if cur else 0)
+            if room < 2:
+                lines.append(cur); cur, cw = "", 0
+                room = width
+            part, pw = "", 0
+            for ch in word:
+                c_ = cells(ch)
+                if pw + c_ > room:
+                    break
+                part += ch; pw += c_
+            cur = (cur + " " + part) if cur else part
+            lines.append(cur); cur, cw = "", 0
+            word = word[len(part):]; ww = cells(word)
+        if not word:
+            continue
+        need = ww + (1 if cur else 0)
+        if cw + need > width:
+            lines.append(cur); cur, cw = word, ww
+        else:
+            cur, cw = ((cur + " " + word) if cur else word), cw + need
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+TITLE_LINES = 4      # a card shows the whole title up to this many lines
+
+
+def card_lines(n, it, src, width, stamp, mark, show_sum):
+    """-> [(text, kind)], kind in head/title/sum/gap. Everything here came with
+    the feed: a card costs no bytes beyond the list itself."""
+    ind = "    "
+    tw = max(8, width - len(ind) - 1)
+    head = "%3d %s %s \u00b7 %s" % (n, mark, src, stamp)
+    out = [(head, "head")]
+    tl = wrap_cells(it.get("ti") or "", tw)
+    if len(tl) > TITLE_LINES:
+        tl = tl[:TITLE_LINES]
+        tl[-1] = tl[-1][:max(1, len(tl[-1]) - 1)] + "\u2026"
+    out += [(ind + ln, "title") for ln in tl]
+    sm = " ".join(str(it.get("s") or "").split())
+    if show_sum and sm and sm.lower() != (it.get("ti") or "").lower():
+        one = wrap_cells(sm, tw - 1)            # leave a cell for the ellipsis
+        out.append((ind + one[0] + ("\u2026" if len(one) > 1 else ""), "sum"))
+    out.append(("", "gap"))
+    return out
+
+
+def fit_keys(parts, drop, width):
+    """The key-hint line, made to fit: a phone is narrower than every hint at
+    once, and a cut-off line once hid "q quit" and "f feeds" entirely. Least
+    essential hints go first; quitting is always shown."""
+    parts = list(parts)
+    for d in drop:
+        if len(" " + "  ".join(parts)) <= width:
+            break
+        if d in parts:
+            parts.remove(d)
+    return " " + "  ".join(parts)
+
+
 def getkey(scr):
     """getch, plus arrow keys in either encoding. In keypad mode terminals send
     ESC O C, which curses decodes; some multiplexers and remote shells send
@@ -4029,7 +4321,7 @@ def tui_main(scr, a, cats, meter=None):
     # ---- state -----------------------------------------------------------
     S = {"rows": [], "meta": {}, "st": state(), "sel": 0, "top": 0,
          "mode": "list", "body": [], "bscroll": 0, "reading": None,
-         "hoff": 0, "hmax": 0}                 # sideways scroll of the title column
+         "sums": True}                         # cards show the feed's one-line summary
     note = {"text": "", "until": 0.0}          # transient status line
     act = {"last": time.time()}                 # opening the reader counts as use
     bg = {"thread": None, "result": None, "gen": 0, "last_try": 0.0}
@@ -4055,6 +4347,7 @@ def tui_main(scr, a, cats, meter=None):
                     S["sel"] = i
                     break
         S["top"] = min(S["top"], S["sel"])
+        fit_top()                      # the selected card may have been pushed down
         # a new list moves lines around; left to itself curses shifts them with
         # scroll regions, which some emulators drop. One full repaint instead.
         try:
@@ -4145,7 +4438,6 @@ def tui_main(scr, a, cats, meter=None):
             if x0 > x_f + 1:                   # never over the title or the age
                 put(0, x0, txt, len(txt) + 1, C(colr, True))
         # widest name that still tells sources apart, capped so titles keep room
-        S["hmax"] = 0
         nw = min(14, max([len(x["name"]) for _i, x in rows] or [4]))
         nw = max(4, min(nw, w // 4))
         st = S["st"]
@@ -4153,45 +4445,92 @@ def tui_main(scr, a, cats, meter=None):
         if S["mode"] == "list":
             if not rows:
                 put(2, 2, "nothing to show - press r to refresh", max(1, w - 3), C(4))
-            for n in range(h - 2):
-                idx = S["top"] + n
-                if idx < 0 or idx >= len(rows):
-                    break
+            # when the view scrolls, cards move by several lines; left alone,
+            # curses shifts screen regions to save output, which emulators
+            # mishandle (lines vanished and interleaved). Repaint whole instead:
+            # a few KB to the local screen, nothing over the network.
+            layout = (S["top"], S["sums"], w, h)
+            if S.get("drawn") != layout:
+                scr.clearok(True)
+                S["drawn"] = layout
+            y = 1
+            idx = S["top"]
+            bar = "|" if a.ascii else "\u258c"
+            while y < h - 1 and 0 <= idx < len(rows):
                 it, s_ = rows[idx]
                 k = key(it["ti"])
                 rd = k in st["read"]
                 # recomputed on every draw, so ages advance while the screen is open
                 sec = age_secs(it.get("d")) if it.get("d") else -3
-                stamp = "?" if sec < 0 else ("now" if sec < 60 else age(sec)[:4])
-                mark = "*" if k in stars else (" " if rd else "\u2022")
-                prefix = "%s %-*s %-4s " % (mark, nw, s_["name"][:nw], stamp)
-                room = max(4, w - 1 - len(prefix))
-                ti = it["ti"]
-                over = max(0, len(ti) - room)
-                S["hmax"] = max(S["hmax"], over + 1 if over else 0)
-                off = min(S["hoff"], over + 1) if over else 0
-                shown = ti[off:]
-                if off:                         # more to the left
-                    shown = "\u00ab" + shown[1:] if not a.ascii else "<" + shown[1:]
-                if len(shown) > room:           # more to the right
-                    shown = shown[:room - 1] + ("\u00bb" if not a.ascii else ">")
-                line = prefix + shown
-                at = C(0) if rd else C(7 if not colour else 0, not rd)
-                if idx == S["sel"]:
-                    at = curses.A_REVERSE
-                put(n + 1, 0, line.ljust(w - 1), w - 1, at)
+                stamp = "?" if sec < 0 else ("now" if sec < 60 else age(sec))
+                mark = ("*" if a.ascii else "\u2605") if k in stars else (" " if rd else
+                                                                        ("o" if a.ascii else "\u2022"))
+                sel_ = idx == S["sel"]
+                for txt, kind in card_lines(idx + 1, it, s_["name"][:24], w, stamp, mark, S["sums"]):
+                    if y >= h - 1:
+                        break
+                    if kind == "head":
+                        at = C(4) if rd else C(6 if colour else 0, True)
+                    elif kind == "title":
+                        at = C(0) if rd else C(7 if not colour else 0, True)
+                    elif kind == "sum":
+                        at = C(4)
+                    else:
+                        at = C(0)
+                    # every line is padded to full width: frames are drawn over
+                    # the last one, and a short line would leave its tail behind
+                    if sel_ and kind != "gap":
+                        put(y, 0, bar, 1, C(6 if colour else 0, True) | curses.A_BOLD)
+                        put(y, 1, (txt[1:] if txt.startswith(" ") else txt).ljust(w - 2), w - 2,
+                            at | (curses.A_BOLD if kind in ("head", "title") else 0))
+                    else:
+                        put(y, 0, txt.ljust(w - 1), w - 1, at)
+                    y += 1
+                idx += 1
+            while y < h - 1:                        # clear below the last card
+                put(y, 0, " " * (w - 1), w - 1, C(0))
+                y += 1
         else:
             for n in range(h - 2):
                 if S["bscroll"] + n >= len(S["body"]):
                     break
                 put(n + 1, 0, S["body"][S["bscroll"] + n][:w - 1], w - 1)
-        keys = ((" \u2190\u2192 titles " if S["hmax"] and not a.ascii else
-                 " h/l titles " if S["hmax"] else "") + " j/k  enter read  s star  o open  r refresh  n/p cat  f feeds  q quit"
+        keys = (fit_keys(["j/k", "enter read", "s star", "o open", "r refresh",
+                          ("n/p" if a.ascii else "\u2190\u2192") + " cat", "v view", "f feeds", "q quit"],
+                         ["j/k", "v view", "r refresh", "o open", "f feeds", "s star"], w - 1)
                 if S["mode"] == "list" else
                 " j/k scroll  b back  s star  o open  q quit")
         msg = note["text"] if time.time() < note["until"] else ""
         put(h - 1, 0, (" " + msg if msg else keys).ljust(w - 1), w - 1, C(4))
         scr.refresh()
+
+    def card_h(i, w):
+        """Lines card i takes at width w (the trailing gap included)."""
+        return len(card_lines(i + 1, S["rows"][i][0], "", w, "", " ", S["sums"]))
+
+    def fit_top():
+        """Cards differ in height: scroll by whole cards until the selected
+        one is entirely on screen."""
+        rows_ = S["rows"]
+        S["sel"] = max(0, min(S["sel"], max(0, len(rows_) - 1)))
+        if S["sel"] < S["top"]:
+            S["top"] = S["sel"]
+        h_, w_ = scr.getmaxyx()
+        avail = max(1, h_ - 2)
+        while S["top"] < S["sel"] and \
+                sum(card_h(i, w_) for i in range(S["top"], S["sel"] + 1)) - 1 > avail:
+            S["top"] += 1
+        S["top"] = max(0, min(S["top"], max(0, len(rows_) - 1)))
+
+    def cards_on_screen():
+        h_, w_ = scr.getmaxyx()
+        used, n = 0, 0
+        for i in range(S["top"], len(S["rows"])):
+            used += card_h(i, w_)
+            if used - 1 > h_ - 2:
+                break
+            n += 1
+        return max(1, n)
 
     def wrap_article(it):
         h, w = scr.getmaxyx()
@@ -4279,7 +4618,7 @@ def tui_main(scr, a, cats, meter=None):
             continue
         act["last"] = time.time()
         h, _w = scr.getmaxyx()
-        page = max(1, h - 3)
+        page = cards_on_screen()
         rows = S["rows"]
         if c in (ord("q"), 27):
             if S["mode"] == "read":
@@ -4288,12 +4627,15 @@ def tui_main(scr, a, cats, meter=None):
             break
         if S["mode"] == "list":
             last = max(0, len(rows) - 1)       # empty list: stay at 0, never -1
-            h_, w_ = scr.getmaxyx()
-            step = max(8, (w_ - 24) // 2)            # half a title column at a time
+            # titles wrap now, so left and right are free: they change category,
+            # which is what the arrow keys on a phone's extra-keys row are for
             if c in (curses.KEY_RIGHT, ord("l")):
-                S["hoff"] = min(S["hoff"] + step, max(0, S["hmax"]))
+                c = ord("n")
             elif c in (curses.KEY_LEFT, ord("h")):
-                S["hoff"] = max(0, S["hoff"] - step)
+                c = ord("p")
+            if c == ord("v"):
+                S["sums"] = not S["sums"]
+                flash("titles and summaries" if S["sums"] else "titles only", 2)
             elif c in (ord("j"), curses.KEY_DOWN):
                 S["sel"] = min(last, S["sel"] + 1)
             elif c in (ord("k"), curses.KEY_UP):
@@ -4320,7 +4662,6 @@ def tui_main(scr, a, cats, meter=None):
                 # letters, not Tab: terminal emulators and phone keyboards
                 # swallow Tab before curses ever sees it
                 ci[0] = (ci[0] + (-1 if c == ord("p") else 1)) % len(cats)
-                S["hoff"] = 0
                 a.cat = cats[ci[0]]
                 load_now(False, "loading %s..." % cats[ci[0]])
             elif c == ord("f"):
@@ -4341,11 +4682,7 @@ def tui_main(scr, a, cats, meter=None):
                 open_it(rows[S["sel"]][0])
             rows = S["rows"]
             S["sel"] = max(0, min(S["sel"], max(0, len(rows) - 1)))
-            if S["sel"] < S["top"]:
-                S["top"] = S["sel"]
-            if S["sel"] >= S["top"] + (h - 2):
-                S["top"] = S["sel"] - (h - 3)
-            S["top"] = max(0, min(S["top"], max(0, len(rows) - 1)))
+            fit_top()
         else:
             body = S["body"]
             if c in (ord("j"), curses.KEY_DOWN):

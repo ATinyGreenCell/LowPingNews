@@ -74,10 +74,12 @@ per feed; if fewer exist than you asked for, the footer says so. In a terminal
 it opens the reader with that many. `-n` still sets a per-feed limit, and means
 list output. Because numbers are counts, a category name cannot be a number.
 
-In the reader, **← →** (or `h`/`l`) slide the title column sideways so long
-headlines can be read in full; `«` and `»` show there is more. Source and age
-stay put. Arrow keys work in either encoding terminals send, and an
-unrecognised key sequence is ignored rather than mistaken for Esc.
+In the reader each article is a card: its number (the one `news -r N` takes),
+`•` unread or `★` starred, the source and age, then the whole title wrapped to
+your screen, and a dim one-line summary. Everything on a card came with the
+feed, so cards cost no data beyond the list itself. `v` hides summaries to fit
+more cards; **← →** (or `h`/`l`) change category, like `n`/`p`. Titles wrap by
+screen cells, so Chinese and Japanese headlines stay inside the screen too.
 
 ## Weather
 
@@ -419,6 +421,31 @@ a script earlier in your `PATH`, or an alias or function in `~/.bashrc`,
 `~/.profile`, `~/.bash_profile` or `~/.zshrc`. It only reports — your files are
 never edited. After moving or deleting what it names, run `hash -r` (or open a
 new session) so the shell forgets where it last found the old command.
+
+## Weak signal
+
+Built for a phone at the edge of coverage:
+
+- **Cut downloads resume.** When a transfer drops partway, the bytes already
+  received are kept, and the next attempt asks only for the rest - at once
+  (up to twice in the same run), or on the next run within the hour. Every
+  byte of a feed is paid for once. Complete items from the part already
+  received are shown meanwhile. A resume is guarded by `If-Range`, so if the
+  feed changed in between it comes back whole; it is never spliced. Servers
+  that compress on the fly mark their versions "weak", and those are never
+  resumed, because their bytes can differ between requests.
+- **Flickers are retried.** A connection that times out, resets or drops
+  before anything arrives - the failures a weak signal causes - is retried
+  twice, after 0.6 s and 1.8 s, while there is time. A refused connection, a
+  bad certificate or a name that does not exist is a definite answer and fails
+  at once.
+- **Quiet feeds are checked less often.** Even "nothing changed" costs a TLS
+  handshake, about 6.7 KB. Each check that finds nothing new doubles the wait,
+  up to 8x (15 minutes becomes 2 hours, never more than 3); any change snaps it
+  back. Feeds in the alerts category never back off, and `-f` always fetches.
+- **DNS failures fall back.** When a name lookup fails - often the first thing
+  to go on a weak signal - the last address that worked for that host (within
+  14 days) is used. Healthy lookups always win.
 
 ## Speed
 
