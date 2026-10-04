@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "7.9"
+VERSION = "8.1"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -42,6 +42,22 @@ WMO = {0: ("Clear", _S + " "), 1: ("Mostly Clear", _S + " "),
        99: ("Thunder & Hail", _T + _N)}
 MOON = "\u263e "
 WXNAMEMAX = max(len(v[0]) for v in WMO.values())    # 14: every name fits whole
+
+
+def clock(d, short=False, hour=False):
+    """A time of day as people say it: 3:05 PM, 3 PM, or 3p on a tight axis.
+    LPN_CLOCK=24 keeps 24-hour time. d: a datetime, or epoch seconds (local)."""
+    if isinstance(d, (int, float)):
+        d = dt.datetime.fromtimestamp(d)
+    if os.environ.get("LPN_CLOCK") == "24":
+        return d.strftime("%H") if short else d.strftime("%H:00" if hour else "%H:%M")
+    h12 = d.hour % 12 or 12
+    ap = "am" if d.hour < 12 else "pm"
+    if short:
+        return "%d%s" % (h12, ap[0])
+    if hour:
+        return "%d %s" % (h12, ap.upper())
+    return "%d:%02d %s" % (h12, d.minute, ap.upper())
 
 
 def wx_label(code, ascii_, night=False):
@@ -82,7 +98,9 @@ WINRESERVED = set(["CON", "PRN", "AUX", "NUL"] +
                   ["LPT%d" % n for n in range(1, 10)])
 STARCAP = 500
 STORECAP = 40                  # items kept per feed; DW ships 136, you read 5
-TUILIST = 60                   # rows in the interactive list unless a count is given
+SHOW = 10                      # articles shown unless a count is given; m or j adds more
+MORE = 10                      # ...this many at a time
+ALLCAP = 600                   # most stories the reader holds to page through
 DLBUDGET = 4 * 1024 * 1024     # ceiling for one -d run; raise with --budget
 ST = DATA + "/state.json"
 CD = _base("XDG_CACHE_HOME", "LOCALAPPDATA", "~/.cache/news")
@@ -1925,7 +1943,7 @@ def radio_show(a, P, loc, r):
             sev = p.get("severity") or "Unknown"
             col = P["red"] if sev in ("Extreme", "Severe") else P["yel"] if sev == "Moderate" else D
             end = when(p.get("ends") or p.get("expires") or "")
-            until = (" until %s" % time.strftime("%a %H:%M", time.localtime(end))) if end else ""
+            until = (" until %s %s" % (time.strftime("%a", time.localtime(end)), clock(end))) if end else ""
             ev = (p.get("event") or "Alert").upper()
             if 2 + len(ev) + len(until) <= cols:
                 print("\n  " + col(B(ev)) + D(until))
@@ -2047,7 +2065,7 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     t0 = L(cu["time"])
     icon, name = wx_label(cu.get("weather_code"), a.ascii, night=not cu.get("is_day", 1))
     place = loc.get("label") or "%.3f,%.3f" % (loc["lat"], loc["lon"])
-    when_ = "%s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"), t0.strftime("%H:%M"))
+    when_ = "%s %d %s %s" % (t0.strftime("%a"), t0.day, t0.strftime("%b"), clock(t0))
     if len(place) + 2 + len(when_) <= cols:
         print(P["hdr"](place) + D("  " + when_))
     else:                                       # a narrow screen: one line each
@@ -2056,7 +2074,7 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     for p_ in radio_banner(loc)[:3]:
         end_ = when(p_.get("ends") or p_.get("expires") or "")
         print("  " + P["red"](P["b"]("%s %s" % ("!!" if a.ascii else "\u26a0", (p_.get("event") or "Alert")[:cols - 6])))
-              + (P["d"](" until %s" % time.strftime("%a %H:%M", time.localtime(end_)))
+              + (P["d"](" until %s %s" % (time.strftime("%a", time.localtime(end_)), clock(end_)))
                  if end_ and len(p_.get("event") or "") + 20 <= cols else ""))
     if radio_banner(loc):
         print(P["d"]("  details: lowpingnews radio"))
@@ -2100,10 +2118,10 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
         ts, lbl = min(cand)
         mins = int((ts - cu["time"]) / 60)
         word = "Sunrise" if lbl == "rises" else "Sunset"
-        sun_short = D("  %s %s" % (word, L(ts).strftime("%H:%M")))
+        sun_short = D("  %s %s" % (word, clock(L(ts))))
         if mins < 180:                      # imminent: say how long is left
             sun = P["yel"]("  %s %s, in %dh %02dm" % (
-                word, L(ts).strftime("%H:%M"), mins // 60, mins % 60))
+                word, clock(L(ts)), mins // 60, mins % 60))
         else:
             sun = sun_short
     unit_w = " mph" if a.unit == "fahrenheit" else " km/h"
@@ -2125,14 +2143,14 @@ def wx_show(a, P, loc, d, wire, age_s, stale):
     unit_p = "in" if a.unit == "fahrenheit" else "mm"
     # probability alone does not support a decision; the amount does
     if pr[k] >= 10:
-        note = "Rain %d%% around %s" % (pr[k], L(h["time"][k]).strftime("%H:00"))
+        note = "Rain %d%% around %s" % (pr[k], clock(L(h["time"][k]), hour=True))
         note += (", %.2f %s total" % (tot, unit_p)) if tot >= 0.005 else ", a trace"
     else:
         note = "No rain expected"
     print("  " + P["cyn"](rainbar(pr, a.ascii)))
     ax = [" "] * n
     for i in range(0, n, 6):               # a sparkline you cannot time-index is
-        lab = L(h["time"][i]).strftime("%H")    # a picture, not a forecast
+        lab = clock(L(h["time"][i]), short=True)    # a picture, not a forecast
         for j, ch in enumerate(lab):
             if i + j < n:
                 ax[i + j] = ch
@@ -3757,7 +3775,8 @@ def tui_available():
         if os.name == "nt":
             return False, ("the interactive view needs curses, which is not "
                            "bundled on Windows.\n  pip install windows-curses")
-        return False, "curses is unavailable here (%s)" % str(e)[:50]
+        return False, ("the interactive view needs curses, which this Python lacks (%s).\n"
+                       "  Use --plain for the printed list." % str(e)[:50])
 
 
 TUIRETRY = 120                 # after a background refresh FAILS, wait this long
@@ -3828,7 +3847,7 @@ def _tui_rows(a, fresh):
             continue
         seen.add(k)
         rows.append((it, x))
-    return rows[:getattr(a, "count", None) or TUILIST], meta
+    return rows[:ALLCAP], meta
 
 
 def tui_freshness(meta):
@@ -4321,7 +4340,8 @@ def tui_main(scr, a, cats, meter=None):
     # ---- state -----------------------------------------------------------
     S = {"rows": [], "meta": {}, "st": state(), "sel": 0, "top": 0,
          "mode": "list", "body": [], "bscroll": 0, "reading": None,
-         "sums": True}                         # cards show the feed's one-line summary
+         "sums": True,                         # cards show the feed's one-line summary
+         "all": [], "limit": getattr(a, "count", None) or SHOW}
     note = {"text": "", "until": 0.0}          # transient status line
     act = {"last": time.time()}                 # opening the reader counts as use
     bg = {"thread": None, "result": None, "gen": 0, "last_try": 0.0}
@@ -4332,12 +4352,29 @@ def tui_main(scr, a, cats, meter=None):
         the outcome when the work ends, so none outlives what it describes."""
         note["text"], note["until"] = text, time.time() + secs
 
-    def adopt(rows, meta, keep_sel=True):
+    def adopt(full, meta, keep_sel=True):
         """Install a new list, keep the cursor on the same story if it is
-        still there, and make -r/-o/-S numbering match what is on screen."""
+        still there, and make -r/-o/-S numbering match what is on screen.
+        Within a category nothing visible is pushed out: the window grows to
+        keep down to the oldest story already shown, plus whatever is new
+        above it. -> how many stories are new."""
         cur = None
         if keep_sel and S["rows"] and 0 <= S["sel"] < len(S["rows"]):
             cur = key(S["rows"][S["sel"]][0]["ti"])
+        same = bool(S["meta"]) and S["meta"].get("cat") == meta.get("cat")
+        known = {key(it["ti"]) for it, _x in S["all"]}
+        lim, new_n = S["limit"], 0
+        if same and S["rows"]:
+            oldest = key(S["rows"][-1][0]["ti"])
+            for i, (it, _x) in enumerate(full):
+                if key(it["ti"]) == oldest:
+                    lim = max(lim, i + 1)
+                    break
+            new_n = sum(1 for it, _x in full[:lim] if key(it["ti"]) not in known)
+        elif not same and S["meta"]:
+            lim = getattr(a, "count", None) or SHOW      # a new category starts short again
+        S["all"], S["limit"] = full, max(1, lim)
+        rows = full[:S["limit"]]
         S["rows"], S["meta"] = rows, meta
         S["st"] = state()                      # read/star may have changed elsewhere
         S["sel"] = 0
@@ -4358,16 +4395,38 @@ def tui_main(scr, a, cats, meter=None):
             jwrite(LAST, [dict(it, src=x["name"]) for it, x in rows])
         except Exception:
             pass
+        return new_n
+
+    def show_more():
+        """Ten more, further back in time: from what is already stored, so it
+        costs nothing. Says plainly when the feeds hold nothing older."""
+        if S["limit"] >= len(S["all"]):
+            old = S["all"][-1][0].get("d") if S["all"] else None
+            sec = age_secs(old) if old else -1
+            flash("that is everything stored%s" % ((", back to %s" % ago(sec)) if sec >= 0 else ""), 3)
+            return False
+        before = len(S["rows"])
+        S["limit"] = min(len(S["all"]), S["limit"] + MORE)
+        S["rows"] = S["all"][:S["limit"]]
+        try:
+            jwrite(LAST, [dict(it, src=x["name"]) for it, x in S["rows"]])
+        except Exception:
+            pass
+        flash("%d more, back to %s" % (len(S["rows"]) - before,
+                                        ago(age_secs(S["rows"][-1][0].get("d"))) if S["rows"][-1][0].get("d")
+                                        else "an unknown time"), 2.5)
+        return True
 
     def load_now(fresh, label):
         flash(label, 3600)
         draw()
         bg["gen"] += 1                          # anything in flight is now obsolete
         rows, meta = _tui_rows(a, fresh)
-        adopt(rows, meta, keep_sel=False)
+        new_n = adopt(rows, meta, keep_sel=False)
         S["top"] = 0
         txt, _c, stale = tui_freshness(meta)
-        flash(("refreshed" if not stale else "could not refresh: " + txt), 2.5)
+        flash(("could not refresh: " + txt) if stale else
+              ("refreshed, %d new at the top" % new_n) if new_n else "refreshed, nothing new", 2.5)
 
     def want_background():
         """Refresh on our own when the data has aged past its TTL, cheaply:
@@ -4409,15 +4468,18 @@ def tui_main(scr, a, cats, meter=None):
         if tui_freshness(meta)[2]:
             bg["last_try"] = time.time()        # still stale: the source is down
         if rows or not S["rows"]:
-            adopt(rows, meta)
+            n_new = adopt(rows, meta)
+            if n_new:
+                flash("%d new at the top" % n_new, 4)
 
     # ---- drawing ---------------------------------------------------------
     def draw():
         scr.erase()
         h, w = scr.getmaxyx()
         rows = S["rows"]
-        hdr = " LowPingNews %s  %s  %d item%s " % (
-            VERSION, cats[ci[0]].upper(), len(rows), "" if len(rows) == 1 else "s")
+        hdr = " LowPingNews %s  %s  %d item%s%s " % (
+            VERSION, cats[ci[0]].upper(), len(rows), "" if len(rows) == 1 else "s",
+            (" of %d" % len(S["all"])) if len(S["all"]) > len(rows) else "")
         fresh_txt, fresh_col, _st = tui_freshness(S["meta"]) if S["meta"] else ("", 2, False)
         if bg["thread"] is not None:
             fresh_txt, fresh_col = "refreshing", 3
@@ -4487,6 +4549,18 @@ def tui_main(scr, a, cats, meter=None):
                         put(y, 0, txt.ljust(w - 1), w - 1, at)
                     y += 1
                 idx += 1
+            if rows and idx >= len(rows) and y < h - 1:
+                # the end of the list says what lies beyond it, and how far back
+                more_n = len(S["all"]) - len(rows)
+                if more_n > 0:
+                    nxt = S["all"][min(len(S["all"]), len(rows) + MORE) - 1][0].get("d")
+                    end_txt = "  %s m: %d more, to %s" % ("v" if a.ascii else "\u25be", min(MORE, more_n),
+                                                         ago(age_secs(nxt)) if nxt else "an unknown time")
+                else:
+                    od = rows[-1][0].get("d")
+                    end_txt = "  all %d shown%s" % (len(rows), (", oldest " + ago(age_secs(od))) if od else "")
+                put(y, 0, end_txt.ljust(w - 1), w - 1, C(4))
+                y += 1
             while y < h - 1:                        # clear below the last card
                 put(y, 0, " " * (w - 1), w - 1, C(0))
                 y += 1
@@ -4495,9 +4569,9 @@ def tui_main(scr, a, cats, meter=None):
                 if S["bscroll"] + n >= len(S["body"]):
                     break
                 put(n + 1, 0, S["body"][S["bscroll"] + n][:w - 1], w - 1)
-        keys = (fit_keys(["j/k", "enter read", "s star", "o open", "r refresh",
+        keys = (fit_keys(["j/k", "enter read", "m more", "s star", "o open", "r refresh",
                           ("n/p" if a.ascii else "\u2190\u2192") + " cat", "v view", "f feeds", "q quit"],
-                         ["j/k", "v view", "r refresh", "o open", "f feeds", "s star"], w - 1)
+                         ["j/k", "m more", "v view", "r refresh", "o open", "f feeds", "s star"], w - 1)
                 if S["mode"] == "list" else
                 " j/k scroll  b back  s star  o open  q quit")
         msg = note["text"] if time.time() < note["until"] else ""
@@ -4633,11 +4707,17 @@ def tui_main(scr, a, cats, meter=None):
                 c = ord("n")
             elif c in (curses.KEY_LEFT, ord("h")):
                 c = ord("p")
-            if c == ord("v"):
+            if c == ord("m"):
+                if show_more():
+                    S["sel"] = min(len(S["rows"]) - 1, S["sel"] + 1) if S["sel"] >= last else S["sel"]
+            elif c == ord("v"):
                 S["sums"] = not S["sums"]
                 flash("titles and summaries" if S["sums"] else "titles only", 2)
             elif c in (ord("j"), curses.KEY_DOWN):
-                S["sel"] = min(last, S["sel"] + 1)
+                if S["sel"] >= last and S["rows"] and show_more():
+                    S["sel"] = last + 1                # past the end: keep going back in time
+                else:
+                    S["sel"] = min(last, S["sel"] + 1)
             elif c in (ord("k"), curses.KEY_UP):
                 S["sel"] = max(0, S["sel"] - 1)
             elif c in (curses.KEY_NPAGE, ord(" ")):
@@ -4803,85 +4883,144 @@ def cmd_tui(a, P, D, explicit=True):
     return True
 
 
+UPDATE_URL = "https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/news"
+MAIN_GUARD = '\nif __name__ == "__main__":'
+
+
+def update_verdict(raw, partial):
+    """-> (version, None) for a complete, plausible program, or (None, why).
+    A transfer cut between two functions still parses, so completeness is
+    checked separately: no partial flag, and the closing main guard present."""
+    if partial:
+        return None, "the download was cut short"
+    try:
+        txt = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "the download is not text"
+    # an error page or some other file: this program has these, wherever they sit
+    if len(raw) < 8000 or "\ndef cmd_update(" not in txt or "\ndef main(" not in txt:
+        return None, "that does not look like LowPingNews (%s)" % kbs(len(raw))
+    if MAIN_GUARD not in txt[-1500:]:
+        return None, "the download is incomplete (its last part is missing)"
+    try:
+        import ast
+        ast.parse(txt)
+    except SyntaxError as e:
+        return None, "the download does not parse (line %s)" % e.lineno
+    m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', txt, re.M)
+    if not m:
+        return None, "the download has no version"
+    return m.group(1), None
+
+
+def update_why(e):
+    """A download failure in words a user can act on."""
+    t = str(getattr(e, "reason", None) or e)
+    if "CERTIFICATE_VERIFY_FAILED" in t:
+        return ("this Python cannot check HTTPS certificates. On macOS, run "
+                "'Install Certificates.command' in the Python folder under Applications")
+    return t[:80]
+
+
 def cmd_update(a, P, D):
-    url = a.update or os.environ.get("NEWS_UPDATE_URL", "")
+    """Replace this program with the latest release, on any platform. Nothing
+    is replaced unless the new copy is complete, parses, is newer, and runs."""
+    import subprocess
     uf = CFD + "/update.url"
+    url = a.update or os.environ.get("NEWS_UPDATE_URL", "")
     if not url and os.path.exists(uf):
-        url = open(uf, encoding="utf-8").read().strip()
-    if not url:
-        sys.exit("news: no update URL. Set one once:\n"
-                 "  news --update https://.../news")
+        try:
+            url = io.open(uf, encoding="utf-8").read().strip()
+        except OSError:
+            url = ""
+    url = url or UPDATE_URL
+    if not url.startswith(("https://", "http://")):
+        sys.exit("news: an update address must start with https:// (got %r)" % url[:60])
     me = os.path.realpath(sys.argv[0])
-    if not os.access(me, os.W_OK):
-        sys.exit("news: %s is not writable" % me)
-    # Ask for the first 4 KB only: VERSION sits near the top, and most checks
-    # end in "already current". A server that ignores Range sends everything,
-    # which is no worse than before; a partial gzip still decodes its head.
+    where = os.path.dirname(me)
+    if not os.access(me, os.W_OK) or not os.access(where, os.W_OK):
+        sys.exit("news: cannot write %s.\n  It was installed where your account cannot change it. Either run the\n"
+                 "  update as the account that installed it, or reinstall into your own\n"
+                 "  folder: sh install.sh (it picks ~/.local/bin when /usr/local is closed)" % me)
+    # the first 4 KB settle most checks: VERSION is near the top
     if os.environ.get("LPN_FORCE") != "1":
         try:
             head, _h, _w, _p = get(url, 30, extra={"Range": "bytes=0-4095"}, cap=PAGECAP)
-            peek = "?"
-            for ln in head.decode("utf-8", "replace").splitlines()[:60]:
-                if ln.startswith("VERSION = "):
-                    peek = ln.split("=", 1)[1].strip().strip('"\'')
-                    break
+            m_ = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', head.decode("utf-8", "replace"), re.M)
+            peek = m_.group(1) if m_ else "?"
             if peek == VERSION:
-                print(D("  already %s %s %s" % (VERSION, bul_(a), spent())))
+                print(D("  already %s, the latest %s %s" % (VERSION, bul_(a), spent())))
                 return
             if peek != "?" and vkey(peek) < vkey(VERSION):
-                sys.exit("news: %s offers %s, older than the installed %s - not "
-                         "installing.\n  Set LPN_FORCE=1 to downgrade deliberately."
-                         % (url, peek, VERSION))
+                sys.exit("news: %s offers %s, older than the installed %s - not installing.\n"
+                         "  Set LPN_FORCE=1 to downgrade deliberately." % (url, peek, VERSION))
         except SystemExit:
             raise
         except Exception:
             pass                               # no verdict from the head: fetch it all
     try:
-        raw, _, wire, _p = get(url, 30, cap=PAGECAP)
+        raw, _h, _w, part = get(url, 60, cap=PAGECAP)
     except Exception as e:
-        sys.exit("news: download failed - %s" % str(e)[:70])
-    txt = raw.decode("utf-8", "replace")
-    # verify before overwriting ourselves: truncated downloads are the
-    # normal failure mode on a lossy link, and a half-file still "installs"
-    if len(raw) < 8000 or "ultra-light headlines" not in txt:
-        sys.exit("news: that does not look like news (%s) - not installing" % kbs(len(raw)))
-    try:
-        import ast
-        ast.parse(txt)
-    except SyntaxError as e:
-        sys.exit("news: downloaded file does not parse (line %s) - not installing"
-                 % e.lineno)
-    new = "?"
-    for ln in txt.splitlines()[:40]:
-        if ln.startswith("VERSION = "):
-            new = ln.split("=", 1)[1].strip().strip('"\'')
-    # never go backwards on its own: a stale branch or mirror would otherwise
-    # quietly undo fixes (this happened: 6.5 "updated" to 6.1)
+        sys.exit("news: download failed - %s" % update_why(e))
+    new, why = update_verdict(raw, part)
+    if why:
+        sys.exit("news: %s - nothing changed. Try again on a steadier connection." % why)
     if new == VERSION:
-        print(D("  already %s %s %s" % (VERSION, bul_(a), spent())))
+        print(D("  already %s, the latest %s %s" % (VERSION, bul_(a), spent())))
         return
     if vkey(new) < vkey(VERSION) and os.environ.get("LPN_FORCE") != "1":
         sys.exit("news: %s offers %s, older than the installed %s - not installing.\n"
                  "  Set LPN_FORCE=1 to downgrade deliberately." % (url, new, VERSION))
-    lines = txt.splitlines(True)
-    if lines and lines[0].startswith("#!"):
-        lines[0] = "#!%s\n" % (sys.executable or "/usr/bin/env python3")
-    tmp = me + ".new"
-    open(tmp, "w", encoding="utf-8").write("".join(lines))
-    os.chmod(tmp, 0o755)
+    # keep what the installer chose: its interpreter line, and the file mode
+    body = raw
     try:
-        shutil_copy(me, me + ".bak")
-    except Exception:
-        pass
-    os.replace(tmp, me)                      # atomic: never a half-written news
-    print(D("  updated %s -> %s %s %s %s backup at %s.bak"
-            % (VERSION, new, bul_(a), spent(), bul_(a),
-               os.path.basename(me))))
-    if not os.path.exists(uf) or open(uf, encoding="utf-8").read().strip() != url:
-        os.makedirs(CFD, exist_ok=True)
-        open(uf, "w", encoding="utf-8").write(url + "\n")
-    return
-
+        first = io.open(me, "rb").readline()
+    except OSError:
+        first = b""
+    if body.startswith(b"#!"):
+        nl = body.find(b"\n")
+        keep = first.rstrip(b"\r\n") if first.startswith(b"#!") else \
+            ("#!%s" % (sys.executable or "/usr/bin/env python3")).encode()
+        body = keep + body[nl:]
+    try:
+        mode = os.stat(me).st_mode & 0o777 | 0o100
+    except OSError:
+        mode = 0o755
+    tmp = me + ".new"
+    try:
+        with io.open(tmp, "wb") as fh:             # bytes: no CRLF on Windows
+            fh.write(body)
+        os.chmod(tmp, mode)
+        # run the new copy before trusting it: catches a program that parses
+        # but fails on this Python or this platform
+        env_ = dict(os.environ, LPN_NO_PING="1")
+        r = subprocess.run([sys.executable, tmp, "--version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=env_, timeout=60)
+        said = r.stdout.decode("utf-8", "replace").strip()
+        if r.returncode != 0 or not said.endswith(new):
+            err = (r.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
+            raise RuntimeError("the new version did not start here (%s)" % (err[:70] or said[:70]))
+        try:
+            shutil_copy(me, me + ".bak")
+        except Exception:
+            pass
+        os.replace(tmp, me)                       # atomic: never a half-written news
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        sys.exit("news: update not installed - %s. Your current %s is untouched."
+                 % (e if isinstance(e, RuntimeError) else update_why(e), VERSION))
+    print(D("  updated %s -> %s %s %s" % (VERSION, new, bul_(a), spent())))
+    print(D("  the previous version is kept at %s.bak" % me))
+    if url != UPDATE_URL:
+        try:
+            if not os.path.exists(uf) or io.open(uf, encoding="utf-8").read().strip() != url:
+                os.makedirs(CFD, exist_ok=True)
+                io.open(uf, "w", encoding="utf-8").write(url + "\n")
+        except OSError:
+            pass
 
 def cmd_pick(a, P, D, pick):
     try:
@@ -5292,7 +5431,7 @@ def run(a):
         now_ = dt.datetime.now()
         print(P["hdr"]("NEWS") + " " + P["cyn"]((a.cat or "top").lower()) +
               D("   %s %d %s %s" % (now_.strftime("%a"), now_.day,
-                                    now_.strftime("%b"), now_.strftime("%H:%M"))))
+                                    now_.strftime("%b"), clock(now_))))
         print()
         st_seen, st_keep, st_n = set(), [], [0]
         wrap_s = textwrap.TextWrapper(width=max(20, cols_s - 5),
@@ -5351,6 +5490,10 @@ def run(a):
         return
     rows, seen, down, skipped, stale, bytes_, nm, partial_n = \
         [], set(), [], [], 0, 0, 0, 0
+    # no count and no -n: the newest SHOW across every feed (each feed may
+    # supply all of them), with the footer saying how many more there are
+    by_default = getattr(a, "count", None) is None and getattr(a, "n", 5) in (None, 5)
+    per_feed = None if by_default else a.n      # newest overall: every stored item competes
     for x in srcs:
         items, nb, sta, unch, part_ = bag.get(x["id"], ([], 0, -1, 0, 0))
         bytes_ += nb
@@ -5362,18 +5505,22 @@ def run(a):
         if sta == -1:
             down.append(x["name"])
             continue
-        for it in sorted(items, key=lambda z: -when_sort(z))[:a.n]:
+        for it in sorted(items, key=lambda z: -when_sort(z))[:per_feed]:
             k = key(it["ti"])
             if k in seen:
                 continue
             seen.add(k)
             rows.append((x["name"], it))
     rows.sort(key=lambda r: -when_sort(r[1]))
-    want_n = getattr(a, "count", None)
+    want_n = getattr(a, "count", None) or (SHOW if by_default else None)
+    total = len(rows)
     if want_n:
         rows = rows[:want_n]
     foot = "%s %s" % (bul_(a), spent())
-    if want_n and len(rows) < want_n:
+    if by_default and total > len(rows):
+        foot += " %s %d of %d: lowpingnews %s %d for more" % (
+            bul_(a), len(rows), total, (a.cat or "top").lower(), min(total, len(rows) + MORE))
+    if getattr(a, "count", None) and len(rows) < want_n:
         foot += " %s only %d of %d available" % (bul_(a), len(rows), want_n)
     if partial_n:
         foot += " %s %d truncated, salvaged" % (bul_(a), partial_n)
@@ -5444,7 +5591,7 @@ def show(a, rows, rd, tag, foot):
     now = dt.datetime.now()
     print(P["hdr"]("NEWS") + " " + P["cyn"](tag) +
           D("   %s %d %s %s" % (now.strftime("%a"), now.day,
-                                now.strftime("%b"), now.strftime("%H:%M"))))
+                                now.strftime("%b"), clock(now))))
     if not rows:
         print(D("  nothing to show " + foot))
         return

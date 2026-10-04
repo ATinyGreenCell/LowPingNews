@@ -603,7 +603,7 @@ def t_tui_survives_an_empty_list(env, srv):
     import pty, select, struct, termios, fcntl
     sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"],
                    "url": "http://127.0.0.1:9/nothing"}])
-    out = _drive_tui(env, [b"j", b"j", b"k", b"\r", b"s", b"n", b" ", b"q"])
+    out = _drive_tui(env, [b"j", b"j", b"k", b"\r", b"s", b"m", b"n", b" ", b"m", b"q"])
     assert "Traceback" not in out, out[-300:]
 
 
@@ -2579,6 +2579,237 @@ def t_the_way_out_is_always_on_screen(env, srv):
     sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"], "url": srv.url("/f")}])
     assert "q quit" in _drive_tui(env, [b"q"], cols=48), "the reader hid its quit key at 48 columns"
     assert "q back" in _drive_tui(env, [b"q"], cols=48, args=("catalog",)), "the editor hid its way out"
+
+
+# ---------------------------------------------------------------- updating
+def _build(ver, mutate=None):
+    s = re.sub(r'^VERSION = "[^"]+"', 'VERSION = "%s"' % ver,
+               io.open(NEWS, encoding="utf-8").read(), count=1, flags=re.M)
+    return (mutate(s) if mutate else s).encode()
+
+
+def _serve_build(srv, body, short=0):
+    def h(req):
+        rg, b = req.headers.get("Range"), body
+        if rg and rg.startswith("bytes=0-"):
+            b = body[:int(rg.split("-")[1]) + 1]
+            req.send_response(206)
+        else:
+            req.send_response(200)
+        req.send_header("Content-Length", str(len(b)))
+        req.end_headers()
+        req.wfile.write(b[:len(b) - short] if (short and not rg) else b)
+        if short and not rg:
+            req.close_connection = True
+    srv.routes["/news"] = h
+
+
+def _installed_copy():
+    """A scratch install with a non-default interpreter line and file mode."""
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "news")
+    b = io.open(NEWS, "rb").read()
+    io.open(p, "wb").write(("#!" + sys.executable).encode() + b[b.find(b"\n"):])
+    os.chmod(p, 0o700)
+    return d, p
+
+
+def _self_update(env, p, url):
+    r = subprocess.run([sys.executable, p, "--update", url], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=env)
+    v = subprocess.run([sys.executable, p, "--version"], stdout=subprocess.PIPE).stdout.decode().strip()
+    return (r.stdout + r.stderr).decode("utf-8", "replace"), v, r.returncode
+
+
+@test
+def t_update_keeps_the_install_intact(env, srv):
+    import stat
+    _serve_build(srv, _build("99.0"))
+    d, p = _installed_copy()
+    out, v, rc = _self_update(env, p, srv.url("/news"))
+    raw = io.open(p, "rb").read()
+    assert rc == 0 and v.endswith("99.0"), out
+    assert raw.split(b"\n")[0] == ("#!" + sys.executable).encode(), "the installer's interpreter line was lost"
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o700, "the file mode was changed"
+    assert b"\r" not in raw, "line endings were rewritten"
+    assert os.path.exists(p + ".bak") and not os.path.exists(p + ".new")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def t_update_refuses_anything_but_a_complete_working_newer_build(env, srv):
+    cur = load().VERSION
+    s99 = _build("99.0").decode()
+    for label, body, short, why in (
+            ("cut just before its end, which still parses", s99[:s99.index("\nif __name__")].encode(), 0, "incomplete"),
+            ("cut mid-transfer", _build("99.0"), 5000, "cut short"),
+            ("an error page", b"<html><body>Not Found</body></html>" * 300, 0, "does not look like"),
+            ("a build that fails to start here", _build("99.0", lambda s: s.replace(
+                "\nimport threading as _thr", "\nimport no_such_module_xyz\nimport threading as _thr", 1)), 0,
+             "did not start"),
+            ("an older build", _build("1.0"), 0, "older")):
+        _serve_build(srv, body, short)
+        d, p = _installed_copy()
+        out, v, rc = _self_update(env, p, srv.url("/news"))
+        assert rc != 0 and v.endswith(cur) and why in out, "%s: %s" % (label, out[-200:])
+        assert not os.path.exists(p + ".new"), "%s left a .new file" % label
+        shutil.rmtree(d, ignore_errors=True)
+    d, p = _installed_copy()
+    _serve_build(srv, _build(cur))
+    out, _v, rc = _self_update(env, p, srv.url("/news"))
+    assert rc == 0 and "already" in out
+    out, _v, rc = _self_update(env, p, "ftp://example.org/news")
+    assert rc != 0 and "https://" in out
+    assert load().UPDATE_URL == "https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/news"
+
+
+@test
+def t_runs_without_unix_only_modules(env, srv):
+    """As on Windows: no curses, termios, fcntl, tty or pty. Everything must
+    still work, falling back to printed lists."""
+    hide = tempfile.mkdtemp()
+    io.open(os.path.join(hide, "sitecustomize.py"), "w").write(
+        "import sys\nH={'curses','_curses','termios','fcntl','tty','pty','readline','resource','grp','pwd'}\n"
+        "class B:\n    def find_spec(self, n, p=None, t=None):\n"
+        "        if n.split('.')[0] in H: raise ImportError(n)\n"
+        "sys.meta_path.insert(0, B())\n")
+    try:
+        e = dict(env, PYTHONPATH=hide)
+        srv.feed("/f", [item("Story %d" % i) for i in range(3)])
+        sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"], "url": srv.url("/f")}])
+        for args in ([], ["top", "2"], ["-r", "1"], ["catalog"], ["signal"]):
+            r = subprocess.run([sys.executable, NEWS] + args, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=e, timeout=60)
+            assert r.returncode == 0 and b"Traceback" not in r.stderr, (args, r.stderr[-300:])
+        out = _drive_tui(e, [], args=(), ready=lambda b: b"Story" in b)
+        assert "Story 0" in out and "Traceback" not in out, "no fallback to the list without curses"
+        out = _drive_tui(e, [], args=("--tui",), ready=lambda b: b"curses" in b)
+        assert "--plain" in out or "windows-curses" in out, \
+            "asking for the reader without curses should say what to do instead: " + out[-200:]
+        _serve_build(srv, _build("99.0"))
+        d, p = _installed_copy()
+        _out, v, _rc = _self_update(e, p, srv.url("/news"))
+        assert v.endswith("99.0"), "self-update needs a Unix-only module"
+    finally:
+        shutil.rmtree(hide, ignore_errors=True)
+
+
+@test
+def t_the_command_finds_where_it_is_installed(env, srv):
+    """It assumed /usr/local/bin whenever PREFIX was unset, while install.sh
+    puts a desktop user's copy in ~/.local/bin."""
+    tmp = tempfile.mkdtemp()
+    try:
+        home, repo = os.path.join(tmp, "home"), os.path.join(tmp, "repo")
+        lb = os.path.join(home, ".local", "bin")
+        for d_ in (lb, repo, os.path.join(tmp, "empty")):
+            os.makedirs(d_)
+        for d_ in (lb, repo):
+            shutil.copy(NEWS, d_); shutil.copy(os.path.join(HERE, "lowpingnews"), d_)
+        snip = re.search(r"^_here=.*?^fi$", io.open(os.path.join(HERE, "lowpingnews")).read(), re.M | re.S).group(0)
+
+        def where(argv0, path, prefix=None):
+            e = {"HOME": home, "PATH": path + ":/usr/bin:/bin", "LPN_REPO": repo}
+            if prefix:
+                e["PREFIX"] = prefix
+            sh = 'REPO="%s"\n%s\necho "$BIN"' % (repo, snip.replace("$0", argv0))
+            return subprocess.run(["sh", "-c", sh], stdout=subprocess.PIPE, env=e).stdout.decode().strip()
+        assert where("/x/usr/bin/lowpingnews", lb, "/x/usr") == "/x/usr/bin", "Termux PREFIX must come first"
+        assert where(os.path.join(lb, "lowpingnews"), lb) == lb
+        assert where(os.path.join(repo, "lowpingnews"), lb) == lb, "never the repo clone"
+        assert where(os.path.join(repo, "lowpingnews"), os.path.join(tmp, "empty")) == lb
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_shell_scripts_avoid_gnu_only_sed(env, srv):
+    """sed -i takes different arguments on macOS, so every use of it failed there."""
+    for f in ("lowpingnews", "install.sh"):
+        for n, ln in enumerate(io.open(os.path.join(HERE, f), encoding="utf-8"), 1):
+            code = ln.split("#", 1)[0]
+            assert "sed -i" not in code, "%s line %d uses sed -i" % (f, n)
+
+
+# ---------------------------------------------------------------- 8.1
+@test
+def t_the_list_shows_ten_and_says_how_many_more(env, srv):
+    _three_feeds(srv, env)
+    count = lambda o: len(re.findall(r"^\s+\d+ [ABC] ", o, re.M))
+    out, _e, _rc = run(env, "-t")
+    flat = " ".join(out.split())
+    assert count(out) == 10, "default should be the newest 10, got %d" % count(out)
+    assert "10 of 60: lowpingnews top 20 for more" in flat, "the footer should give the true total: " + flat[-120:]
+    out, _e, _rc = run(env, "top", "13", "-t")
+    assert count(out) == 13 and "for more" not in out
+    out, _e, _rc = run(env, "-n", "2", "-t")
+    assert count(out) == 6, "-n is still a per-feed limit"
+
+
+def _growing_feed(srv, path, n_old=30, n_new=3):
+    """Old stories on the first request; three newer ones on top afterwards."""
+    calls = [0]
+
+    def h(req):
+        calls[0] += 1
+        titles = (["New story %d" % i for i in range(n_new)] if calls[0] > 1 else []) + \
+                 ["Old story %02d" % i for i in range(n_old)]
+        body = ('<?xml version="1.0"?><rss version="2.0"><channel><title>A</title>%s</channel></rss>' % "".join(
+            "<item><title>%s</title><link>%s/%d</link><description>s</description><pubDate>%s</pubDate></item>" % (
+                ti, NOWHERE, i, time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(
+                    # new: 10-30 minutes ago; old: an hour ago and back. Never in the
+                    # future - future-dated items are deliberately not pinned on top
+                    time.time() - (600 * (int(ti.split()[-1]) + 1) if ti.startswith("New")
+                                   else 3600 * (int(ti.split()[-1]) + 1)))))
+            for i, ti in enumerate(titles))).encode()
+        req.send_response(200)
+        req.send_header("Content-Length", str(len(body)))
+        req.end_headers()
+        req.wfile.write(body)
+    srv.routes[path] = h
+
+
+@test
+def t_the_reader_loads_more_and_keeps_new_stories_on_top(env, srv):
+    _growing_feed(srv, "/a")
+    srv.feed("/b", [item("Science story %d" % i) for i in range(25)])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"], "url": srv.url("/a")},
+                  {"id": "b", "name": "B", "kind": "rss", "cats": ["science"], "url": srv.url("/b")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    shots = _tui_frames(e, [b"j"] * 9 + [b"j", b"r", b"n", b"p"], rows=40, cols=60)
+    banner = lambda sh: next((l for l in sh if "LowPingNews" in l), "")
+    sel = lambda sh: next((int(m_.group(1)) for l in sh for m_ in [_SEL.search(l)] if m_), None)
+    assert "10 items of 30" in banner(shots[0]), banner(shots[0])
+    assert sel(shots[9]) == 10 and sel(shots[10]) == 11, "j on the last card should load more"
+    assert "20 items of 30" in banner(shots[10])
+    after = shots[11]
+    assert "23 items of 33" in banner(after), "new stories should be added, nothing pushed out: " + banner(after)
+    assert any("New story 0" in l for l in after) and "3 new at the top" in " ".join(after)
+    assert "SCIENCE  10 items of 25" in banner(shots[12]) and "TOP  10 items of 33" in banner(shots[13])
+
+
+@test
+def t_times_read_am_and_pm(env, srv):
+    m = load()
+    import datetime as dt_
+    for h_, mi, full, short, hour in ((0, 0, "12:00 AM", "12a", "12 AM"), (12, 0, "12:00 PM", "12p", "12 PM"),
+                                      (15, 5, "3:05 PM", "3p", "3 PM"), (9, 30, "9:30 AM", "9a", "9 AM")):
+        d_ = dt_.datetime(2026, 10, 4, h_, mi)
+        assert (m.clock(d_), m.clock(d_, short=True), m.clock(d_, hour=True)) == (full, short, hour), h_
+    tmp = tempfile.mkdtemp()
+    try:
+        srv.json("/fc", _forecast(rain=True))
+        b = _wx_binary(srv, tmp)
+        subprocess.run([b, "weather", "-c", "40.9,-73.4"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        out = re.sub(r"\x1b\[[0-9;]*m", "", subprocess.run([b, "weather", "--plain"], stdout=subprocess.PIPE,
+                                                           env=env).stdout.decode())
+        assert re.search(r"around \d{1,2} (AM|PM)", out) and re.search(r"\b\d{1,2}[ap]\b", out), out
+        e = dict(env, LPN_CLOCK="24")
+        out = re.sub(r"\x1b\[[0-9;]*m", "", subprocess.run([b, "weather", "--plain"], stdout=subprocess.PIPE,
+                                                           env=e).stdout.decode())
+        assert re.search(r"around \d\d:00", out), "LPN_CLOCK=24 should keep 24-hour time"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @test

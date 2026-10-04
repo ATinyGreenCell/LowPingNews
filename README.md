@@ -27,23 +27,90 @@ NEWS top   Sun 13 Sep 19:35
 
 `●` unread  `↓` article text already downloaded, readable offline at zero cost
 
+That is the printed list (`--plain`, or any time output is piped). In a terminal
+it opens an interactive reader instead: each article a card with the whole
+title, tap or `j`/`k` to move, Enter to read, `q` to quit.
+
 ---
 
 ## Install
 
+Needs Python 3.5 or newer and nothing else: no pip packages, no API keys.
+
+**Android (Termux)**
+
 ```sh
+pkg install python git
 git clone https://github.com/ATinyGreenCell/LowPingNews
-cd LowPingNews
-sh install.sh
-lowpingnews --check
+cd LowPingNews && sh install.sh
+lowpingnews
 ```
 
-Needs Python 3.5 or newer. That is the only requirement.
+**Linux and macOS**
 
-On Termux: `pkg install python git` first. `lpn` is installed as a short alias.
+```sh
+git clone https://github.com/ATinyGreenCell/LowPingNews
+cd LowPingNews && sh install.sh
+lowpingnews
+```
 
-`--check` fetches every feed once and reports which work, what they cost and how
-fast they answered. Feed URLs rot; this is how you find out.
+`install.sh` puts `news`, `lowpingnews` and the short alias `lpn` in the first
+writable of `~/.local/bin`, `/usr/local/bin` and `~/bin`; no `sudo` needed. If it
+says that folder is not on your `PATH`, it prints the line to add. On macOS with
+Python from python.org, run *Install Certificates.command* (in the Python folder
+under Applications) once, or HTTPS will fail.
+
+**Windows** (PowerShell, Python from python.org or the Microsoft Store)
+
+```powershell
+git clone https://github.com/ATinyGreenCell/LowPingNews
+cd LowPingNews
+py news
+```
+
+No installer is needed: `py news` runs it from the folder (download the ZIP from
+GitHub if you have no git). You get the printed list; for the interactive reader,
+`pip install windows-curses` once.
+
+### First steps
+
+```sh
+lowpingnews               the reader (q quits)
+lowpingnews top 13        thirteen newest headlines
+lowpingnews weather -p "Huntington, NY"     forecast; the place is remembered
+lowpingnews radio         NOAA warnings and forecast (United States)
+lowpingnews catalog       choose feeds: tap or space to tick
+lowpingnews --check       test every feed: which work, what they cost
+```
+
+### Updating
+
+```sh
+lowpingnews update        # Android, Linux, macOS
+py news --update          # Windows
+```
+
+See [Updating safely](#updating-safely) for what it checks before replacing anything.
+
+### Uninstalling
+
+Delete the commands and the data folders:
+
+```sh
+rm -f ~/.local/bin/{news,lowpingnews,lpn,weather}      # or $PREFIX/bin on Termux
+rm -rf ~/.config/news ~/.cache/news ~/.local/share/news
+```
+
+With `XDG_CONFIG_HOME` and friends set, the folders are named `lowpingnews` inside
+them; on Windows they are under `%APPDATA%\lowpingnews`.
+
+### Trying it out and reporting problems
+
+Please open an issue at
+[github.com/ATinyGreenCell/LowPingNews/issues](https://github.com/ATinyGreenCell/LowPingNews/issues)
+with the output of `lowpingnews --version`, your platform (Termux, Linux, macOS,
+Windows), what you ran, and what you saw. A screenshot helps most with display
+problems.
 
 ## Everyday use
 
@@ -67,19 +134,26 @@ lowpingnews -r 3            # later, no signal, zero bytes
 
 ## How many articles
 
-A number is how many articles to show, newest first across every feed in the
-category: `lowpingnews top 13`, `lowpingnews 13`, `lowpingnews science 40`. It
-raises the per-feed limit to match, so the count is not quietly capped at five
-per feed; if fewer exist than you asked for, the footer says so. In a terminal
-it opens the reader with that many. `-n` still sets a per-feed limit, and means
-list output. Because numbers are counts, a category name cannot be a number.
+Ten, newest first across every feed in the category, unless you give a number:
+`lowpingnews top 13`, `lowpingnews science 40`. The printed list says how many
+more are stored and the command to see them (`10 of 60: lowpingnews top 20 for
+more`). `-n` is still a per-feed limit. A search (`-q`) shows every match.
+
+In the reader, **m** (or `j` past the last card) shows ten more, further back in
+time. They come from what is already stored, so they cost nothing; the message
+says how far back they reach, and when there is nothing older it says so, with
+the age of the oldest story. When newer stories arrive - on a refresh, or the
+reader's own background check - they are added on top and the window grows, so
+nothing you could see is pushed out ("3 new at the top"). The banner shows
+`10 items of 60`. Changing category starts again at ten.
 
 In the reader each article is a card: its number (the one `news -r N` takes),
-`•` unread or `★` starred, the source and age, then the whole title wrapped to
-your screen, and a dim one-line summary. Everything on a card came with the
-feed, so cards cost no data beyond the list itself. `v` hides summaries to fit
-more cards; **← →** (or `h`/`l`) change category, like `n`/`p`. Titles wrap by
-screen cells, so Chinese and Japanese headlines stay inside the screen too.
+`•` unread or `★` starred, the source and age, the whole title wrapped to your
+screen, and a dim one-line summary. Everything on a card came with the feed, so
+cards cost no data beyond the list itself. `v` hides summaries to fit more cards.
+
+**← →** (or `h`/`l`) change category, like `n`/`p`. Numbers are counts, so a
+category name cannot be a number.
 
 ## Weather
 
@@ -394,6 +468,12 @@ uses the same location as `weather` (`-c`, `-p`, `--label`). United States only.
 
 ## Weather in words
 
+Times read the way people say them: "Sunset 7:00 PM", "Rain 80% around 5 PM", and
+the rain graph's axis `2p  8p  2a  8a`. `LPN_CLOCK=24` keeps 24-hour time, here
+and in the radio.
+
+### Conditions
+
 Conditions are written out — Partly Cloudy, Icy Drizzle, Thunder & Hail — never
 two-letter codes, with a small icon beside them: ☀ sun, ☁ cloud, ☂ rain,
 ❄ snow, ☈ thunderstorm, ≋ fog, paired (☀☁ partly cloudy, ☀☂ showers, ☂☂ heavy
@@ -453,35 +533,41 @@ A run with every feed cached takes about a third of the time it used to
 (208 ms to 82 ms on the build machine): the program waited a fixed 0.12 s per
 batch of feeds even when they came from cache in a millisecond.
 
-## Updating
+## Updating safely
 
-```sh
-lowpingnews update
-```
+`lowpingnews update` (`py news --update` on Windows) fetches the latest release
+from GitHub. A check that finds nothing new costs about 11 KB; an update about
+70 KB. Nothing is replaced unless the new copy:
 
-Downloads the latest release and verifies it before overwriting anything — size
-floor, content marker and a full `ast.parse()` — because a truncated download is
-the normal failure on a lossy link, and a half-written file still installs
-cleanly enough to break the command. The replace is atomic; the previous version
-is kept at `news.bak`.
+- arrived whole: a cut transfer is refused, and so is a file missing its last
+  part, even though such a file can still parse;
+- is this program, parses, and is newer: older releases are refused unless
+  you set `LPN_FORCE=1`;
+- actually runs on your machine: it is started once, and must report its
+  version, before it replaces anything.
+
+The swap is atomic, the previous version is kept as `news.bak` beside it, and
+your interpreter line and file permissions are kept. `lowpingnews update` also
+updates the `lowpingnews` command itself, but only when `news` updated or was
+already current.
 
 ## Portability
 
-Pure standard library, Python 3.5+, verified with `vermin`. No f-strings, no
-`fromisoformat`. The newest thing it needs is from 2015.
+Pure standard library, Python 3.5+. Tested on Termux (Android) and Linux; the
+behaviour Windows and macOS differ in is tested by simulation.
 
-- Colour is enabled on Windows via VT processing and dropped if that fails, if
-  output is piped, or if `NO_COLOR` is set.
-- `ping` flags differ per platform and are handled; ICMP is optional anyway.
-- Opening a link tries `termux-open-url`, then stdlib `webbrowser`, then prints
-  the URL.
-- The installer avoids `sed -i`, which is mutually incompatible between GNU and
-  BSD, and picks the first writable directory among `$PREFIX/bin`,
-  `~/.local/bin`, `/usr/local/bin`, `~/bin`.
-- Source ids colliding with Windows device names (`con`, `nul`, `com1`) are
-  suffixed, since those cannot be opened as files.
-
-Not supported: Python 2, and Windows without a VT-capable console.
+- **Windows**: no `curses`, `termios` or `fcntl`. Everything still runs; the
+  reader falls back to the printed list, or works with `pip install
+  windows-curses`. Colour uses VT processing and is dropped if unavailable.
+  Updates write the file byte for byte, so line endings stay Unix-style.
+- **macOS**: the scripts avoid `sed -i`, whose arguments differ between GNU and
+  BSD. Python from python.org needs *Install Certificates.command* once.
+- **Termux**: Google Play builds run programs through a preloaded library; the
+  tests keep the full environment so that works.
+- Opening a link tries `termux-open-url`, then the standard `webbrowser`, then
+  prints the URL.
+- Source ids that collide with Windows device names (`con`, `nul`, `com1`) are
+  suffixed, since those cannot be files.
 
 ## Limitations
 
@@ -542,23 +628,15 @@ lpn release 4.5     bump, install, test, commit, tag, gh release
 containing files this project does not own. `ship` and `release` refuse to
 commit anything outside the files this project owns. `release` is idempotent.
 
-## Why not a TUI, or TypeScript
+## Why curses, not a framework
 
-Measured, not assumed. Importing Textual costs ~207 ms and Rich ~57 ms before
-any work happens; the whole program currently runs in ~47 ms. Together they pull
-13.5 MB across 8 packages and require Python 3.9, against this program's 86 KB,
-zero dependencies and 3.5 floor. Node would mean a ~50 MB runtime for a tool
-whose entire output is text.
+Measured, not assumed. Textual costs ~207 ms to import and Rich ~57 ms; together
+they pull 13.5 MB across 8 packages and need Python 3.9. The reader uses `curses`
+from the standard library instead, which imports in ~12 ms.
 
-The deeper reason is that this is a filter, not an application. `news -q term`,
-`news | head`, `--stream`, terminal scrollback and text selection all work
-because output is an ordinary stream. A full-screen TUI takes the terminal over
-and loses every one of those — a poor trade on a phone, where scrollback and
-copy/paste are how you actually read.
-
-If an interactive reading mode is ever wanted, `curses` is in the standard
-library, imports in ~12 ms, and would slot in behind a flag without touching
-the default path or adding a dependency.
+The printed list stays a first-class mode: `--plain`, pipes, `news -q term`,
+`--stream`, scrollback and copy/paste all work because that output is an
+ordinary text stream.
 
 ## Reading an article
 

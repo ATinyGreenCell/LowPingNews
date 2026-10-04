@@ -7,7 +7,20 @@ REPO="${LPN_REPO:-$HOME/LowPingNews}"
 # Termux's share handler writes to ~/downloads; the browser writes to
 # ~/storage/downloads. Scan both or builds silently go missing.
 DLS="${LPN_DOWNLOADS:-$HOME/downloads $HOME/storage/downloads}"
-BIN="${PREFIX:-/usr/local}/bin"
+# where news is installed. Termux: $PREFIX/bin. Elsewhere install.sh picks the
+# first writable of ~/.local/bin, /usr/local/bin, ~/bin - so look rather than
+# assume: next to this script (never the repo clone), then wherever news is.
+_here="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+_repo="$(cd "$REPO" 2>/dev/null && pwd)"
+if [ -n "${PREFIX:-}" ]; then
+  BIN="$PREFIX/bin"
+elif [ -n "$_here" ] && [ "$_here" != "$_repo" ] && [ -f "$_here/news" ]; then
+  BIN="$_here"
+elif _n="$(command -v news 2>/dev/null)" && head -c 3000 "$_n" 2>/dev/null | grep -q "ultra-light headlines"; then
+  BIN="$(dirname "$_n")"
+else
+  BIN="$HOME/.local/bin"
+fi
 RAW="${LPN_RAW:-https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/news}"
 PY="$(command -v python3 || command -v python || true)"
 
@@ -132,7 +145,7 @@ cmd_install() {
   mkdir -p "$BIN"
   cp "$REPO/news" "$BIN/news.new" || die "cannot write $BIN"
   chmod +x "$BIN/news.new"
-  sed -i "1s|.*|#!$PY|" "$BIN/news.new"
+  set_shebang "$BIN/news.new"
   mv "$BIN/news.new" "$BIN/news"
   got="$(installed_ver)"
   [ "$got" = "$v" ] || die "installed $got but repo says $v"
@@ -280,7 +293,7 @@ cmd_release() {
   esac
   cur="$(repo_ver)"
   [ "$cur" = "$v" ] || {
-    sed -i "s|^VERSION = .*|VERSION = \"$v\"|" "$REPO/news" || die "version bump failed"
+    set_version "$REPO/news" "$v" || die "version bump failed"
     say "bumped $cur -> $v"
   }
   cmd_install
@@ -327,21 +340,81 @@ cmd_release() {
   say "released v$v"
 }
 
-cmd_update() {
-  if command -v news >/dev/null 2>&1 && news --help 2>&1 | grep -q -- --update; then
-    news --update "$RAW"
-  else                                  # bootstrap: no news yet, or too old to self-update
-    tmp="$(mktemp)"
-    "$PY" - "$RAW" "$tmp" <<'EOF' || die "download failed"
+set_shebang() {   # portable: sed -i takes different arguments on GNU and BSD (macOS)
+  "$PY" - "$1" "$PY" <<'EOF'
+import sys
+p, py = sys.argv[1:3]
+b = open(p, "rb").read()
+if b.startswith(b"#!"):
+    open(p, "wb").write(("#!" + py).encode() + b[b.find(b"\n"):])
+EOF
+}
+
+set_version() {
+  "$PY" - "$1" "$2" <<'EOF'
+import re, sys
+p, v = sys.argv[1:3]
+s = open(p, encoding="utf-8").read()
+n = re.sub(r'^VERSION = .*$', 'VERSION = "%s"' % v, s, count=1, flags=re.M)
+if n == s and ('VERSION = "%s"' % v) not in s:
+    raise SystemExit(1)
+open(p, "w", encoding="utf-8", newline="\n").write(n)
+EOF
+}
+
+fetch_to() {   # fetch_to URL FILE: portable, and refuses a cut-short download
+  "$PY" - "$1" "$2" <<'EOF'
 import sys, urllib.request
 r = urllib.request.Request(sys.argv[1], headers={"User-Agent": "lowpingnews"})
-open(sys.argv[2], "wb").write(urllib.request.urlopen(r, timeout=30).read())
+f = urllib.request.urlopen(r, timeout=60)
+data = f.read()
+if f.length not in (None, 0):
+    raise SystemExit("cut short")
+n = f.headers.get("Content-Length")
+if n and n.isdigit() and int(n) != len(data):
+    raise SystemExit("cut short")
+open(sys.argv[2], "wb").write(data)
 EOF
-    v="$(ver "$tmp")" || { rm -f "$tmp"; die "downloaded file does not parse"; }
-    mkdir -p "$BIN"; cp "$tmp" "$BIN/news"; chmod +x "$BIN/news"
-    sed -i "1s|.*|#!$PY|" "$BIN/news"; rm -f "$tmp"
+}
+
+cmd_update() {
+  if [ -x "$BIN/news" ] && "$BIN/news" --help 2>&1 | grep -q -- --update; then
+    "$BIN/news" --update "$RAW" || return 1
+  else                                  # bootstrap: no news yet, or too old to self-update
+    tmp="$(mktemp)"
+    fetch_to "$RAW" "$tmp" || { rm -f "$tmp"; die "download failed - nothing changed"; }
+    v="$(ver "$tmp")" || { rm -f "$tmp"; die "downloaded file does not parse - nothing changed"; }
+    mkdir -p "$BIN"
+    # the interpreter line in python: sed -i differs between GNU and BSD (macOS)
+    "$PY" - "$tmp" "$BIN/news.new" "$PY" <<'EOF' || { rm -f "$tmp"; die "could not write $BIN"; }
+import sys
+src, dst, py = sys.argv[1:4]
+b = open(src, "rb").read()
+if b.startswith(b"#!"):
+    b = ("#!" + py).encode() + b[b.find(b"\n"):]
+open(dst, "wb").write(b)
+EOF
+    chmod +x "$BIN/news.new" && mv "$BIN/news.new" "$BIN/news"; rm -f "$tmp"
     say "installed v$v from $RAW"
   fi
+  update_self
+}
+
+update_self() {
+  # news updates itself; this command did not, so an early install kept an
+  # early lowpingnews forever. Swap by rename: safe while this script runs.
+  [ -f "$BIN/lowpingnews" ] || return 0
+  tmp="$(mktemp)"
+  if ! fetch_to "${RAW%/news}/lowpingnews" "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; say "(lowpingnews itself not checked: download failed)"; return 0
+  fi
+  if ! grep -q "lowpingnews - dev loop" "$tmp" || ! sh -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; say "(lowpingnews itself not updated: the download did not check out)"; return 0
+  fi
+  if cmp -s "$tmp" "$BIN/lowpingnews"; then rm -f "$tmp"; return 0; fi
+  cp "$tmp" "$BIN/lowpingnews.new" && chmod +x "$BIN/lowpingnews.new" \
+    && mv "$BIN/lowpingnews.new" "$BIN/lowpingnews" && say "updated the lowpingnews command"
+  rm -f "$tmp"
 }
 
 cmd_pull() {
