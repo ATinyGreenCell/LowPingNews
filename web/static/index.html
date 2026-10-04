@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LowPingNews</title>
+<meta name="description" content="News, weather and NOAA alerts for bad connections.">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LowPing">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+:root{--bg:#0f1115;--fg:#e8e8ea;--dim:#9a9ca3;--card:#181b21;--line:#262a32;--acc:#4cc38a;--warn:#e0b341;--bad:#ef6b5b;--rain:#4fa3e0}
+@media (prefers-color-scheme:light){:root{--bg:#f6f6f4;--fg:#16181c;--dim:#62656c;--card:#fff;--line:#e2e2de;--acc:#1f8a5b;--warn:#a87400;--bad:#c23b2b;--rain:#1f6fb2}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+header{position:sticky;top:0;z-index:2;background:var(--bg);padding:calc(env(safe-area-inset-top) + 8px) 12px 0;border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:8px}
+h1{font-size:17px;margin:0;flex:1}
+.status{font-size:12px;color:var(--dim)}.status.ok{color:var(--acc)}.status.warn{color:var(--warn)}.status.bad{color:var(--bad)}
+button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+#refresh{padding:6px 10px}
+#tabs{display:flex;gap:6px;overflow-x:auto;padding:8px 0;scrollbar-width:none}#tabs::-webkit-scrollbar{display:none}
+.tab{white-space:nowrap;border-radius:999px;padding:6px 12px;font-size:14px}.tab.on{background:var(--fg);color:var(--bg)}
+main{padding:10px 12px calc(env(safe-area-inset-bottom) + 24px);max-width:720px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:0 0 10px;cursor:pointer}
+.card .meta{font-size:12px;color:var(--dim)}.card:not(.read) .meta{color:var(--acc)}
+.card h2{font-size:16px;margin:4px 0 0;font-weight:650}.card.read h2{font-weight:450;color:var(--dim)}
+.sum{font-size:14px;color:var(--dim);margin:6px 0 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sum.full{display:block}
+a.go{display:inline-block;margin-top:10px;color:var(--acc);font-weight:600;text-decoration:none}
+.more{display:block;width:100%;margin:6px 0 12px}
+.end,.empty,.note{color:var(--dim);font-size:13px;text-align:center}.note.warn{color:var(--warn)}
+.where{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}.where input{flex:1 1 100%;font:inherit;padding:9px 11px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.small{font-size:13px;color:var(--dim)}button.small{font-size:14px;color:var(--fg)}
+.place{font-size:18px;margin:10px 0 0}
+.now{display:flex;align-items:center;gap:10px;font-size:18px;margin-top:6px}.big{font-size:44px;font-weight:300}.icon{font-size:30px}
+.chart{width:100%;height:auto}.chart rect{fill:var(--rain)}.chart text{fill:var(--dim);font-size:10px}
+.rain{color:var(--rain);font-size:14px}
+h3{font-size:13px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:18px 0 6px}
+.days .day{display:grid;grid-template-columns:2.6em 1.6em 1fr 2.4em 4.5em 2.4em 2.8em;align-items:center;gap:4px;padding:5px 0;border-bottom:1px solid var(--line);font-size:14px}
+.days .w{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.days .t{text-align:right}.days .p{text-align:right;color:var(--dim)}.days .p.wet{color:var(--rain)}
+.range{position:relative;height:6px;background:var(--line);border-radius:3px}.range i{position:absolute;top:0;bottom:0;background:var(--warn);border-radius:3px}
+.alert{background:var(--card);border:1px solid var(--warn);border-radius:12px;padding:10px 12px;margin:8px 0}.alert.severe{border-color:var(--bad)}
+.alert summary{font-weight:650}.alert.unknown{color:var(--bad);border-color:var(--bad);font-weight:600}.todo{font-weight:600}
+.ok{color:var(--acc);font-size:14px}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom) + 16px);background:var(--fg);color:var(--bg);padding:8px 14px;border-radius:999px;font-size:14px;z-index:3;max-width:90%}
+#hint,#update{position:fixed;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom) + 12px);z-index:4;text-align:left}
+</style>
+</head>
+<body>
+<header>
+  <div class="bar"><h1>LowPingNews</h1><span id="status" class="status"></span><button id="refresh" aria-label="Refresh">&#x21bb;</button></div>
+  <nav id="tabs" aria-label="Sections"></nav>
+</header>
+<main id="main"></main>
+<div id="toast" role="status" hidden></div>
+<button id="hint" hidden>To install: tap the Share button, then <b>Add to Home Screen</b>. (Tap to dismiss)</button>
+<button id="update" hidden>A newer version is ready. Tap to reload.</button>
+<noscript><p style="padding:16px">LowPingNews needs JavaScript.</p></noscript>
+<script type="module" src="app.js"></script>
+</body>
+</html>

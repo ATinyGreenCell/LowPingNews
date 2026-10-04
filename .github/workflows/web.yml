@@ -1,0 +1,57 @@
+# Builds and publishes the phone web app (GitHub Pages) every 20 minutes:
+# the feeds are read here, because phone browsers are not allowed to read
+# most of them directly, and published beside the app as one small file per
+# category. Turn on once with: lowpingnews web
+name: web
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Compile the app and test its logic
+        run: |
+          npx -y -p typescript@5.6 tsc -p web/tsconfig.json
+          npx -y -p typescript@5.6 tsc -p web/tsconfig.sw.json
+          node web/test/core.test.mjs
+      - name: Keep the feed cache between runs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/news
+          key: feeds-${{ github.run_id }}
+          restore-keys: feeds-
+      - name: Read the feeds and build the site
+        run: python3 web/build_digest.py web/site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

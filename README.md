@@ -33,6 +33,44 @@ title, tap or `j`/`k` to move, Enter to read, `q` to quit.
 
 ---
 
+## On a phone, in the browser (iPhone or Android)
+
+Open **https://atinygreencell.github.io/LowPingNews/** in Safari or Chrome, then:
+
+- **iPhone**: tap the Share button, then **Add to Home Screen**.
+- **Android**: tap the menu, then **Install app** or **Add to Home screen**.
+
+It opens like an app, works offline from its last copy, and needs no account.
+The news tabs show ten stories with "Show 10 more" further back in time; the
+Weather tab gives the forecast, and NOAA watches and warnings in the United
+States, for your location or a place you type ("Huntington, NY").
+
+**Data.** The whole app is about 15 KB the first time, then kept on the phone. A
+news section is one small file (roughly 5-8 KB) and costs a few hundred bytes
+when nothing has changed. Weather comes straight from Open-Meteo and
+weather.gov, a few KB each, and is reused for half an hour (alerts: five minutes).
+
+**How it works.** Phone browsers are not allowed to read most news feeds
+directly, so a GitHub Action reads them every 20 minutes using this program and
+publishes one small file per category beside the app. Nothing runs on a server.
+The app always says how old the news is, says when it is offline and showing a
+saved copy, names any feed that could not be read, and says "ALERTS UNKNOWN"
+rather than implying all-clear when weather.gov cannot be reached.
+
+**Setting it up** (once, for the repository owner): sign `gh` in with permission
+to change workflows, release, then switch it on:
+
+```sh
+gh auth refresh -h github.com -s workflow
+lpn release 8.2
+lpn web                     # turns on GitHub Pages and prints the address
+```
+
+The app is TypeScript in `web/src`, compiled to plain JavaScript in `web/static`
+(no frameworks, no dependencies); `web/build_digest.py` builds the news files.
+Scheduled builds stop if the repository sees no activity for 60 days; the app
+then says the news is old rather than showing it as current.
+
 ## Install
 
 Needs Python 3.5 or newer and nothing else: no pip packages, no API keys.

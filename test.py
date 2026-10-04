@@ -2812,6 +2812,111 @@ def t_times_read_am_and_pm(env, srv):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- web app
+WEB = os.path.join(HERE, "web")
+
+
+@test
+def t_web_build_is_small_safe_and_honest(env, srv):
+    feeds = []
+    for i in range(4):
+        srv.feed("/w%d" % i, [item("Story %d-%d about the council" % (i, j), when="2026-10-04T%02d:00:00Z" % (j % 24),
+                                   body="summary " * 80) for j in range(40)])
+        feeds.append({"id": "w%d" % i, "name": "Feed %d" % i, "url": srv.url("/w%d" % i), "cats": ["top"]})
+    srv.feed("/evil", [item("Evil \x1b[2J story", body="x", link="javascript:alert(1)")])
+    feeds += [{"id": "evil", "name": "Evil", "url": srv.url("/evil"), "cats": ["health"]},
+              {"id": "dead", "name": "Dead feed", "url": NOWHERE + "/dead", "cats": ["health"]},
+              {"id": "lpn", "name": "Releases", "url": srv.url("/w0"), "cats": ["app"]}]
+    tmp = tempfile.mkdtemp()
+    try:
+        fl = os.path.join(tmp, "feeds.json")
+        json.dump(feeds, io.open(fl, "w"))
+        out = os.path.join(tmp, "site")
+        r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=dict(env, LPN_WEB_FEEDS=fl), timeout=120)
+        assert r.returncode == 0, r.stderr[-400:]
+        top = json.load(io.open(os.path.join(out, "data", "top.json"), encoding="utf-8"))
+        assert len(top["items"]) == 60 and top["v"] == 1 and top["app"] == load().VERSION
+        assert len(gzip.compress(io.open(os.path.join(out, "data", "top.json"), "rb").read())) < 20000
+        assert not os.path.exists(os.path.join(out, "data", "app.json")), "release notes are not for the web app"
+        health = json.load(io.open(os.path.join(out, "data", "health.json"), encoding="utf-8"))
+        evil = health["items"][0]
+        assert evil[3] == "" and "\x1b" not in evil[1], "a hostile story reached the web data: %r" % evil
+        assert ["Dead feed", -1] in health["failed"], "a dead feed must be named, not silently dropped"
+        for f in ("index.html", "app.js", "core.js", "sw.js", "manifest.webmanifest", "icon-180.png"):
+            assert os.path.exists(os.path.join(out, f)), f
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_web_files_are_consistent(env, srv):
+    st = os.path.join(WEB, "static")
+    sw = io.open(os.path.join(st, "sw.js"), encoding="utf-8").read()
+    listed = re.findall(r'"\./([^"]*)"', sw[sw.index("FILES"):sw.index("];", sw.index("FILES"))])
+    for f in listed:
+        assert f == "" or os.path.exists(os.path.join(st, f)), "the service worker caches a missing file: " + f
+    assert "export" not in sw.split("\n")[0:3] and not re.search(r"^(export|import) ", sw, re.M), \
+        "sw.js must be a plain script: module service workers fail in some browsers"
+    man = json.load(io.open(os.path.join(st, "manifest.webmanifest"), encoding="utf-8"))
+    for ic in man["icons"]:
+        assert io.open(os.path.join(st, ic["src"]), "rb").read(8) == b"\x89PNG\r\n\x1a\n", ic["src"]
+    html = io.open(os.path.join(st, "index.html"), encoding="utf-8").read()
+    for need in ('type="module" src="app.js"', 'rel="manifest"', 'rel="apple-touch-icon"', "viewport-fit=cover"):
+        assert need in html, need
+    v = load().VERSION
+    for p, rx in (("src/core.ts", r'APP_VERSION = "([^"]+)"'), ("static/core.js", r'APP_VERSION = "([^"]+)"'),
+                  ("src/sw.ts", r'const VERSION = "([^"]+)"'), ("static/sw.js", r'const VERSION = "([^"]+)"')):
+        m_ = re.search(rx, io.open(os.path.join(WEB, p), encoding="utf-8").read())
+        assert m_ and m_.group(1) == v, "%s says %s, news says %s" % (p, m_ and m_.group(1), v)
+
+
+@test
+def t_web_logic_tests_pass(env, srv):
+    node = shutil.which("node")
+    if not node:
+        raise Skip("needs Node.js for the web app's logic tests (they also run on GitHub)")
+    r = subprocess.run([node, os.path.join(WEB, "test", "core.test.mjs")], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=60)
+    assert r.returncode == 0, r.stdout.decode("utf-8", "replace")[-600:]
+
+
+@test
+def t_sync_takes_the_web_archive_only_when_it_matches(env, srv):
+    import tarfile
+    tmp = tempfile.mkdtemp()
+    try:
+        dl, repo, pre = (os.path.join(tmp, x) for x in ("dl", "repo", "usr"))
+        for d_ in (dl, repo, os.path.join(pre, "bin")):
+            os.makedirs(d_)
+
+        def tarball(name, files):
+            with tarfile.open(os.path.join(dl, name), "w:gz") as tf:
+                for arc, body in files.items():
+                    data = body.encode("utf-8")
+                    ti = tarfile.TarInfo(arc); ti.size = len(data); ti.mode = 0o755
+                    tf.addfile(ti, io.BytesIO(data))
+        news99 = re.sub(r'^VERSION = "[^"]+"', 'VERSION = "99.0"', io.open(NEWS, encoding="utf-8").read(), count=1, flags=re.M)
+        tarball("lowpingnews-v99.0.tar.gz", {"news": news99,
+                                             "lowpingnews": io.open(os.path.join(HERE, "lowpingnews")).read()})
+        tarball("lowpingnews-web-v98.0.tar.gz", {"web/src/core.ts": 'export const APP_VERSION = "98.0";\n',
+                                                 "web/OLD": "stale\n"})
+        tarball("lowpingnews-web-v99.0.tar.gz", {"web/src/core.ts": 'export const APP_VERSION = "99.0";\n',
+                                                 ".github/workflows/web.yml": "name: web\n"})
+        tarball("lowpingnews-web-v99.1.tar.gz", {"web/src/core.ts": 'export const APP_VERSION = "99.0";\n',
+                                                 "etc/passwd": "no\n"})
+        e = dict(env, LPN_DOWNLOADS=dl, LPN_REPO=repo, PREFIX=pre, HOME=tmp)
+        r = subprocess.run(["sh", os.path.join(HERE, "lowpingnews"), "sync"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, env=e, timeout=120)
+        out = r.stdout.decode("utf-8", "replace")
+        assert io.open(os.path.join(repo, "web", "src", "core.ts")).read().count("99.0"), out
+        assert os.path.exists(os.path.join(repo, ".github", "workflows", "web.yml")), out
+        assert not os.path.exists(os.path.join(repo, "web", "OLD")), "a web archive for another version was used"
+        assert not os.path.exists(os.path.join(repo, "etc")), "an archive with stray paths was used"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @test
 def t_version_is_consistent(env, srv):
     m = load()

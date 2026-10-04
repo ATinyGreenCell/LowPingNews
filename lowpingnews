@@ -26,7 +26,11 @@ PY="$(command -v python3 || command -v python || true)"
 
 die() { printf '%s\n' "lowpingnews: $*" >&2; exit 1; }
 OWNED="news README.md install.sh lowpingnews LICENSE .gitignore test.py catalog.json"
-owned() { for o in $OWNED; do [ "$1" = "$o" ] && return 0; done; return 1; }
+owned() {
+  # the web app; the stray check passes only a path's first part ("web")
+  case "$1" in web|web/*|.github|.github/workflows/web.yml) return 0 ;; esac
+  for o in $OWNED; do [ "$1" = "$o" ] && return 0; done; return 1
+}
 say() { printf '  %s\n' "$*"; }
 [ -n "$PY" ] || die "python3 not found (pkg install python)"
 
@@ -79,6 +83,25 @@ cmd_status() {
   return 0
 }
 
+sync_web() {   # sync_web VERSION: the web app's archive, only if it matches
+  want="$1"; best=""
+  for d in $DLS; do
+    for t in "$d"/lowpingnews-web-v*.tar.gz; do
+      [ -f "$t" ] || continue
+      ok=1
+      for m in $(tar tzf "$t" 2>/dev/null); do
+        case "$m" in web/*|.github/|.github/workflows/|.github/workflows/web.yml) ;; *) ok=0; break ;; esac
+      done
+      [ "$ok" -eq 1 ] || continue
+      wv="$(tar xzf "$t" -O web/src/core.ts 2>/dev/null | sed -n 's/^export const APP_VERSION = "\(.*\)";/\1/p' | head -1)"
+      if [ "$wv" = "$want" ]; then best="$t"; fi
+    done
+  done
+  if [ -n "$best" ]; then
+    tar xzf "$best" -C "$REPO" && say "extracted $(basename "$best") (web app v$want)"
+  fi
+}
+
 cmd_sync() {
   # Extract FIRST: an archive alone is a complete delivery. Requiring a loose
   # build before extracting meant a tarball-only drop could never sync.
@@ -90,6 +113,7 @@ cmd_sync() {
       for m in $(tar tzf "$t" 2>/dev/null); do
         case "$m" in
           news|test.py|catalog.json|README.md|install.sh|lowpingnews|LICENSE|.gitignore) ;;
+          web/*|.github/workflows/web.yml) ;;
           */) ;;
           *) bad=1; break ;;
         esac
@@ -122,6 +146,7 @@ cmd_sync() {
     fi
     rm -rf "$peek"
     tar xzf "$newest_tar" -C "$REPO" || die "extract failed: $newest_tar"
+    sync_web "$nv"
     say "extracted $(basename "$newest_tar") (v$(ver "$REPO/news" 2>/dev/null || echo '?'))"
   fi
 
@@ -275,6 +300,10 @@ release_has_changes() {
       [ -f "$REPO/$f" ] || continue
       git -C "$REPO" show "$last:$f" 2>/dev/null | cmp -s - "$REPO/$f" || return 0
     done
+    # the web app is a directory: changed if its tracked files differ from
+    # the last release, or it has files not yet committed
+    git -C "$REPO" diff --quiet "$last" -- web .github/workflows/web.yml 2>/dev/null || return 0
+    [ -z "$(git -C "$REPO" status --porcelain -- web .github/workflows/web.yml 2>/dev/null)" ] || return 0
     return 1
   fi
   rm -f "$REPO/.rel_old" "$REPO/.rel_new"
@@ -417,6 +446,20 @@ update_self() {
   rm -f "$tmp"
 }
 
+cmd_web() {
+  command -v gh >/dev/null 2>&1 || die "needs gh (pkg install gh), signed in: gh auth login"
+  slug="$(git -C "$REPO" remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\([^/]*/[^/.]*\).*#\1#p')"
+  [ -n "$slug" ] || die "no GitHub remote in $REPO"
+  # Pages built by the workflow, not from a branch (409 = already on)
+  gh api -X POST "repos/$slug/pages" -f build_type=workflow >/dev/null 2>&1 \
+    || gh api -X PUT "repos/$slug/pages" -f build_type=workflow >/dev/null 2>&1 \
+    || say "(could not switch Pages on - Settings > Pages > Source: GitHub Actions)"
+  gh workflow run web.yml -R "$slug" >/dev/null 2>&1 && say "web build started" \
+    || say "(start it by hand: Actions > web > Run workflow)"
+  owner="${slug%%/*}"; repo="${slug#*/}"
+  say "in a few minutes: https://$(echo "$owner" | tr 'A-Z' 'a-z').github.io/$repo/"
+}
+
 cmd_pull() {
   [ -d "$REPO/.git" ] || die "$REPO is not a git repo"
   git -C "$REPO" pull --ff-only || die "pull failed"
@@ -445,6 +488,7 @@ lowpingnews - the reader, plus its dev loop
 
 dev:
   update          install the latest release from GitHub
+  web             put the phone web app online (GitHub Pages) and print its address
   status          installed / repo / newest download / git, and flag mismatches
   sync            newest VALID download -> repo -> install  (never picks by filename)
   install         repo -> PATH, verifying the version actually landed
@@ -463,11 +507,12 @@ EOF
 # weather), so dispatch is unambiguous.
 c="${1:-}"
 case "$c" in
-  update|status|sync|install|test|pull|ship|release|clean|-h|--help|help) shift ;;
+  update|status|sync|install|test|pull|ship|release|clean|web|-h|--help|help) shift ;;
   *) exec "$BIN/news" "$@" ;;
 esac
 case "$c" in
   update)  cmd_update ;;
+  web)     cmd_web ;;
   status)  cmd_status ;;
   sync)    cmd_sync ;;
   install) cmd_install ;;

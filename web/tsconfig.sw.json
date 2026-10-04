@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2019",
+    "lib": [
+      "ES2020",
+      "WebWorker"
+    ],
+    "strict": true,
+    "outDir": "static",
+    "rootDir": "src",
+    "removeComments": true,
+    "newLine": "lf",
+    "moduleDetection": "legacy"
+  },
+  "files": [
+    "src/sw.ts"
+  ]
+}
