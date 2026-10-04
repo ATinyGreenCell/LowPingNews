@@ -118,5 +118,12 @@ test("an abstract file reads as who, when, which version, then the abstract", ()
   assert.equal(C.parseAbstractDoc({ abstract: "x", published: "javascript:alert(1)" }).text.includes("javascript"), false);
   assert.equal(C.parseAbstractDoc(null).text, "");
 });
+test("the update banner shows only for a genuinely newer version", () => {
+  assert.ok(C.newerVersion("8.8", "8.7"));
+  assert.ok(C.newerVersion("8.10", "8.9"), "8.10 is newer than 8.9");
+  assert.ok(C.newerVersion("9.0", "8.12"));
+  for (const [a, b] of [["8.7", "8.7"], ["8.6", "8.7"], ["8.7", "8.7.0"], [undefined, "8.7"], ["8.7<x>", "8.7"], ["", "8.7"]])
+    assert.equal(C.newerVersion(a, b), false, a + " vs " + b);
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

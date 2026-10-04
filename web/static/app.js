@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc } from "./core.js";
+import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -105,8 +105,72 @@ async function loadNews(cat, manual = false) {
         toast(w.fresh + " new at the top");
     else if (manual)
         toast(offline ? "offline: showing the saved copy" : "nothing new");
-    if (d.app && d.app !== APP_VERSION)
-        $("update").hidden = false;
+    if (newerVersion(d.app, APP_VERSION))
+        showUpdate();
+    else if (d.app === APP_VERSION) {
+        mem("lpn-updating", null);
+        mem("lpn-hard", null);
+    }
+}
+function mem(k, v) {
+    try {
+        if (v === undefined)
+            return sessionStorage.getItem(k);
+        if (v === null)
+            sessionStorage.removeItem(k);
+        else
+            sessionStorage.setItem(k, v);
+    }
+    catch { }
+    return null;
+}
+let updating = false;
+function showUpdate() {
+    const b = $("update");
+    b.hidden = false;
+    const tried = Number(mem("lpn-updating") || 0);
+    if (tried && Date.now() - tried < 120000)
+        void hardUpdate(b);
+}
+async function updateNow(b) {
+    if (updating)
+        return;
+    updating = true;
+    b.textContent = "Updating\u2026";
+    mem("lpn-updating", String(Date.now()));
+    const sws = navigator.serviceWorker;
+    if (sws) {
+        const changed = new Promise((res) => sws.addEventListener("controllerchange", () => res(), { once: true }));
+        try {
+            const reg = await sws.getRegistration();
+            if (reg)
+                await reg.update();
+        }
+        catch { }
+        await Promise.race([changed, new Promise((r) => setTimeout(r, 6000))]);
+    }
+    location.reload();
+}
+async function hardUpdate(b) {
+    if (updating)
+        return;
+    if (mem("lpn-hard")) {
+        b.textContent = "Could not update yet. Close the app fully and open it again.";
+        return;
+    }
+    updating = true;
+    mem("lpn-hard", "1");
+    b.textContent = "Updating\u2026";
+    try {
+        for (const k of await caches.keys())
+            if (k.startsWith("lpn-shell-"))
+                await caches.delete(k);
+        if (navigator.serviceWorker)
+            for (const r of await navigator.serviceWorker.getRegistrations())
+                await r.unregister();
+    }
+    catch { }
+    location.reload();
 }
 function card(it) {
     const read = S.read.has(it.key);
@@ -505,7 +569,7 @@ function start() {
         else
             void loadNews(S.view, true);
     };
-    $("update").onclick = () => location.reload();
+    $("update").onclick = () => void updateNow($("update"));
     renderTabs();
     go(S.view === "weather" ? "weather" : S.view);
     window.addEventListener("popstate", () => { if (S.reading)

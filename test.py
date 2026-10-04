@@ -2982,7 +2982,8 @@ def t_web_build_is_small_safe_and_honest(env, srv):
 def t_web_files_are_consistent(env, srv):
     st = os.path.join(WEB, "static")
     sw = io.open(os.path.join(st, "sw.js"), encoding="utf-8").read()
-    listed = re.findall(r'"\./([^"]*)"', sw[sw.index("FILES"):sw.index("];", sw.index("FILES"))])
+    listed = [f for k in ("CORE", "EXTRA")                      # required files, then optional ones
+              for f in re.findall(r'"\./([^"]*)"', sw[sw.index(k + " = ["):sw.index("];", sw.index(k + " = ["))])]
     for f in listed:
         assert f == "" or os.path.exists(os.path.join(st, f)), "the service worker caches a missing file: " + f
     assert "export" not in sw.split("\n")[0:3] and not re.search(r"^(export|import) ", sw, re.M), \
@@ -3006,7 +3007,7 @@ def t_web_logic_tests_pass(env, srv):
     node = shutil.which("node")
     if not node:
         raise Skip("needs Node.js for the web app's logic tests (they also run on GitHub)")
-    for t_ in ("core.test.mjs", "reader.test.mjs"):
+    for t_ in ("core.test.mjs", "reader.test.mjs", "sw.test.mjs"):
         r = subprocess.run([node, os.path.join(WEB, "test", t_)], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=90)
         assert r.returncode == 0, t_ + ": " + r.stdout.decode("utf-8", "replace")[-600:]

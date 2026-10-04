@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "8.7";
+export const APP_VERSION = "8.8";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -135,6 +135,17 @@ export function parseAbstractDoc(raw: unknown): Article {
   const host = d.server === "medrxiv" ? "medRxiv" : "bioRxiv";
   return { text: paras.join("\n\n"), complete: true, error: "",
            note: "This is the abstract. The full paper is on " + host + ": open the original page." };
+}
+
+/** Is version a newer than b? ("8.10" > "8.9"; anything odd is not newer) */
+export function newerVersion(a: unknown, b: string): boolean {
+  if (typeof a !== "string" || !/^\d+(\.\d+)*$/.test(a) || !/^\d+(\.\d+)*$/.test(b)) return false;
+  const x = a.split(".").map(Number), y = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return d > 0;
+  }
+  return false;
 }
 
 export function ago(sec: number): string {

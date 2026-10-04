@@ -8,7 +8,7 @@
 //
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
-const VERSION = "8.7";
+const VERSION = "8.8";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;

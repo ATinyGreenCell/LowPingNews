@@ -1,4 +1,4 @@
-export const APP_VERSION = "8.7";
+export const APP_VERSION = "8.8";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -116,6 +116,17 @@ export function parseAbstractDoc(raw) {
     const host = d.server === "medrxiv" ? "medRxiv" : "bioRxiv";
     return { text: paras.join("\n\n"), complete: true, error: "",
         note: "This is the abstract. The full paper is on " + host + ": open the original page." };
+}
+export function newerVersion(a, b) {
+    if (typeof a !== "string" || !/^\d+(\.\d+)*$/.test(a) || !/^\d+(\.\d+)*$/.test(b))
+        return false;
+    const x = a.split(".").map(Number), y = b.split(".").map(Number);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+        const d = (x[i] || 0) - (y[i] || 0);
+        if (d)
+            return d > 0;
+    }
+    return false;
 }
 export function ago(sec) {
     if (!isFinite(sec) || sec < 0)

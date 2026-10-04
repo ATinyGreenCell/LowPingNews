@@ -5,14 +5,28 @@
 // A plain script, not a module: classic service workers work in every browser.
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-const VERSION = "8.7";
+const VERSION = "8.8";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
-const FILES = ["./", "./index.html", "./app.js", "./core.js", "./manifest.webmanifest",
-               "./icon-180.png", "./icon-192.png", "./icon-512.png"];
+const CORE = ["./", "./index.html", "./app.js", "./core.js"];          // the app cannot run without these
+const EXTRA = ["./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png"];
 
+// Straight from the site (cache: "reload"), never the phone's web cache: that
+// may still hold the previous version's files for a few minutes, and a new
+// version stored with old files would never update. Only the core files must
+// arrive; a missing icon must not block an update.
+const fresh = (f: string): Promise<Response> => fetch(new Request(f, { cache: "reload" }));
 sw.addEventListener("install", (e: ExtendableEvent) => {
-  e.waitUntil(caches.open(SHELL).then((c) => c.addAll(FILES)).then(() => sw.skipWaiting()));
+  e.waitUntil((async () => {
+    const c = await caches.open(SHELL);
+    await Promise.all(CORE.map(async (f) => {
+      const r = await fresh(f);
+      if (!r.ok) throw new Error(f + " answered " + r.status);
+      await c.put(f, r);
+    }));
+    await Promise.all(EXTRA.map((f) => fresh(f).then((r) => (r.ok ? c.put(f, r) : undefined)).catch(() => undefined)));
+    await sw.skipWaiting();
+  })());
 });
 
 sw.addEventListener("activate", (e: ExtendableEvent) => {

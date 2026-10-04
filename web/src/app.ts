@@ -1,6 +1,6 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -85,7 +85,54 @@ async function loadNews(cat: string, manual = false): Promise<void> {
   status();
   if (w.fresh) toast(w.fresh + " new at the top");
   else if (manual) toast(offline ? "offline: showing the saved copy" : "nothing new");
-  if (d.app && d.app !== APP_VERSION) $("update").hidden = false;
+  if (newerVersion(d.app, APP_VERSION)) showUpdate();
+  else if (d.app === APP_VERSION) { mem("lpn-updating", null); mem("lpn-hard", null); }
+}
+
+// ---- updating the app itself ---------------------------------------------
+// The app's files come from the phone's offline copy, so a plain reload shows
+// the same old version until the new one has installed. Tapping asks for the
+// new version and waits for it to take over; if a reload still shows the old
+// one, the offline copy is cleared and the app loads fresh from the site
+// (~15 KB), once - after that it says so instead of looping.
+function mem(k: string, v?: string | null): string | null {
+  try {
+    if (v === undefined) return sessionStorage.getItem(k);
+    if (v === null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, v);
+  } catch { /* private mode: no memory, still works */ }
+  return null;
+}
+let updating = false;
+function showUpdate(): void {
+  const b = $("update");
+  b.hidden = false;
+  const tried = Number(mem("lpn-updating") || 0);
+  if (tried && Date.now() - tried < 120000) void hardUpdate(b);    // just tried, still old
+}
+async function updateNow(b: HTMLElement): Promise<void> {
+  if (updating) return;
+  updating = true;
+  b.textContent = "Updating\u2026";
+  mem("lpn-updating", String(Date.now()));
+  const sws = navigator.serviceWorker;
+  if (sws) {
+    const changed = new Promise<void>((res) => sws.addEventListener("controllerchange", () => res(), { once: true }));
+    try { const reg = await sws.getRegistration(); if (reg) await reg.update(); } catch { /* offline */ }
+    await Promise.race([changed, new Promise((r) => setTimeout(r, 6000))]);
+  }
+  location.reload();
+}
+async function hardUpdate(b: HTMLElement): Promise<void> {
+  if (updating) return;
+  if (mem("lpn-hard")) { b.textContent = "Could not update yet. Close the app fully and open it again."; return; }
+  updating = true;
+  mem("lpn-hard", "1");
+  b.textContent = "Updating\u2026";
+  try {
+    for (const k of await caches.keys()) if (k.startsWith("lpn-shell-")) await caches.delete(k);
+    if (navigator.serviceWorker) for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  } catch { /* nothing to clear */ }
+  location.reload();
 }
 
 function card(it: Item): HTMLElement {
@@ -426,7 +473,7 @@ function start(): void {
     else if (S.reading) void renderReader(S.reading, true);         // in an article: fetch it afresh
     else void loadNews(S.view, true);
   };
-  $("update").onclick = () => location.reload();
+  $("update").onclick = () => void updateNow($("update"));
   renderTabs();
   go(S.view === "weather" ? "weather" : S.view);
   // return to the app: check again only if it has been a while

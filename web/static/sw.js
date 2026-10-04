@@ -1,12 +1,23 @@
 "use strict";
 const sw = self;
-const VERSION = "8.7";
+const VERSION = "8.8";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
-const FILES = ["./", "./index.html", "./app.js", "./core.js", "./manifest.webmanifest",
-    "./icon-180.png", "./icon-192.png", "./icon-512.png"];
+const CORE = ["./", "./index.html", "./app.js", "./core.js"];
+const EXTRA = ["./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png"];
+const fresh = (f) => fetch(new Request(f, { cache: "reload" }));
 sw.addEventListener("install", (e) => {
-    e.waitUntil(caches.open(SHELL).then((c) => c.addAll(FILES)).then(() => sw.skipWaiting()));
+    e.waitUntil((async () => {
+        const c = await caches.open(SHELL);
+        await Promise.all(CORE.map(async (f) => {
+            const r = await fresh(f);
+            if (!r.ok)
+                throw new Error(f + " answered " + r.status);
+            await c.put(f, r);
+        }));
+        await Promise.all(EXTRA.map((f) => fresh(f).then((r) => (r.ok ? c.put(f, r) : undefined)).catch(() => undefined)));
+        await sw.skipWaiting();
+    })());
 });
 sw.addEventListener("activate", (e) => {
     e.waitUntil(caches.keys()
