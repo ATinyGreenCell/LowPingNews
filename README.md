@@ -41,9 +41,12 @@ Open **https://atinygreencell.github.io/LowPingNews/** in Safari or Chrome, then
 - **Android**: tap the menu, then **Install app** or **Add to Home screen**.
 
 It opens like an app, works offline from its last copy, and needs no account.
-The news tabs show ten stories with "Show 10 more" further back in time; the
-Weather tab gives the forecast, and NOAA watches and warnings in the United
-States, for your location or a place you type ("Huntington, NY").
+**Weather** comes first: the forecast, and NOAA watches and warnings in the
+United States, for your location or a place you type ("Huntington, NY"). The
+news tabs show ten stories with "Show 10 more" further back in time. Tapping a
+story opens its **text only**, like the terminal app: a few KB instead of the
+whole website. Articles you open are kept on the phone (the last 40), so
+reading one again costs nothing and works offline.
 
 **Data.** The whole app is about 15 KB the first time, then kept on the phone. A
 news section is one small file (roughly 5-8 KB) and costs a few hundred bytes
@@ -65,6 +68,23 @@ gh auth refresh -h github.com -s workflow
 lpn release 8.2
 lpn web                     # turns on GitHub Pages and prints the address
 ```
+
+**The article reader** (once, about five minutes, free). A browser cannot fetch
+other sites' pages, so a small Cloudflare Worker does it on request: it fetches
+the one page she taps, keeps only the paragraphs, and sends back the text.
+Nothing is stored or published - publishing copies of articles on the app's
+public site would invite copyright takedowns. It answers only the app's own
+address, and only for links in the app's current headline files, so it is not
+an open proxy.
+
+1. Sign up at dash.cloudflare.com (free plan).
+2. Workers & Pages > Create > Create Worker, name it `lowpingnews-reader`, Deploy.
+3. Edit code: replace everything with the contents of
+   `https://raw.githubusercontent.com/ATinyGreenCell/LowPingNews/main/web/reader/reader.js`
+   (open it in the phone's browser, select all, copy), then Deploy.
+4. Copy the Worker's address and tell the app: `lpn reader https://lowpingnews-reader.NAME.workers.dev`
+
+Until then, a story shows its summary and a link to the original page.
 
 The app is TypeScript in `web/src`, compiled to plain JavaScript in `web/static`
 (no frameworks, no dependencies); `web/build_digest.py` builds the news files.

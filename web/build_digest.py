@@ -23,6 +23,11 @@ KEEP = 60                # stories per category: ten shown, the rest for "more"
 SUMMARY = 220            # characters of summary kept per story
 TITLE = 300
 SKIP_CATS = {"app"}      # release notes are for the terminal app
+# the article reader's address (a Cloudflare Worker), from the READER_URL
+# repository variable; https only. Empty: the app offers summaries and links.
+READER = os.environ.get("LPN_READER_URL", "").strip()
+if not READER.startswith("https://") or any(ch in READER for ch in " \"'<>"):
+    READER = ""
 
 
 def load_news():
@@ -111,6 +116,7 @@ def build(out_dir, now=None):
             if len(rows) >= KEEP:
                 break
         doc = {"v": 1, "t": int(now), "app": m.VERSION, "cat": c, "cats": cat_list, "src": names,
+               "reader": READER,
                "items": rows,
                "failed": [[n, a] for n, a in sorted(failed.items()) if n in names or
                           any(n == x["name"] and c in x["cats"] for x in srcs)]}

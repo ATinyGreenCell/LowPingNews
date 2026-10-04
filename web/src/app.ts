@@ -1,7 +1,7 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
 import {
-  APP_VERSION, SHOW, Digest, Item, Alert, parseDigest, staleness, ago, adoptWindow, moreWindow,
+  APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow,
   clock, wmo, placeParts, placeFits, liveAlerts,
 } from "./core.js";
 
@@ -23,7 +23,7 @@ function keep(k: string, v: unknown): void {
 
 // ---- state --------------------------------------------------------------
 const S = {
-  view: store<string>("view", "top"),
+  view: store<string>("view", "weather"),        // weather first, for a first visit too
   cats: [["top", "Headlines"]] as [string, string][],
   digest: null as Digest | null,
   offline: false,
@@ -31,7 +31,7 @@ const S = {
   shown: [] as Item[],
   known: new Set<string>(),
   fetched: 0,
-  open: "" as string,
+  reading: null as Item | null,
   read: new Set<string>(store<string[]>("read", [])),
 };
 function markRead(k: string): void {
@@ -97,25 +97,16 @@ function card(it: Item): HTMLElement {
   const c = el("article", "card" + (read ? " read" : ""),
     el("div", "meta", (read ? "" : "\u25cf ") + it.src + " \u00b7 " + age),
     el("h2", "", it.title));
-  const open = S.open === it.key;
-  if (it.summary) c.append(el("p", open ? "sum full" : "sum", it.summary));
-  if (open && it.link) {
-    const a = el("a", "go", "Open article \u2197") as HTMLAnchorElement;
-    a.href = it.link; a.target = "_blank"; a.rel = "noopener noreferrer";
-    c.append(a);
-  }
+  if (it.summary) c.append(el("p", "sum", it.summary));
+  if (savedArticle(it.key)) c.querySelector(".meta")!.append(" \u00b7 saved");
   c.tabIndex = 0;
   c.setAttribute("role", "button");
-  c.onclick = (e) => {
-    if ((e.target as HTMLElement).tagName === "A") { markRead(it.key); return; }
-    S.open = open ? "" : it.key;
-    markRead(it.key);
-    renderNews();
-  };
+  c.onclick = () => openReader(it);
   return c;
 }
 
 function renderNews(): void {
+  if (S.reading) return;                    // never pull an open article out from under her
   const main = $("main");
   main.replaceChildren();
   const d = S.digest;
@@ -140,11 +131,78 @@ function renderNews(): void {
   }
 }
 
+// ---- reading an article: text only, like the terminal app ----------------
+// Saved on the phone (the last 40), so reading again costs nothing, offline too.
+interface Saved { t: number; a: Article }
+function savedArticle(key: string): Saved | null { return store<Saved | null>("art:" + key, null); }
+function saveArticle(key: string, a: Article): void {
+  const idx = store<string[]>("arts", []).filter((k) => k !== key);
+  idx.push(key);
+  while (idx.length > 40) { const old = idx.shift(); try { localStorage.removeItem("art:" + old); } catch { /* fine */ } }
+  keep("art:" + key, { t: now(), a });
+  keep("arts", idx);
+}
+
+function openReader(it: Item, fromHistory = false): void {
+  S.reading = it;
+  markRead(it.key);
+  if (!fromHistory) history.pushState({ reading: it.key }, "");
+  window.scrollTo(0, 0);
+  void renderReader(it);
+}
+
+function closeReader(): void {
+  if (!S.reading) return;
+  S.reading = null;
+  renderNews();
+}
+
+async function renderReader(it: Item): Promise<void> {
+  const main = $("main");
+  const back = el("button", "back", "\u2039 Back");
+  back.onclick = () => history.back();
+  const body = el("div", "body", el("p", "empty", "Getting the text\u2026"));
+  main.replaceChildren(back, el("div", "meta", it.src + (it.t ? " \u00b7 " + ago(now() - it.t) + " ago" : "")),
+                       el("h1", "headline", it.title), body);
+  const show = (a: Article | null, why: string, savedAgo: number): void => {
+    if (S.reading !== it) return;                        // left meanwhile
+    body.replaceChildren();
+    if (a && a.text) {
+      for (const p of a.text.split("\n\n")) body.append(el("p", "", p));
+      if (!a.complete) body.append(el("p", "note warn", a.note || "This may be only part of the article."));
+      if (savedAgo >= 0) body.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
+    } else {
+      if (it.summary) body.append(el("p", "", it.summary));
+      body.append(el("p", "note warn", why));
+    }
+    if (it.link) {
+      const a_ = el("a", "go", "Open the original page \u2197") as HTMLAnchorElement;
+      a_.href = it.link; a_.target = "_blank"; a_.rel = "noopener noreferrer";
+      body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
+    }
+  };
+  const saved = savedArticle(it.key);
+  if (saved && saved.a.text) { show(saved.a, "", now() - saved.t); return; }
+  const reader = S.digest ? S.digest.reader : "";
+  if (!it.link) { show(null, "This feed gives no link to the full article.", -1); return; }
+  if (!reader) { show(null, "Full-text reading is not set up for this app yet.", -1); return; }
+  try {
+    const r = await fetch(reader + "?cat=" + encodeURIComponent(S.view) + "&u=" + encodeURIComponent(it.link));
+    let raw: unknown = null;
+    try { raw = await r.json(); } catch { /* not JSON */ }
+    const a = parseArticle(raw);
+    if (a.text) { saveArticle(it.key, a); show(a, "", -1); }
+    else show(null, "Could not get the text: " + (a.error || "the reader answered " + r.status) + ".", -1);
+  } catch {
+    show(null, "Offline: this article has not been saved yet.", -1);
+  }
+}
+
 // ---- tabs ---------------------------------------------------------------
 function renderTabs(): void {
   const nav = $("tabs");
   nav.replaceChildren();
-  const all: [string, string][] = [...S.cats, ["weather", "Weather"]];
+  const all: [string, string][] = [["weather", "Weather"], ...S.cats];
   for (const [id, name] of all) {
     const b = el("button", id === S.view ? "tab on" : "tab", name);
     b.onclick = () => go(id);
@@ -156,7 +214,7 @@ function go(view: string): void {
   if (view === S.view && view !== "weather") { void loadNews(view, true); return; }
   S.view = view;
   keep("view", view);
-  S.digest = null; S.limit = SHOW; S.shown = []; S.known = new Set(); S.open = "";
+  S.digest = null; S.limit = SHOW; S.shown = []; S.known = new Set(); S.reading = null;
   renderTabs();
   window.scrollTo(0, 0);
   if (view === "weather") void showWeather(); else { renderNews(); void loadNews(view); }
@@ -351,11 +409,17 @@ async function renderForecast(sp: Spot, box: HTMLElement, force: boolean): Promi
 
 // ---- start --------------------------------------------------------------
 function start(): void {
-  $("refresh").onclick = () => { if (S.view === "weather") void showWeather(true); else void loadNews(S.view, true); };
+  $("refresh").onclick = () => {
+    if (S.view === "weather") void showWeather(true);
+    else if (S.reading) void renderReader(S.reading);
+    else void loadNews(S.view, true);
+  };
   $("update").onclick = () => location.reload();
   renderTabs();
   go(S.view === "weather" ? "weather" : S.view);
   // return to the app: check again only if it has been a while
+  // the phone's back gesture leaves the article, not the app
+  window.addEventListener("popstate", () => { if (S.reading) closeReader(); });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && S.view !== "weather" && now() - S.fetched > 15 * 60) void loadNews(S.view);
   });

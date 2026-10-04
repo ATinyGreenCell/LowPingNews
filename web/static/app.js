@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, parseDigest, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, } from "./core.js";
+import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -26,7 +26,7 @@ function keep(k, v) {
     catch { }
 }
 const S = {
-    view: store("view", "top"),
+    view: store("view", "weather"),
     cats: [["top", "Headlines"]],
     digest: null,
     offline: false,
@@ -34,7 +34,7 @@ const S = {
     shown: [],
     known: new Set(),
     fetched: 0,
-    open: "",
+    reading: null,
     read: new Set(store("read", [])),
 };
 function markRead(k) {
@@ -112,30 +112,18 @@ function card(it) {
     const read = S.read.has(it.key);
     const age = it.t ? ago(now() - it.t) : "?";
     const c = el("article", "card" + (read ? " read" : ""), el("div", "meta", (read ? "" : "\u25cf ") + it.src + " \u00b7 " + age), el("h2", "", it.title));
-    const open = S.open === it.key;
     if (it.summary)
-        c.append(el("p", open ? "sum full" : "sum", it.summary));
-    if (open && it.link) {
-        const a = el("a", "go", "Open article \u2197");
-        a.href = it.link;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        c.append(a);
-    }
+        c.append(el("p", "sum", it.summary));
+    if (savedArticle(it.key))
+        c.querySelector(".meta").append(" \u00b7 saved");
     c.tabIndex = 0;
     c.setAttribute("role", "button");
-    c.onclick = (e) => {
-        if (e.target.tagName === "A") {
-            markRead(it.key);
-            return;
-        }
-        S.open = open ? "" : it.key;
-        markRead(it.key);
-        renderNews();
-    };
+    c.onclick = () => openReader(it);
     return c;
 }
 function renderNews() {
+    if (S.reading)
+        return;
     const main = $("main");
     main.replaceChildren();
     const d = S.digest;
@@ -166,10 +154,102 @@ function renderNews() {
         main.append(el("p", "note", "Not updated this time: " + d.failed.map(([n, a]) => n + (a > 0 ? " (copy " + ago(a) + " old)" : "")).join(", ")));
     }
 }
+function savedArticle(key) { return store("art:" + key, null); }
+function saveArticle(key, a) {
+    const idx = store("arts", []).filter((k) => k !== key);
+    idx.push(key);
+    while (idx.length > 40) {
+        const old = idx.shift();
+        try {
+            localStorage.removeItem("art:" + old);
+        }
+        catch { }
+    }
+    keep("art:" + key, { t: now(), a });
+    keep("arts", idx);
+}
+function openReader(it, fromHistory = false) {
+    S.reading = it;
+    markRead(it.key);
+    if (!fromHistory)
+        history.pushState({ reading: it.key }, "");
+    window.scrollTo(0, 0);
+    void renderReader(it);
+}
+function closeReader() {
+    if (!S.reading)
+        return;
+    S.reading = null;
+    renderNews();
+}
+async function renderReader(it) {
+    const main = $("main");
+    const back = el("button", "back", "\u2039 Back");
+    back.onclick = () => history.back();
+    const body = el("div", "body", el("p", "empty", "Getting the text\u2026"));
+    main.replaceChildren(back, el("div", "meta", it.src + (it.t ? " \u00b7 " + ago(now() - it.t) + " ago" : "")), el("h1", "headline", it.title), body);
+    const show = (a, why, savedAgo) => {
+        if (S.reading !== it)
+            return;
+        body.replaceChildren();
+        if (a && a.text) {
+            for (const p of a.text.split("\n\n"))
+                body.append(el("p", "", p));
+            if (!a.complete)
+                body.append(el("p", "note warn", a.note || "This may be only part of the article."));
+            if (savedAgo >= 0)
+                body.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
+        }
+        else {
+            if (it.summary)
+                body.append(el("p", "", it.summary));
+            body.append(el("p", "note warn", why));
+        }
+        if (it.link) {
+            const a_ = el("a", "go", "Open the original page \u2197");
+            a_.href = it.link;
+            a_.target = "_blank";
+            a_.rel = "noopener noreferrer";
+            body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
+        }
+    };
+    const saved = savedArticle(it.key);
+    if (saved && saved.a.text) {
+        show(saved.a, "", now() - saved.t);
+        return;
+    }
+    const reader = S.digest ? S.digest.reader : "";
+    if (!it.link) {
+        show(null, "This feed gives no link to the full article.", -1);
+        return;
+    }
+    if (!reader) {
+        show(null, "Full-text reading is not set up for this app yet.", -1);
+        return;
+    }
+    try {
+        const r = await fetch(reader + "?cat=" + encodeURIComponent(S.view) + "&u=" + encodeURIComponent(it.link));
+        let raw = null;
+        try {
+            raw = await r.json();
+        }
+        catch { }
+        const a = parseArticle(raw);
+        if (a.text) {
+            saveArticle(it.key, a);
+            show(a, "", -1);
+        }
+        else
+            show(null, "Could not get the text: " + (a.error || "the reader answered " + r.status) + ".", -1);
+    }
+    catch {
+        show(null, "Offline: this article has not been saved yet.", -1);
+    }
+}
 function renderTabs() {
     const nav = $("tabs");
     nav.replaceChildren();
-    const all = [...S.cats, ["weather", "Weather"]];
+    const all = [["weather", "Weather"], ...S.cats];
     for (const [id, name] of all) {
         const b = el("button", id === S.view ? "tab on" : "tab", name);
         b.onclick = () => go(id);
@@ -187,7 +267,7 @@ function go(view) {
     S.limit = SHOW;
     S.shown = [];
     S.known = new Set();
-    S.open = "";
+    S.reading = null;
     renderTabs();
     window.scrollTo(0, 0);
     if (view === "weather")
@@ -397,13 +477,19 @@ async function renderForecast(sp, box, force) {
     box.append(el("h3", "", "7 days"), days);
 }
 function start() {
-    $("refresh").onclick = () => { if (S.view === "weather")
-        void showWeather(true);
-    else
-        void loadNews(S.view, true); };
+    $("refresh").onclick = () => {
+        if (S.view === "weather")
+            void showWeather(true);
+        else if (S.reading)
+            void renderReader(S.reading);
+        else
+            void loadNews(S.view, true);
+    };
     $("update").onclick = () => location.reload();
     renderTabs();
     go(S.view === "weather" ? "weather" : S.view);
+    window.addEventListener("popstate", () => { if (S.reading)
+        closeReader(); });
     document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible" && S.view !== "weather" && now() - S.fetched > 15 * 60)
             void loadNews(S.view);

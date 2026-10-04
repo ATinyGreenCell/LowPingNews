@@ -1,4 +1,4 @@
-export const APP_VERSION = "8.2";
+export const APP_VERSION = "8.3";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -76,7 +76,14 @@ export function parseDigest(raw, now) {
             }
         }
     }
-    return { t: d.t, app: cleanText(d.app, 12), cat: cleanText(d.cat, 24), cats, items, failed };
+    const reader = safeUrl(d.reader);
+    return { t: d.t, app: cleanText(d.app, 12), cat: cleanText(d.cat, 24), cats, items, failed,
+        reader: reader.startsWith("https://") ? reader : "" };
+}
+export function parseArticle(raw) {
+    const d = (raw && typeof raw === "object" ? raw : {});
+    const text = typeof d.text === "string" ? d.text.split("\n\n").map((p) => cleanText(p, 6000)).filter(Boolean).join("\n\n").slice(0, 200000) : "";
+    return { text, complete: d.complete === true, note: cleanText(d.note, 200), error: cleanText(d.error, 200) };
 }
 export function ago(sec) {
     if (!isFinite(sec) || sec < 0)

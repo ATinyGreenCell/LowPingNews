@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "8.2";
+export const APP_VERSION = "8.3";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -21,6 +21,7 @@ export interface Digest {
   cats: [string, string][];
   items: Item[];
   failed: [string, number][];    // feeds that could not be read, and their copy's age (s, -1 unknown)
+  reader: string;                // the article reader's address, "" if none is set up
 }
 
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -88,7 +89,18 @@ export function parseDigest(raw: unknown, now: number): Digest | null {
       }
     }
   }
-  return { t: d.t, app: cleanText(d.app, 12), cat: cleanText(d.cat, 24), cats, items, failed };
+  const reader = safeUrl(d.reader);
+  return { t: d.t, app: cleanText(d.app, 12), cat: cleanText(d.cat, 24), cats, items, failed,
+           reader: reader.startsWith("https://") ? reader : "" };
+}
+
+export interface Article { text: string; complete: boolean; note: string; error: string }
+
+/** The reader's answer, parsed as strictly as everything else. */
+export function parseArticle(raw: unknown): Article {
+  const d = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const text = typeof d.text === "string" ? d.text.split("\n\n").map((p) => cleanText(p, 6000)).filter(Boolean).join("\n\n").slice(0, 200000) : "";
+  return { text, complete: d.complete === true, note: cleanText(d.note, 200), error: cleanText(d.error, 200) };
 }
 
 /** "just now", "5m", "3h", "2d" - for ages in seconds. */

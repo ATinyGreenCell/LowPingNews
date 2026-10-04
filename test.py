@@ -2833,7 +2833,8 @@ def t_web_build_is_small_safe_and_honest(env, srv):
         json.dump(feeds, io.open(fl, "w"))
         out = os.path.join(tmp, "site")
         r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, env=dict(env, LPN_WEB_FEEDS=fl), timeout=120)
+                           stderr=subprocess.PIPE, env=dict(env, LPN_WEB_FEEDS=fl,
+                                                            LPN_READER_URL="https://lpn-reader.x.workers.dev"), timeout=120)
         assert r.returncode == 0, r.stderr[-400:]
         top = json.load(io.open(os.path.join(out, "data", "top.json"), encoding="utf-8"))
         assert len(top["items"]) == 60 and top["v"] == 1 and top["app"] == load().VERSION
@@ -2843,6 +2844,15 @@ def t_web_build_is_small_safe_and_honest(env, srv):
         evil = health["items"][0]
         assert evil[3] == "" and "\x1b" not in evil[1], "a hostile story reached the web data: %r" % evil
         assert ["Dead feed", -1] in health["failed"], "a dead feed must be named, not silently dropped"
+        assert top["reader"] == "https://lpn-reader.x.workers.dev"
+        probe = ("import importlib.util as u; s = u.spec_from_file_location('b', %r); m = u.module_from_spec(s); "
+                 "s.loader.exec_module(m); print(repr(m.READER))" % os.path.join(WEB, "build_digest.py"))
+        for bad, want in (("javascript:alert(1)", "''"), ("http://plain.example", "''"),
+                          ('https://x" onload="', "''"), ("https://ok.workers.dev", "'https://ok.workers.dev'")):
+            r2 = subprocess.run([sys.executable, "-c", probe], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=dict(env, LPN_READER_URL=bad))
+            assert r2.stdout.decode().strip() == want, "reader address %r gave %r %s" % (
+                bad, r2.stdout.decode().strip(), r2.stderr.decode()[-200:])
         for f in ("index.html", "app.js", "core.js", "sw.js", "manifest.webmanifest", "icon-180.png"):
             assert os.path.exists(os.path.join(out, f)), f
     finally:
@@ -2866,7 +2876,8 @@ def t_web_files_are_consistent(env, srv):
         assert need in html, need
     v = load().VERSION
     for p, rx in (("src/core.ts", r'APP_VERSION = "([^"]+)"'), ("static/core.js", r'APP_VERSION = "([^"]+)"'),
-                  ("src/sw.ts", r'const VERSION = "([^"]+)"'), ("static/sw.js", r'const VERSION = "([^"]+)"')):
+                  ("src/sw.ts", r'const VERSION = "([^"]+)"'), ("static/sw.js", r'const VERSION = "([^"]+)"'),
+                  ("reader/reader.ts", r'const VERSION = "([^"]+)"'), ("reader/reader.js", r'const VERSION = "([^"]+)"')):
         m_ = re.search(rx, io.open(os.path.join(WEB, p), encoding="utf-8").read())
         assert m_ and m_.group(1) == v, "%s says %s, news says %s" % (p, m_ and m_.group(1), v)
 
@@ -2876,9 +2887,10 @@ def t_web_logic_tests_pass(env, srv):
     node = shutil.which("node")
     if not node:
         raise Skip("needs Node.js for the web app's logic tests (they also run on GitHub)")
-    r = subprocess.run([node, os.path.join(WEB, "test", "core.test.mjs")], stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=60)
-    assert r.returncode == 0, r.stdout.decode("utf-8", "replace")[-600:]
+    for t_ in ("core.test.mjs", "reader.test.mjs"):
+        r = subprocess.run([node, os.path.join(WEB, "test", t_)], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=90)
+        assert r.returncode == 0, t_ + ": " + r.stdout.decode("utf-8", "replace")[-600:]
 
 
 @test

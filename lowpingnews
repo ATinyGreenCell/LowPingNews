@@ -460,6 +460,23 @@ cmd_web() {
   say "in a few minutes: https://$(echo "$owner" | tr 'A-Z' 'a-z').github.io/$repo/"
 }
 
+cmd_reader() {   # cmd_reader URL: point the web app at its article reader
+  command -v gh >/dev/null 2>&1 || die "needs gh (pkg install gh), signed in: gh auth login"
+  case "${1:-}" in https://*) ;; *) die "usage: lowpingnews reader https://lowpingnews-reader.NAME.workers.dev" ;; esac
+  slug="$(git -C "$REPO" remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\([^/]*/[^/.]*\).*#\1#p')"
+  [ -n "$slug" ] || die "no GitHub remote in $REPO"
+  # check it answers like the reader before telling the app to use it
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "Origin: https://$(echo "${slug%%/*}" | tr 'A-Z' 'a-z').github.io" \
+          "${1%/}/?cat=top&u=https%3A%2F%2Fexample.org%2F" 2>/dev/null || echo 000)"
+  case "$code" in
+    404|400) ;;                          # the reader's own "not a story in the app" answer
+    *) die "that address answered $code, not like the reader. Check the Worker deployed." ;;
+  esac
+  gh variable set READER_URL --body "${1%/}" -R "$slug" || die "could not set READER_URL"
+  gh workflow run web.yml -R "$slug" >/dev/null 2>&1 && say "reader set; the app picks it up in a few minutes" \
+    || say "reader set; it takes effect at the next build (within 20 minutes)"
+}
+
 cmd_pull() {
   [ -d "$REPO/.git" ] || die "$REPO is not a git repo"
   git -C "$REPO" pull --ff-only || die "pull failed"
@@ -489,6 +506,7 @@ lowpingnews - the reader, plus its dev loop
 dev:
   update          install the latest release from GitHub
   web             put the phone web app online (GitHub Pages) and print its address
+  reader URL      give the web app its article reader (a Cloudflare Worker)
   status          installed / repo / newest download / git, and flag mismatches
   sync            newest VALID download -> repo -> install  (never picks by filename)
   install         repo -> PATH, verifying the version actually landed
@@ -507,12 +525,13 @@ EOF
 # weather), so dispatch is unambiguous.
 c="${1:-}"
 case "$c" in
-  update|status|sync|install|test|pull|ship|release|clean|web|-h|--help|help) shift ;;
+  update|status|sync|install|test|pull|ship|release|clean|web|reader|-h|--help|help) shift ;;
   *) exec "$BIN/news" "$@" ;;
 esac
 case "$c" in
   update)  cmd_update ;;
   web)     cmd_web ;;
+  reader)  cmd_reader "$@" ;;
   status)  cmd_status ;;
   sync)    cmd_sync ;;
   install) cmd_install ;;

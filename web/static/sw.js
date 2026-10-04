@@ -1,6 +1,6 @@
 "use strict";
 const sw = self;
-const VERSION = "8.2";
+const VERSION = "8.3";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
 const FILES = ["./", "./index.html", "./app.js", "./core.js", "./manifest.webmanifest",

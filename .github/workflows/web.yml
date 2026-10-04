@@ -33,7 +33,9 @@ jobs:
         run: |
           npx -y -p typescript@5.6 tsc -p web/tsconfig.json
           npx -y -p typescript@5.6 tsc -p web/tsconfig.sw.json
+          npx -y -p typescript@5.6 tsc -p web/tsconfig.reader.json
           node web/test/core.test.mjs
+          node web/test/reader.test.mjs
       - name: Keep the feed cache between runs
         uses: actions/cache@v4
         with:
@@ -41,6 +43,8 @@ jobs:
           key: feeds-${{ github.run_id }}
           restore-keys: feeds-
       - name: Read the feeds and build the site
+        env:
+          LPN_READER_URL: ${{ vars.READER_URL }}
         run: python3 web/build_digest.py web/site
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
