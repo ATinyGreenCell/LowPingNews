@@ -3061,6 +3061,28 @@ def t_pubmed_tab_links_to_pubmed_and_publishes_abstracts(env, srv):
 
 
 @test
+def t_europe_pmc_feeds_list_the_newest_papers_first(env, srv):
+    m = load()
+    builtin = [f["url"] for f in json.loads(m.CATALOG_SEED)["feeds"] + m.DEFAULTS if "europepmc" in f["url"]]
+    assert builtin and all("sort=FIRST_PDATE_D%20desc" in u and "P_PDATE_D" not in u.replace("FIRST_PDATE_D", "")
+                           for u in builtin), builtin
+    old = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=x&format=json&pageSize=20&sort=P_PDATE_D%20desc"
+    assert m.epmc_newest(old).endswith("&sort=FIRST_PDATE_D%20desc")
+    for keep in ("https://evil.example/europepmc/webservices/rest/search?sort=P_PDATE_D%20desc",
+                 "https://www.ebi.ac.uk.evil.example/europepmc/webservices/rest/search?sort=P_PDATE_D%20desc",
+                 "https://feeds.example/rss?sort=P_PDATE_D%20desc"):
+        assert m.epmc_newest(keep) == keep, keep
+    sources(env, [{"id": "pm", "name": "PubMed", "url": old, "cats": ["pubmed"], "kind": "epmc"}])
+    probe = ("import importlib.util as u, importlib.machinery as mc, json, sys; sys.argv=['x']; "
+             "l = mc.SourceFileLoader('n', %r); s = u.spec_from_loader('n', l); m = u.module_from_spec(s); l.exec_module(m); "
+             "import types; print(json.dumps([x['url'] for x in m.sources(types.SimpleNamespace(only=None, cat='all'))]))" % NEWS)
+    pr = subprocess.run([sys.executable, "-c", probe], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    assert pr.returncode == 0, pr.stderr.decode()[-400:]
+    got = json.loads(pr.stdout.decode())
+    assert got == [old.replace("P_PDATE_D", "FIRST_PDATE_D")], "a saved list keeps the issue-date sort: %r" % got
+
+
+@test
 def t_previews_end_at_a_word_and_keep_the_whole_text(env, srv):
     m = load()
     assert m.preview("short", 400) == "short"
