@@ -161,5 +161,16 @@ test("fuzz: hostile or broken data never throws and never reaches the page raw",
     C.newerVersion(x, "8.9"); C.preprintId(typeof x === "string" ? x : ""); C.liveAlerts(x, 1791100000);
   }
 });
+test("PubMed records: recognised, and their abstract file checked by PMID", () => {
+  assert.deepEqual(C.paperId("https://pubmed.ncbi.nlm.nih.gov/41000001/"), { server: "pubmed", id: "41000001" });
+  assert.deepEqual(C.paperId("http://biorxiv.org/cgi/content/short/2026.10.02.679012v1?rss=1"), { server: "biorxiv", id: "2026.10.02.679012" });
+  assert.equal(C.paperId("https://pubmed.ncbi.nlm.nih.gov/?term=x"), null);
+  assert.equal(C.abstractFile({ server: "pubmed", id: "41000001" }), "./data/abs/pubmed-41000001.json");
+  const doc = { server: "pubmed", pmid: "41000001", abstract: "Plastids.", authors: "Lee K; Park S", journal: "Plant Cell", date: "2026-10-02" };
+  const a = C.parseAbstractDoc(doc, { server: "pubmed", id: "41000001" });
+  assert.equal(a.text.split("\n\n")[0], "Lee K; Park S \u00b7 Plant Cell \u00b7 published 2026-10-02");
+  assert.match(a.note, /journal/);
+  assert.equal(C.parseAbstractDoc(doc, { server: "pubmed", id: "41000002" }).text, "", "another record's file");
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

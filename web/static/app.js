@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion } from "./core.js";
+import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -292,7 +292,7 @@ async function renderReader(it, force = false) {
         show(null, "This feed gives no link to the full article.", -1);
         return;
     }
-    const pre = preprintId(it.link);
+    const pre = paperId(it.link);
     if (pre) {
         try {
             const r = await fetch(abstractFile(pre));

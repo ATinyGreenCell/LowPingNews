@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "8.9";
+export const APP_VERSION = "9.0";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -110,7 +110,15 @@ export function preprintId(link: string): { server: string; id: string } | null 
   const m = PREPRINT.exec(link || "");
   return m ? { server: m[1].toLowerCase(), id: m[2] } : null;
 }
-/** Where the site build publishes that preprint's abstract (same site, ~1 KB). */
+/** A preprint or a PubMed record: the papers whose abstracts the site publishes. */
+const PUBMED = /^https?:\/\/pubmed\.ncbi\.nlm\.nih\.gov\/(\d{1,9})\/?(?:[?#].*)?$/i;
+export function paperId(link: string): { server: string; id: string } | null {
+  const p = preprintId(link);
+  if (p) return p;
+  const m = PUBMED.exec(link || "");
+  return m ? { server: "pubmed", id: m[1] } : null;
+}
+/** Where the site build publishes that paper's abstract (same site, ~1 KB). */
 export function abstractFile(p: { server: string; id: string }): string {
   return "./data/abs/" + p.server + "-" + p.id + ".json";
 }
@@ -123,17 +131,19 @@ export function parseAbstractDoc(raw: unknown, want?: { server: string; id: stri
   const none: Article = { text: "", complete: false, note: "", error: "no abstract" };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return none;
   const d = raw as Record<string, unknown>;
-  if (want && (d.doi !== "10.1101/" + want.id || d.server !== want.server)) return none;   // some other paper's file
+  if (want && (d.server !== want.server ||
+               (want.server === "pubmed" ? d.pmid !== want.id : d.doi !== "10.1101/" + want.id))) return none;   // some other paper's file
   const str = (k: string): string => cleanText(d[k], 600);
   const abs = cleanParas(d.abstract, 8000);
   if (!abs) return none;
   const cat = str("category");
-  const meta = [authorsShort(str("authors")), cat && cat[0].toUpperCase() + cat.slice(1),
-                str("date") && "posted " + str("date"), str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
+  const meta = [authorsShort(str("authors")), str("journal"), cat && cat[0].toUpperCase() + cat.slice(1),
+                str("date") && (d.server === "pubmed" ? "published " : "posted ") + str("date"),
+                str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
   const paras = [meta, abs].filter(Boolean);
   const pub = str("published");
   if (pub && pub !== "NA" && /^10\.\S+$/.test(pub)) paras.push("Since published: https://doi.org/" + pub);
-  const host = d.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+  const host = d.server === "medrxiv" ? "medRxiv" : d.server === "pubmed" ? "the journal's site (PubMed links to it)" : "bioRxiv";
   return { text: paras.join("\n\n"), complete: true, error: "",
            note: "This is the abstract. The full paper is on " + host + ": open the original page." };
 }

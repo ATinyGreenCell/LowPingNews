@@ -46,7 +46,8 @@ const API = {
 const listedUrls = Object.keys(pages).concat(["https://news.example/slow", "https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1",
   "http://biorxiv.org/cgi/content/short/2026.10.01.612345v2?rss=1", "https://www.biorxiv.org/content/10.1101/339747v1",
   "https://europepmc.org/article/MED/12345678", "http://biorxiv.org/content/early/2026/10/01/2026.10.01.612345",
-  "https://www.biorxiv.org/content/10.1101/2026.01.03.999999v1", "https://www.biorxiv.org/content/10.1101/2026.10.04.700001v1"]);
+  "https://www.biorxiv.org/content/10.1101/2026.01.03.999999v1", "https://www.biorxiv.org/content/10.1101/2026.10.04.700001v1",
+  "https://pubmed.ncbi.nlm.nih.gov/12345678/"]);
 let fetched = [];
 globalThis.fetch = async (url, init = {}) => {
   url = String(url); fetched.push(url);
@@ -148,6 +149,11 @@ await test("when bioRxiv refuses the reader, the error says so", async () => {
   assert.match((await r.json()).error, /bioRxiv's API answered 404/);
   const d = await (await ask("http://biorxiv.org/content/early/2026/10/01/2026.10.01.612345")).json();
   assert.match(d.text, /central to photoprotection/, "an older /content/early/ link is a preprint too");
+});
+await test("a PubMed link gets its abstract from Europe PMC's copy", async () => {
+  const d = await (await ask("https://pubmed.ncbi.nlm.nih.gov/12345678/")).json();
+  assert.ok(d.complete && /Plants make pigments/.test(d.text), JSON.stringify(d));
+  assert.equal(d.url, "https://pubmed.ncbi.nlm.nih.gov/12345678/");
 });
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");

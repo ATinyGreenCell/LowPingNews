@@ -97,6 +97,12 @@ the abstract (labelled as such); bioRxiv's pages sit behind an anti-bot check
 that would otherwise return only the site's tagline. `lpn release` keeps the
 deployed reader up to date.
 
+**PubMed tab.** Newest PubMed papers matching a search (by default: duckweed,
+plant and plastid transformation, molecular farming, plant synthetic biology),
+read through Europe PMC's daily copy of PubMed - one light request, no API key.
+Links go to PubMed itself, and abstracts are published beside the app like
+preprints'. In the terminal, tick it in `lowpingnews catalog`.
+
 **Preprint abstracts.** bioRxiv and medRxiv feeds already carry each paper's
 full abstract, so the site build publishes it beside the app as a ~1 KB file
 (`data/abs/`) - opening a preprint costs one small request and never touches

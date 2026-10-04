@@ -122,18 +122,58 @@ def _day(epoch):
 FEED_FULL = 300   # a feed text at least this long is taken as the whole abstract
 
 
+PUBMED = re.compile(r"^https?://pubmed\.ncbi\.nlm\.nih\.gov/(\d{1,9})/?(?:[?#].*)?$", re.I)
+
+
+def paper_id(link):
+    """("biorxiv"|"medrxiv", id) for a preprint, ("pubmed", pmid) for a PubMed record."""
+    p = preprint_id(link)
+    if p:
+        return p
+    m = PUBMED.match(link or "")
+    return ("pubmed", m.group(1)) if m else None
+
+
+def from_epmc(pmids):
+    """Europe PMC's copy of PubMed: abstracts for many PMIDs in one request."""
+    from urllib.parse import quote
+    base = PREPRINT_API or "https://www.ebi.ac.uk"
+    q = "(" + " OR ".join("EXT_ID:" + x for x in pmids) + ") AND SRC:MED"
+    d = _get_json("%s/europepmc/webservices/rest/search?query=%s&resultType=core&format=json&pageSize=%d"
+                  % (base.rstrip("/"), quote(q, safe=""), len(pmids)), timeout=30)
+    res = ((d or {}).get("resultList") or {}).get("result") if d else None
+    out = {}
+    import html
+    for r in res if isinstance(res, list) else []:
+        if not isinstance(r, dict) or str(r.get("pmid") or r.get("id") or "") not in pmids:
+            continue
+        raw = str(r.get("abstractText") or "")
+        text = _paras(html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"</?(h\d|p|br|div)[^>]*>", "\n\n", raw, flags=re.I))))
+        if len(text) < 80:
+            continue
+        doi = str(r.get("doi") or "")
+        out[str(r.get("pmid") or r.get("id"))] = {
+            "abstract": text, "authors": clean(str(r.get("authorString") or "").replace(", ", "; "), 600),
+            "journal": clean(r.get("journalTitle") or (r.get("journalInfo") or {}).get("journal", {}).get("title"), 200),
+            "date": clean(r.get("firstPublicationDate") or r.get("pubYear"), 10),
+            "published": doi if re.match(r"^10\.\S+$", doi) else "", "src": "europepmc"}
+    return out
+
+
 def write_abstracts(m, out_dir, items, now):
-    """items: (link, feed item) for every story listed. Each preprint gets
-    data/abs/<server>-<id>.json. The feed's own text is used when it is the
-    whole abstract (bioRxiv's feeds carry it): nothing more is downloaded.
-    Otherwise Crossref, then bioRxiv's API, once per preprint, cached."""
+    """items: (link, feed item) for every story listed. Each preprint or PubMed
+    record gets data/abs/<server>-<id>.json, read by the app from its own site.
+    A preprint feed's own text is used when it is the whole abstract (bioRxiv's
+    feeds carry it): nothing more is downloaded. Otherwise Crossref, then
+    bioRxiv's API; PubMed records come from Europe PMC, many per request.
+    Each paper is asked about once, then cached."""
     cache_f = os.path.join(m.CD, "abstracts.json")
     cache = m.jread(cache_f, {})
     if not isinstance(cache, dict):
         cache = {}
     best = {}
     for link, it in items:
-        pid = preprint_id(link)
+        pid = paper_id(link)
         if not pid:
             continue
         text = str(it.get("c") or it.get("s") or "")
@@ -141,29 +181,49 @@ def write_abstracts(m, out_dir, items, now):
             best[pid] = (text, it)
     adir = os.path.join(out_dir, "data", "abs")
     os.makedirs(adir, exist_ok=True)
-    asked = written = 0
+    asked = 0
+    docs = {}
+    due_pubmed = []
     for (server, pid), (text, it) in sorted(best.items()):
         k = "%s-%s" % (server, pid)
-        doc = None
-        if len(text) >= FEED_FULL and not text.endswith("\u2026"):
-            doc = {"abstract": _paras(text), "authors": clean(it.get("a"), 600),
-                   "date": _day(it.get("d")), "src": "feed"}
+        c = cache.get(k) if isinstance(cache.get(k), dict) else {}
+        due = (now - c.get("t", 0)) > (ABS_KEEP if c.get("doc") else ABS_RETRY)
+        if server != "pubmed" and len(text) >= FEED_FULL and not text.endswith("\u2026"):
+            docs[k] = {"abstract": _paras(text), "authors": clean(it.get("a"), 600),
+                       "date": _day(it.get("d")), "src": "feed"}
             cache.pop(k, None)
+        elif server == "pubmed":
+            if due and len(due_pubmed) < ABS_NEW_MAX:
+                due_pubmed.append(pid)
+            else:
+                docs[k] = c.get("doc")
         else:
-            c = cache.get(k) if isinstance(cache.get(k), dict) else {}
-            due = (now - c.get("t", 0)) > (ABS_KEEP if c.get("doc") else ABS_RETRY)
             if due and asked < ABS_NEW_MAX:
                 asked += 1
                 got = from_crossref(pid) or from_biorxiv(server, pid)
                 c = {"t": int(now), "doc": got or c.get("doc")}   # a failed refresh keeps the old copy
                 cache[k] = c
-            doc = c.get("doc")
-        if doc and doc.get("abstract"):
-            out = {"v": 1, "server": server, "doi": "10.1101/" + pid}
-            out.update({kk: vv for kk, vv in doc.items() if isinstance(vv, str) and vv})
-            with io.open(os.path.join(adir, k + ".json"), "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
-            written += 1
+            docs[k] = c.get("doc")
+    for i in range(0, len(due_pubmed), 50):                     # Europe PMC: 50 records a request
+        batch = due_pubmed[i:i + 50]
+        asked += 1
+        got = from_epmc(batch)
+        for pid in batch:
+            k = "pubmed-" + pid
+            old = (cache.get(k) or {}).get("doc") if isinstance(cache.get(k), dict) else None
+            cache[k] = {"t": int(now), "doc": got.get(pid) or old}
+            docs[k] = cache[k]["doc"]
+    written = 0
+    for k, doc in sorted(docs.items()):
+        if not doc or not doc.get("abstract"):
+            continue
+        server, pid = k.split("-", 1)
+        out = {"v": 1, "server": server}
+        out.update({"pmid": pid} if server == "pubmed" else {"doi": "10.1101/" + pid})
+        out.update({kk: vv for kk, vv in doc.items() if isinstance(vv, str) and vv and kk not in ("server", "doi", "pmid")})
+        with io.open(os.path.join(adir, k + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+        written += 1
     keep = {"%s-%s" % i for i in best}
     m.jwrite(cache_f, {k: v for k, v in cache.items() if k in keep})   # only what is still listed
     return asked, written
@@ -287,7 +347,7 @@ def main():
     sizes = build(out)
     import gzip
     asked, written = sizes.pop("(abstracts)")
-    print("  preprint abstracts: %d published, %d asked of bioRxiv this run" % (written, asked))
+    print("  paper abstracts: %d published, %d outside requests this run" % (written, asked))
     for c, n in sorted(sizes.items()):
         raw = io.open(os.path.join(out, "data", c + ".json"), "rb").read()
         print("  %-8s %6.1f KB, %5.1f KB compressed" % (c, n / 1024.0, len(gzip.compress(raw)) / 1024.0))

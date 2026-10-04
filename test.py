@@ -2926,11 +2926,11 @@ def t_web_build_publishes_preprint_abstracts(env, srv):
             os.path.join(tmp, "site", "data", "bio.json"), encoding="utf-8").read()[:600])
         doc = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.02.679012.json"), encoding="utf-8"))
         assert doc["abstract"] == "MYC2 is central.\n\nWe mapped its binding." and doc["version"] == "2", doc
-        assert "1 published, 2 asked" in log, log
+        assert "1 published, 2 outside requests" in log, log
         srv.json(api, {"collection": [{"version": "3", "abstract": "Changed."}]})
         adir, log = build()                                   # cached: bioRxiv is not asked again
         doc = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.02.679012.json"), encoding="utf-8"))
-        assert doc["version"] == "2" and "0 asked" in log, (doc, log)
+        assert doc["version"] == "2" and "0 outside requests" in log, (doc, log)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2973,7 +2973,7 @@ def t_abstracts_come_from_the_feed_then_crossref(env, srv):
         b = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.03.222222.json"), encoding="utf-8"))
         assert b["abstract"] == "Crossref holds this abstract & it is long enough to use here, being a real paragraph of findings.", b
         assert b["authors"] == "Ruiz, A. M." and b["date"] == "2026-10-03" and b["src"] == "crossref", b
-        assert "2 asked" in r.stdout.decode(), "the feed's own abstract must cost no extra request"
+        assert "2 outside requests" in r.stdout.decode(), "the feed's own abstract must cost no extra request"
         bio = json.load(io.open(os.path.join(out, "data", "bio.json"), encoding="utf-8"))
         s = [x[2] for x in bio["items"] if x[1].startswith("Cytokinin")][0]
         assert s.endswith("\u2026") and len(s) <= 220 and full.startswith(s[:-1].rstrip()), repr(s)
@@ -3006,6 +3006,56 @@ def t_site_build_survives_a_broken_cache_and_hostile_feed(env, srv):
                 continue
             assert not re.search(u"[\x00-\x08\x0b-\x1f\x7f\u202a-\u202e]", v), "control text survived: %r" % v[:80]
         assert "<script>" not in raw and len(doc.get("authors", "")) <= 600, doc.get("authors", "")[:80]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_pubmed_tab_links_to_pubmed_and_publishes_abstracts(env, srv):
+    m = load()
+    feed = {"resultList": {"result": [
+        {"id": "41000001", "source": "MED", "pmid": "41000001", "doi": "10.1000/a1", "title": "Duckweed chloroplast transformation",
+         "journalTitle": "Plant Cell", "authorString": "Lee K, Park S", "firstPublicationDate": "2026-10-02"},
+        {"id": "41000002", "source": "MED", "pmid": "41000002", "title": "Molecular farming in Wolffia",
+         "journalTitle": "Plant Biotechnol J", "authorString": "Ruiz M", "firstPublicationDate": "2026-10-01"},
+        {"id": "PPR999", "source": "PPR", "doi": "10.1101/2026.10.01.555555", "title": "A preprint in Europe PMC",
+         "firstPublicationDate": "2026-10-01"}]}}
+    recs = m.parse_epmc(json.dumps(feed).encode())
+    assert [r["u"] for r in recs] == ["https://pubmed.ncbi.nlm.nih.gov/41000001/", "https://pubmed.ncbi.nlm.nih.gov/41000002/",
+                                      "https://doi.org/10.1101/2026.10.01.555555"], [r["u"] for r in recs]
+    srv.json("/pm", feed)
+    batch = {"resultList": {"result": [
+        {"pmid": "41000001", "abstractText": "<h4>Background</h4>Duckweed grows fast &amp; clonally, which makes it a good host for chloroplast work.<h4>Results</h4>We transformed plastids.",
+         "authorString": "Lee K, Park S", "journalTitle": "Plant Cell", "firstPublicationDate": "2026-10-02", "doi": "10.1000/a1"},
+        {"pmid": "41000002", "abstractText": "Wolffia makes recombinant protein at useful yields, as shown here across many trials in detail.",
+         "authorString": "Ruiz M", "journalTitle": "Plant Biotechnol J", "firstPublicationDate": "2026-10-01"},
+        {"pmid": "99999999", "abstractText": "Some other paper that was never asked about, and must not be published here."}]}}
+    srv.json("/europepmc/webservices/rest/search", batch)
+    tmp = tempfile.mkdtemp()
+    try:
+        fl = os.path.join(tmp, "feeds.json")
+        json.dump([{"id": "pubmed", "name": "PubMed", "url": srv.url("/pm"), "cats": ["pubmed"], "kind": "epmc"}], io.open(fl, "w"))
+
+        def build():
+            out = os.path.join(tmp, "site")
+            shutil.rmtree(out, ignore_errors=True)
+            r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=dict(env, LPN_WEB_FEEDS=fl, LPN_PREPRINT_API=srv.url("")), timeout=120)
+            assert r.returncode == 0, r.stderr.decode()[-600:]
+            return out, r.stdout.decode()
+        out, log = build()
+        adir = os.path.join(out, "data", "abs")
+        assert sorted(os.listdir(adir)) == ["pubmed-41000001.json", "pubmed-41000002.json"], os.listdir(adir)
+        a = json.load(io.open(os.path.join(adir, "pubmed-41000001.json"), encoding="utf-8"))
+        assert a["pmid"] == "41000001" and a["server"] == "pubmed" and a["journal"] == "Plant Cell", a
+        assert a["abstract"].split("\n\n") == ["Background", "Duckweed grows fast & clonally, which makes it a good host for chloroplast work.",
+                                                "Results", "We transformed plastids."], a["abstract"]
+        assert a["authors"] == "Lee K; Park S" and a["published"] == "10.1000/a1", a
+        assert "1 outside requests" in log, "both PubMed abstracts should come in one request: " + log
+        pm = json.load(io.open(os.path.join(out, "data", "pubmed.json"), encoding="utf-8"))
+        assert pm["cat"] == "pubmed" and pm["items"][0][3] == "https://pubmed.ncbi.nlm.nih.gov/41000001/"
+        out, log = build()
+        assert "0 outside requests" in log and len(os.listdir(os.path.join(out, "data", "abs"))) == 2, log
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

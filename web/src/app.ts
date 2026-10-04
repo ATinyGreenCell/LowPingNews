@@ -1,6 +1,6 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -237,7 +237,7 @@ async function renderReader(it: Item, force = false): Promise<void> {
   if (!it.link) { show(null, "This feed gives no link to the full article.", -1); return; }
   // a preprint: its abstract was published beside the app by the site build
   // (bioRxiv refuses the reader's servers, but not GitHub's): ~1 KB, same site
-  const pre = preprintId(it.link);
+  const pre = paperId(it.link);
   if (pre) {
     try {
       const r = await fetch(abstractFile(pre));

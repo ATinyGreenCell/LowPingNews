@@ -1,4 +1,4 @@
-export const APP_VERSION = "8.9";
+export const APP_VERSION = "9.0";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -90,6 +90,14 @@ export function preprintId(link) {
     const m = PREPRINT.exec(link || "");
     return m ? { server: m[1].toLowerCase(), id: m[2] } : null;
 }
+const PUBMED = /^https?:\/\/pubmed\.ncbi\.nlm\.nih\.gov\/(\d{1,9})\/?(?:[?#].*)?$/i;
+export function paperId(link) {
+    const p = preprintId(link);
+    if (p)
+        return p;
+    const m = PUBMED.exec(link || "");
+    return m ? { server: "pubmed", id: m[1] } : null;
+}
 export function abstractFile(p) {
     return "./data/abs/" + p.server + "-" + p.id + ".json";
 }
@@ -102,20 +110,22 @@ export function parseAbstractDoc(raw, want) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw))
         return none;
     const d = raw;
-    if (want && (d.doi !== "10.1101/" + want.id || d.server !== want.server))
+    if (want && (d.server !== want.server ||
+        (want.server === "pubmed" ? d.pmid !== want.id : d.doi !== "10.1101/" + want.id)))
         return none;
     const str = (k) => cleanText(d[k], 600);
     const abs = cleanParas(d.abstract, 8000);
     if (!abs)
         return none;
     const cat = str("category");
-    const meta = [authorsShort(str("authors")), cat && cat[0].toUpperCase() + cat.slice(1),
-        str("date") && "posted " + str("date"), str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
+    const meta = [authorsShort(str("authors")), str("journal"), cat && cat[0].toUpperCase() + cat.slice(1),
+        str("date") && (d.server === "pubmed" ? "published " : "posted ") + str("date"),
+        str("version") && "version " + str("version")].filter(Boolean).join(" \u00b7 ");
     const paras = [meta, abs].filter(Boolean);
     const pub = str("published");
     if (pub && pub !== "NA" && /^10\.\S+$/.test(pub))
         paras.push("Since published: https://doi.org/" + pub);
-    const host = d.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+    const host = d.server === "medrxiv" ? "medRxiv" : d.server === "pubmed" ? "the journal's site (PubMed links to it)" : "bioRxiv";
     return { text: paras.join("\n\n"), complete: true, error: "",
         note: "This is the abstract. The full paper is on " + host + ": open the original page." };
 }

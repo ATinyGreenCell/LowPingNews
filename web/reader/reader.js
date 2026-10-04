@@ -8,7 +8,7 @@
 //
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
-const VERSION = "8.9";
+const VERSION = "9.0";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -319,7 +319,11 @@ export async function read(url, timeoutMs = TIMEOUT_MS) {
         return { v: 1, url, text: "", complete: false,
             error: "no abstract yet (" + host + "'s API " + (apiWhy || "had none") + ", and Crossref had none)" };
     }
-    const api = await epmcAbstract(url, timeoutMs).catch(() => null);
+    // a PubMed record: its abstract from Europe PMC's copy of PubMed
+    const pm = /^https?:\/\/pubmed\.ncbi\.nlm\.nih\.gov\/(\d{1,9})\/?(?:[?#].*)?$/i.exec(url);
+    const api = await epmcAbstract(pm ? "https://europepmc.org/article/MED/" + pm[1] : url, timeoutMs).catch(() => null);
+    if (api)
+        api.url = url;
     if (api)
         return api;
     const apiNote = "";
