@@ -106,7 +106,7 @@ async function loadNews(cat, manual = false) {
     else if (manual)
         toast(offline ? "offline: showing the saved copy" : "nothing new");
     if (newerVersion(d.app, APP_VERSION))
-        showUpdate();
+        showUpdate(d.app);
     else if (d.app === APP_VERSION) {
         mem("lpn-updating", null);
         mem("lpn-hard", null);
@@ -125,8 +125,10 @@ function mem(k, v) {
     return null;
 }
 let updating = false;
-function showUpdate() {
+function showUpdate(v) {
     const b = $("update");
+    if (!updating)
+        b.textContent = "Version " + v + " is ready (you have " + APP_VERSION + "). Tap to update.";
     b.hidden = false;
     const tried = Number(mem("lpn-updating") || 0);
     if (tried && Date.now() - tried < 120000)
@@ -279,7 +281,8 @@ async function renderReader(it, force = false) {
             body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
         }
     };
-    const saved = savedArticle(it.key);
+    const saved0 = savedArticle(it.key);
+    const saved = saved0 && (saved0.a.complete || !preprintId(it.link)) ? saved0 : null;
     if (!force && saved && saved.a.text && saved.a.complete) {
         show(saved.a, "", now() - saved.t);
         return;
@@ -293,7 +296,7 @@ async function renderReader(it, force = false) {
     if (pre) {
         try {
             const r = await fetch(abstractFile(pre));
-            const a = r.ok ? parseAbstractDoc(await r.json()) : null;
+            const a = r.ok ? parseAbstractDoc(await r.json(), pre) : null;
             if (a && a.text) {
                 saveArticle(it.key, a);
                 show(a, "", -1);
@@ -570,6 +573,7 @@ function start() {
             void loadNews(S.view, true);
     };
     $("update").onclick = () => void updateNow($("update"));
+    $("ver").textContent = "v" + APP_VERSION;
     renderTabs();
     go(S.view === "weather" ? "weather" : S.view);
     window.addEventListener("popstate", () => { if (S.reading)

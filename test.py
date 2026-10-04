@@ -2936,6 +2936,93 @@ def t_web_build_publishes_preprint_abstracts(env, srv):
 
 
 @test
+def t_abstracts_come_from_the_feed_then_crossref(env, srv):
+    full = ("Cytokinin delays leaf senescence and keeps photosynthesis going by maintaining chloroplast function. "
+            "Here we show that two import components are required, ") * 3 + "and we map where they act."
+    feed_item = item("Cytokinin and chloroplast import", body=full,
+                     link="http://biorxiv.org/cgi/content/short/2026.10.03.111111v1?rss=1",
+                     when="2026-10-03T08:00:00Z").replace("</item>", "<author>Okafor, N. A.; Li, W.</author></item>")
+    srv.feed("/bx", [feed_item,
+                     item("A short-texted preprint", body="Just a teaser.",
+                          link="http://biorxiv.org/cgi/content/short/2026.10.03.222222v1?rss=1"),
+                     item("Nobody has this one", body="Teaser.",
+                          link="http://biorxiv.org/cgi/content/short/2026.10.03.333333v1?rss=1")])
+    srv.json("/works/10.1101/2026.10.03.222222", {"status": "ok", "message": {
+        "abstract": "<jats:title>Abstract</jats:title><jats:p>Crossref holds this abstract &amp; it is long enough to use here, being a real paragraph of findings.</jats:p>",
+        "author": [{"given": "Ana Maria", "family": "Ruiz"}], "posted": {"date-parts": [[2026, 10, 3]]}}})
+
+    def empty(h):                                   # what bioRxiv's details endpoint sends lately
+        h.send_response(200)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+    srv.routes["/details/biorxiv/10.1101/2026.10.03.333333/na/json"] = empty
+    tmp = tempfile.mkdtemp()
+    try:
+        fl = os.path.join(tmp, "feeds.json")
+        json.dump([{"id": "bx", "name": "bioRxiv plant", "url": srv.url("/bx"), "cats": ["bio"]}], io.open(fl, "w"))
+        out = os.path.join(tmp, "site")
+        r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=dict(env, LPN_WEB_FEEDS=fl, LPN_PREPRINT_API=srv.url("")), timeout=120)
+        assert r.returncode == 0, r.stderr.decode()[-600:]
+        adir = os.path.join(out, "data", "abs")
+        assert sorted(os.listdir(adir)) == ["biorxiv-2026.10.03.111111.json", "biorxiv-2026.10.03.222222.json"], os.listdir(adir)
+        a = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.03.111111.json"), encoding="utf-8"))
+        assert a["abstract"] == full and a["src"] == "feed" and a["authors"] == "Okafor, N. A.; Li, W.", a
+        assert a["date"] == "2026-10-03" and a["doi"] == "10.1101/2026.10.03.111111", a
+        b = json.load(io.open(os.path.join(adir, "biorxiv-2026.10.03.222222.json"), encoding="utf-8"))
+        assert b["abstract"] == "Crossref holds this abstract & it is long enough to use here, being a real paragraph of findings.", b
+        assert b["authors"] == "Ruiz, A. M." and b["date"] == "2026-10-03" and b["src"] == "crossref", b
+        assert "2 asked" in r.stdout.decode(), "the feed's own abstract must cost no extra request"
+        bio = json.load(io.open(os.path.join(out, "data", "bio.json"), encoding="utf-8"))
+        s = [x[2] for x in bio["items"] if x[1].startswith("Cytokinin")][0]
+        assert s.endswith("\u2026") and len(s) <= 220 and full.startswith(s[:-1].rstrip()), repr(s)
+        assert s[-2] != " " and full[len(s) - 1] == " ", "a preview should end at a whole word: %r" % s[-20:]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_site_build_survives_a_broken_cache_and_hostile_feed(env, srv):
+    nasty = "Abstract \x1b[2J text <script>x</script> \u202e reversed. " * 12
+    srv.feed("/bx", [item("Hostile", body=nasty, link="http://biorxiv.org/cgi/content/short/2026.10.03.444444v1?rss=1")
+                     .replace("</item>", "<author>\x07Evil, E.\x1b]0;title\x07 " + "A" * 5000 + "</author></item>")])
+    tmp = tempfile.mkdtemp()
+    try:
+        fl = os.path.join(tmp, "feeds.json")
+        json.dump([{"id": "bx", "name": "bx", "url": srv.url("/bx"), "cats": ["bio"]}], io.open(fl, "w"))
+        cache = os.path.join(env["XDG_CACHE_HOME"], "lowpingnews")
+        os.makedirs(cache, exist_ok=True)
+        for name in ("abstracts.json",):
+            io.open(os.path.join(cache, name), "w").write("{not json at all")
+        out = os.path.join(tmp, "site")
+        r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=dict(env, LPN_WEB_FEEDS=fl, LPN_PREPRINT_API=NOWHERE), timeout=120)
+        assert r.returncode == 0, r.stderr.decode()[-500:]
+        raw = io.open(os.path.join(out, "data", "abs", "biorxiv-2026.10.03.444444.json"), encoding="utf-8").read()
+        doc = json.loads(raw)
+        for v in doc.values():
+            if not isinstance(v, str):
+                continue
+            assert not re.search(u"[\x00-\x08\x0b-\x1f\x7f\u202a-\u202e]", v), "control text survived: %r" % v[:80]
+        assert "<script>" not in raw and len(doc.get("authors", "")) <= 600, doc.get("authors", "")[:80]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_previews_end_at_a_word_and_keep_the_whole_text(env, srv):
+    m = load()
+    assert m.preview("short", 400) == "short"
+    p = m.preview("word " * 200, 50)
+    assert p.endswith("\u2026") and len(p) <= 50 and "wor\u2026" not in p, repr(p)
+    assert m.preview("x" * 500, 50) == "x" * 49 + "\u2026", "one long word is cut, still marked"
+    body = "Abstract sentence number one is here. " * 13          # ~500 characters: just over the preview
+    recs = m.parse_feed(("<rss><channel>%s</channel></rss>" % item("T", body=body)).encode())
+    assert recs[0]["s"].endswith("\u2026") and recs[0]["c"] == body.strip(), "a 400-600 character text must be kept whole"
+
+
+@test
 def t_web_build_is_small_safe_and_honest(env, srv):
     feeds = []
     for i in range(4):

@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "8.8";
+export const APP_VERSION = "8.9";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -119,10 +119,11 @@ const authorsShort = (a: string): string => {
   return names.length > 3 ? names.slice(0, 3).join("; ") + " and " + (names.length - 3) + " more" : names.join("; ");
 };
 /** The published abstract file as an article: who, when, which version, then the abstract. */
-export function parseAbstractDoc(raw: unknown): Article {
+export function parseAbstractDoc(raw: unknown, want?: { server: string; id: string }): Article {
   const none: Article = { text: "", complete: false, note: "", error: "no abstract" };
-  if (!raw || typeof raw !== "object") return none;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return none;
   const d = raw as Record<string, unknown>;
+  if (want && (d.doi !== "10.1101/" + want.id || d.server !== want.server)) return none;   // some other paper's file
   const str = (k: string): string => cleanText(d[k], 600);
   const abs = cleanParas(d.abstract, 8000);
   if (!abs) return none;

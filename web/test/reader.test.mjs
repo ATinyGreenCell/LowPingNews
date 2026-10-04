@@ -35,6 +35,10 @@ const API = {
     { version: "2", abstract: "Violaxanthin de-epoxidases are central to photoprotection.\n\nHere we show a natural alga retains both enzymes.",
       authors: "Smith, J.; Jones, A.; Lee, K.; Park, S.; Ruiz, M.", date: "2026-10-02", category: "plant biology", published: "10.1038/s41477-026-0001-x" }] },
   "https://api.biorxiv.org/details/biorxiv/10.1101/339747/na/json": { collection: [{ version: "1", abstract: "An old-style DOI abstract.", authors: "B", date: "2018-06-05", category: "genomics", published: "NA" }] },
+  "https://api.biorxiv.org/details/biorxiv/10.1101/2026.10.04.700001/na/json": "",
+  "https://api.crossref.org/works/10.1101/2026.10.04.700001": { status: "ok", message: {
+    abstract: "<jats:title>Abstract</jats:title><jats:p>Cytokinin delays senescence &amp; keeps chloroplasts working, here shown in detail.</jats:p><jats:p>CIA2 and CIL mediate it.</jats:p>",
+    author: [{ given: "Ngozi Ada", family: "Okafor" }, { given: "Wei", family: "Li" }, { name: "A consortium" }] } },
   "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A12345678%20AND%20SRC%3AMED&resultType=core&format=json&pageSize=1":
     { resultList: { result: [{ abstractText: "<h4>Background</h4>Plants make pigments.<h4>Results</h4>We found &amp; characterised an enzyme.",
       authorString: "Smith J, Jones A", journalTitle: "Plant Cell", pubYear: "2026" }] } },
@@ -42,14 +46,14 @@ const API = {
 const listedUrls = Object.keys(pages).concat(["https://news.example/slow", "https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1",
   "http://biorxiv.org/cgi/content/short/2026.10.01.612345v2?rss=1", "https://www.biorxiv.org/content/10.1101/339747v1",
   "https://europepmc.org/article/MED/12345678", "http://biorxiv.org/content/early/2026/10/01/2026.10.01.612345",
-  "https://www.biorxiv.org/content/10.1101/2026.01.03.999999v1"]);
+  "https://www.biorxiv.org/content/10.1101/2026.01.03.999999v1", "https://www.biorxiv.org/content/10.1101/2026.10.04.700001v1"]);
 let fetched = [];
 globalThis.fetch = async (url, init = {}) => {
   url = String(url); fetched.push(url);
   if (url === SITE + "data/top.json") return new Response(JSON.stringify({ v: 1, items: listedUrls.map((u, i) => [0, "t" + i, "", u, 0]) }), { headers: { "content-type": "application/json" } });
   if (url.startsWith(SITE + "data/")) return new Response("", { status: 404 });
-  if (url in API) return new Response(JSON.stringify(API[url]), { headers: { "content-type": "application/json" } });
-  if (url.startsWith("https://api.biorxiv.org/") || url.startsWith("https://www.ebi.ac.uk/")) return new Response("{}", { status: 404 });
+  if (url in API) return new Response(typeof API[url] === "string" ? API[url] : JSON.stringify(API[url]), { headers: { "content-type": "application/json" } });
+  if (url.startsWith("https://api.biorxiv.org/") || url.startsWith("https://www.ebi.ac.uk/") || url.startsWith("https://api.crossref.org/")) return new Response("{}", { status: 404 });
   if (url === "https://news.example/slow") return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))));
   const p = pages[url];
   if (!p) return new Response("nope", { status: 404, headers: { "content-type": "text/html" } });
@@ -92,11 +96,19 @@ await test("non-pages, slow sites and huge pages fail cleanly", async () => {
   const huge = await (await ask("https://news.example/huge")).json();
   assert.ok(huge.text.length <= 2 * 1024 * 1024, "read past the cap");
 });
-await test("bioRxiv: the full text page is tried first", async () => {
+await test("a preprint's pages are never scraped: they are a bot wall or a slogan", async () => {
   fetched = [];
-  const d = await (await ask("https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1")).json();
-  assert.ok(fetched.includes("https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1.full"));
-  assert.ok(d.complete, "a paper with its sections is complete");
+  const r = await ask("https://www.biorxiv.org/content/10.1101/2026.01.02.123456v1");
+  const d = await r.json();
+  assert.ok(!fetched.some((u) => u.startsWith("https://www.biorxiv.org/")), "fetched: " + fetched.join(" "));
+  assert.ok(!d.text && !JSON.stringify(d).includes("nonprofit"), "never the site's slogan");
+  assert.match(d.error, /no abstract yet \(bioRxiv's API answered 404, and Crossref had none\)/);
+});
+await test("bioRxiv's API sending nothing: Crossref's abstract instead", async () => {
+  const d = await (await ask("https://www.biorxiv.org/content/10.1101/2026.10.04.700001v1")).json();
+  assert.ok(d.complete, JSON.stringify(d));
+  assert.deepEqual(d.text.split("\n\n"), ["Okafor, N. A.; Li, W.", "Cytokinin delays senescence & keeps chloroplasts working, here shown in detail.",
+                                          "CIA2 and CIL mediate it."]);
 });
 await test("a bioRxiv RSS link gets the API's abstract, latest version, authors and journal", async () => {
   fetched = [];

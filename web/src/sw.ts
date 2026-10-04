@@ -5,7 +5,7 @@
 // A plain script, not a module: classic service workers work in every browser.
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-const VERSION = "8.8";
+const VERSION = "8.9";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
 const CORE = ["./", "./index.html", "./app.js", "./core.js"];          // the app cannot run without these
@@ -39,6 +39,7 @@ sw.addEventListener("fetch", (e: FetchEvent) => {
   const req = e.request;
   const url = new URL(req.url);
   if (req.method !== "GET" || url.origin !== sw.location.origin) return;   // weather and NOAA: straight through
+  if (url.pathname.includes("/data/abs/")) return;   // abstracts: the app saves the ones read; caching every one would grow forever
   if (url.pathname.includes("/data/")) {
     // news: ask the network first (an unchanged file is a tiny "not modified");
     // offline, answer from the saved copy and say so in a header

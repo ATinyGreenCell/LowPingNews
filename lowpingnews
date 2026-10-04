@@ -537,7 +537,8 @@ cmd_reader_deploy() {
     -F "metadata={\"main_module\":\"reader.js\",\"compatibility_date\":\"2024-09-23\"};type=application/json" \
     -F "reader.js=@$f;type=application/javascript+module")" || die "could not reach Cloudflare"
   if [ "$(printf '%s' "$out" | cf_json success)" != "true" ]; then
-    die "Cloudflare refused the upload: $(printf '%s' "$out" | cf_json errors.0.message)"
+    why="$(printf '%s' "$out" | cf_json errors.0.message)"
+    die "Cloudflare refused the upload: ${why:-no details given (try again in a few minutes)}"
   fi
   # its workers.dev address: on (a new Worker can start with it off), then found
   cf_call -X POST "$CF_API/accounts/$acct/workers/scripts/$READER_NAME/subdomain" \

@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "8.8"
+VERSION = "8.9"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -171,13 +171,28 @@ DEFAULTS = [
 
 TAGS = re.compile(r"<[^>]+>")
 WS = re.compile(r"\s+")
-CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# C0 and C1 controls (some terminals read \x9b as the start of an escape
+# sequence) and the invisible direction overrides that can make text display
+# reversed or disguised
+CTRL = re.compile(u"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 def safe_url(u):
     """Item links end up in a browser. Same rule as feed URLs: http(s) only."""
     u = (u or "").strip()
     return u if u[:7].lower() == "http://" or u[:8].lower() == "https://" else ""
+
+
+def preview(s, limit=400):
+    """A shortened text ends at a word, with an ellipsis, so it reads as a
+    preview and never as an article cut off mid-word."""
+    if len(s) <= limit:
+        return s
+    cut = s[:limit - 1]
+    sp = cut.rfind(" ")
+    if sp > limit * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:-\u2013\u2014") + "\u2026"
 
 
 def clean(s, limit=400):
@@ -865,13 +880,19 @@ def parse_feed(raw):
         ti = clean(txt("title"), 200)
         if not ti:
             continue
-        short = clean(txt("description", "summary", "content"))
+        whole = clean(txt("description", "summary", "content"), 6000)
+        short = preview(whole)
         full = clean(txt("encoded", "content", "description"), 6000)
+        if len(whole) > len(full):
+            full = whole
         rec = {"ti": ti, "u": safe_url(link), "s": short,
                "d": when(txt("pubDate", "published", "date", "updated",
                              "publicationDate", "issued", "created", "modified"))}
-        if len(full) > len(short) + 200:      # feed shipped the body: already paid for
+        if len(full) > len(short):            # the feed shipped more than the preview: already paid for
             rec["c"] = full
+        by = clean(txt("creator", "author"), 600)
+        if by:
+            rec["a"] = by
         out.append(rec)
     return out
 
@@ -4477,7 +4498,7 @@ def tui_main(scr, a, cats, meter=None):
         scr.erase()
         h, w = scr.getmaxyx()
         rows = S["rows"]
-        hdr = " LowPingNews %s  %s  %d item%s%s " % (
+        hdr = " LowPingNews v%s  %s  %d item%s%s " % (
             VERSION, cats[ci[0]].upper(), len(rows), "" if len(rows) == 1 else "s",
             (" of %d" % len(S["all"])) if len(S["all"]) > len(rows) else "")
         fresh_txt, fresh_col, _st = tui_freshness(S["meta"]) if S["meta"] else ("", 2, False)

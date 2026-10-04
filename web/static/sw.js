@@ -1,6 +1,6 @@
 "use strict";
 const sw = self;
-const VERSION = "8.8";
+const VERSION = "8.9";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
 const CORE = ["./", "./index.html", "./app.js", "./core.js"];
@@ -28,6 +28,8 @@ sw.addEventListener("fetch", (e) => {
     const req = e.request;
     const url = new URL(req.url);
     if (req.method !== "GET" || url.origin !== sw.location.origin)
+        return;
+    if (url.pathname.includes("/data/abs/"))
         return;
     if (url.pathname.includes("/data/")) {
         e.respondWith(fetch(req).then((r) => {

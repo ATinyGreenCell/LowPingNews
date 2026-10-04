@@ -85,7 +85,7 @@ async function loadNews(cat: string, manual = false): Promise<void> {
   status();
   if (w.fresh) toast(w.fresh + " new at the top");
   else if (manual) toast(offline ? "offline: showing the saved copy" : "nothing new");
-  if (newerVersion(d.app, APP_VERSION)) showUpdate();
+  if (newerVersion(d.app, APP_VERSION)) showUpdate(d.app);
   else if (d.app === APP_VERSION) { mem("lpn-updating", null); mem("lpn-hard", null); }
 }
 
@@ -103,8 +103,9 @@ function mem(k: string, v?: string | null): string | null {
   return null;
 }
 let updating = false;
-function showUpdate(): void {
+function showUpdate(v: string): void {
   const b = $("update");
+  if (!updating) b.textContent = "Version " + v + " is ready (you have " + APP_VERSION + "). Tap to update.";
   b.hidden = false;
   const tried = Number(mem("lpn-updating") || 0);
   if (tried && Date.now() - tried < 120000) void hardUpdate(b);    // just tried, still old
@@ -228,7 +229,9 @@ async function renderReader(it: Item, force = false): Promise<void> {
   };
   // a complete saved copy is reused; a partial one (a paywall, a tagline, an
   // older reader's best effort) is fetched again, and kept only for offline
-  const saved = savedArticle(it.key);
+  // a preprint's partial copy can only be a bot wall's leftovers or a site slogan: never shown
+  const saved0 = savedArticle(it.key);
+  const saved = saved0 && (saved0.a.complete || !preprintId(it.link)) ? saved0 : null;
   if (!force && saved && saved.a.text && saved.a.complete) { show(saved.a, "", now() - saved.t); return; }
   const reader = S.digest ? S.digest.reader : "";
   if (!it.link) { show(null, "This feed gives no link to the full article.", -1); return; }
@@ -238,7 +241,7 @@ async function renderReader(it: Item, force = false): Promise<void> {
   if (pre) {
     try {
       const r = await fetch(abstractFile(pre));
-      const a = r.ok ? parseAbstractDoc(await r.json()) : null;
+      const a = r.ok ? parseAbstractDoc(await r.json(), pre) : null;
       if (a && a.text) { saveArticle(it.key, a); show(a, "", -1); return; }
     } catch { /* offline, or not published yet: the reader may still manage */ }
   }
@@ -474,6 +477,7 @@ function start(): void {
     else void loadNews(S.view, true);
   };
   $("update").onclick = () => void updateNow($("update"));
+  $("ver").textContent = "v" + APP_VERSION;
   renderTabs();
   go(S.view === "weather" ? "weather" : S.view);
   // return to the app: check again only if it has been a while

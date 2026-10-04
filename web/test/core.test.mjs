@@ -125,5 +125,41 @@ test("the update banner shows only for a genuinely newer version", () => {
   for (const [a, b] of [["8.7", "8.7"], ["8.6", "8.7"], ["8.7", "8.7.0"], [undefined, "8.7"], ["8.7<x>", "8.7"], ["", "8.7"]])
     assert.equal(C.newerVersion(a, b), false, a + " vs " + b);
 });
+test("an abstract file for some other paper is not shown", () => {
+  const doc = { server: "biorxiv", doi: "10.1101/2026.10.02.679012", abstract: "Right paper." };
+  assert.equal(C.parseAbstractDoc(doc, { server: "biorxiv", id: "2026.10.02.679012" }).text.endsWith("Right paper."), true);
+  assert.equal(C.parseAbstractDoc(doc, { server: "biorxiv", id: "2026.10.02.000001" }).text, "");
+  assert.equal(C.parseAbstractDoc(doc, { server: "medrxiv", id: "2026.10.02.679012" }).text, "");
+  assert.equal(C.parseAbstractDoc([doc]).text, "");
+});
+test("fuzz: hostile or broken data never throws and never reaches the page raw", () => {
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const atoms = [null, undefined, true, 0, -1, 1e308, NaN, "", "x".repeat(70000), "\u0000\u001b[2J\u202e<script>alert(1)</script>",
+                 "javascript:alert(1)", "https://ok.example/a", "8.9", "10.1101/2026.10.02.679012", "biorxiv", [], {}];
+  const junk = (d) => {
+    const r = rnd();
+    if (d > 3 || r < 0.4) return atoms[Math.floor(rnd() * atoms.length)];
+    if (r < 0.7) return Array.from({ length: Math.floor(rnd() * 6) }, () => junk(d + 1));
+    const o = {};
+    for (const k of ["v", "t", "app", "cat", "cats", "src", "items", "failed", "reader", "text", "complete", "note", "error",
+                     "abstract", "authors", "date", "version", "category", "published", "server", "doi", "features"])
+      if (rnd() < 0.5) o[k] = junk(d + 1);
+    return o;
+  };
+  const bad = /[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e\u2066-\u2069]/;
+  const scan = (v, path) => {
+    if (typeof v === "string") assert.ok(!bad.test(v), "control/direction character survived at " + path);
+    else if (v && typeof v === "object") for (const k of Object.keys(v)) scan(v[k], path + "." + k);
+  };
+  for (let n = 0; n < 3000; n++) {
+    const x = junk(0);
+    const d = C.parseDigest(x, 1791100000);
+    if (d) { scan(d, "digest"); for (const it of d.items) assert.ok(!it.link || /^https?:\/\//.test(it.link), "unsafe link: " + it.link); }
+    scan(C.parseArticle(x), "article");
+    scan(C.parseAbstractDoc(x), "abstract");
+    C.newerVersion(x, "8.9"); C.preprintId(typeof x === "string" ? x : ""); C.liveAlerts(x, 1791100000);
+  }
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

@@ -9,7 +9,7 @@
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
 
-const VERSION = "8.8";
+const VERSION = "8.9";
 const SITE = "https://atinygreencell.github.io/LowPingNews/";   // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024;     // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -124,7 +124,12 @@ function getJSON(url: string, timeoutMs: number): Promise<unknown> {
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   return fetch(url, { signal: ac.signal, headers: { Accept: "application/json",
     "User-Agent": "LowPingNewsReader/" + VERSION + " (+github.com/ATinyGreenCell/LowPingNews)" } })
-    .then((r) => { if (r.ok) return r.json(); apiWhy = "answered " + r.status; return null; })
+    .then(async (r) => {
+      if (!r.ok) { apiWhy = "answered " + r.status; return null; }
+      const t = await r.text();
+      if (!t.trim()) { apiWhy = "sent nothing"; return null; }        // bioRxiv's details endpoint, lately
+      try { return JSON.parse(t); } catch { apiWhy = "sent something unreadable"; return null; }
+    })
     .catch((e) => { apiWhy = (e as Error).name === "AbortError" ? "took too long" : "could not be reached"; return null; })
     .finally(() => clearTimeout(timer));
 }
@@ -152,6 +157,26 @@ export async function preprintAbstract(u: string, timeoutMs: number): Promise<Ou
   if (pub && pub !== "NA") paras.push("Since published: https://doi.org/" + pub);
   const host = id.server === "medrxiv" ? "medRxiv" : "bioRxiv";
   return { v: 1, url: u, text: paras.join("\n\n"), complete: true,
+           note: "This is the abstract. The full paper is on " + host + ": open the original page." };
+}
+
+/** Crossref registers bioRxiv's DOIs and holds the abstract bioRxiv deposits. */
+export async function crossrefAbstract(u: string, timeoutMs: number): Promise<Out | null> {
+  const id = preprintDoi(u);
+  if (!id) return null;
+  const d = await getJSON("https://api.crossref.org/works/" + id.doi, timeoutMs).catch(() => null) as
+    { message?: Record<string, unknown> } | null;
+  const m = d && d.message && typeof d.message === "object" ? d.message : null;
+  const jats = m && typeof m.abstract === "string" ? m.abstract : "";
+  const paras = decodeEntities(jats.replace(/<jats:title>[\s\S]*?<\/jats:title>/gi, "")
+    .replace(/<\/(jats:)?p>/gi, "\n\n").replace(/<[^>]+>/g, " ")).split(/\n\s*\n/).map(tidy).filter(Boolean);
+  if (paras.join(" ").length < 80) return null;
+  const names = (Array.isArray(m!.author) ? m!.author as Record<string, unknown>[] : [])
+    .filter((a) => a && typeof a.family === "string")
+    .map((a) => tidy(a.family as string) + (typeof a.given === "string" && a.given.trim()
+      ? ", " + (a.given as string).trim().split(/\s+/).map((w) => w[0] + ".").join(" ") : ""));
+  const host = id.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+  return { v: 1, url: u, text: [authorsShort(names.join("; ")), ...paras].filter(Boolean).join("\n\n"), complete: true,
            note: "This is the abstract. The full paper is on " + host + ": open the original page." };
 }
 
@@ -237,10 +262,19 @@ async function listed(site: string, cat: string, url: string): Promise<boolean> 
 export async function read(url: string, timeoutMs: number = TIMEOUT_MS): Promise<Out> {
   // a paper's own API first: clean, reliable, and never an anti-bot wall
   apiWhy = "";
-  const api = (await preprintAbstract(url, timeoutMs).catch(() => null)) || (await epmcAbstract(url, timeoutMs).catch(() => null));
-  if (api) return api;
   const pre = preprintDoi(url);
-  const apiNote = pre ? (pre.server === "medrxiv" ? "medRxiv" : "bioRxiv") + "'s API " + (apiWhy || "had no abstract") : "";
+  if (pre) {
+    // a preprint server's pages are an anti-bot wall or a site-wide slogan:
+    // never scraped. Its own API, then Crossref, or an honest reason.
+    const a = (await preprintAbstract(url, timeoutMs).catch(() => null)) || (await crossrefAbstract(url, timeoutMs).catch(() => null));
+    if (a) return a;
+    const host = pre.server === "medrxiv" ? "medRxiv" : "bioRxiv";
+    return { v: 1, url, text: "", complete: false,
+             error: "no abstract yet (" + host + "'s API " + (apiWhy || "had none") + ", and Crossref had none)" };
+  }
+  const api = await epmcAbstract(url, timeoutMs).catch(() => null);
+  if (api) return api;
+  const apiNote = "";
   let best: Out = { v: 1, url, text: "", complete: false };
   for (const u of fullTextUrls(url)) {
     let page;

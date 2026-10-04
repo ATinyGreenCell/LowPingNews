@@ -1,4 +1,4 @@
-export const APP_VERSION = "8.8";
+export const APP_VERSION = "8.9";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -97,11 +97,13 @@ const authorsShort = (a) => {
     const names = a.split(/;\s*/).map((x) => x.trim()).filter(Boolean);
     return names.length > 3 ? names.slice(0, 3).join("; ") + " and " + (names.length - 3) + " more" : names.join("; ");
 };
-export function parseAbstractDoc(raw) {
+export function parseAbstractDoc(raw, want) {
     const none = { text: "", complete: false, note: "", error: "no abstract" };
-    if (!raw || typeof raw !== "object")
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
         return none;
     const d = raw;
+    if (want && (d.doi !== "10.1101/" + want.id || d.server !== want.server))
+        return none;
     const str = (k) => cleanText(d[k], 600);
     const abs = cleanParas(d.abstract, 8000);
     if (!abs)

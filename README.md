@@ -97,6 +97,16 @@ the abstract (labelled as such); bioRxiv's pages sit behind an anti-bot check
 that would otherwise return only the site's tagline. `lpn release` keeps the
 deployed reader up to date.
 
+**Preprint abstracts.** bioRxiv and medRxiv feeds already carry each paper's
+full abstract, so the site build publishes it beside the app as a ~1 KB file
+(`data/abs/`) - opening a preprint costs one small request and never touches
+bioRxiv's web pages, which block automated reading. If a feed's text is too
+short to be the whole abstract, the build asks Crossref (where bioRxiv deposits
+its abstracts), then bioRxiv's own API, once per paper. Story previews in the
+lists are shortened to keep each news file at 3-4 KB; they end with "..." so a
+preview never looks like a cut-off article.
+
+
 The app is TypeScript in `web/src`, compiled to plain JavaScript in `web/static`
 (no frameworks, no dependencies); `web/build_digest.py` builds the news files.
 Scheduled builds stop if the repository sees no activity for 60 days; the app
