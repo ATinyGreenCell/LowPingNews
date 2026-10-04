@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "9.2";
+export const APP_VERSION = "9.3";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -324,10 +324,14 @@ export function tideLevel(hilo: Tide[], t: number): { level: number; rising: boo
 }
 const num = (x: unknown): number | null => (typeof x === "number" && isFinite(x) ? x : null);
 export interface Station { id: string; name: string; km: number }
+export interface CurrentStation { id: string; name: string; km: number; bin: number }
 export interface Buoy { id: string; name: string; km: number; t: number; water: number | null; waves: number | null;
                         period: number | null; dir: number | null; wind: number | null; air: number | null }
-/** The site's tile, sorted by distance from you: hostile or broken rows dropped. */
-export function parseTile(raw: unknown, lat: number, lon: number, now: number): { stations: Station[]; buoys: Buoy[]; reader: string } {
+/** The site's tile, sorted by distance from you: hostile or broken rows dropped.
+ *  nb is the buoy readings in the whole build (-1 if the tile does not say):
+ *  0 there means NDBC did not answer, not that no buoy is near. */
+export function parseTile(raw: unknown, lat: number, lon: number, now: number):
+    { stations: Station[]; buoys: Buoy[]; currents: CurrentStation[]; nb: number; reader: string } {
   const d = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
   const rows = (k: string): unknown[][] => (Array.isArray(d[k]) ? (d[k] as unknown[]).filter(Array.isArray) as unknown[][] : []);
   const stations: Station[] = [];
@@ -343,10 +347,63 @@ export function parseTile(raw: unknown, lat: number, lon: number, now: number): 
     buoys.push({ id: cleanText(r[0], 10), name: cleanText(r[1], 50), km: kmBetween(lat, lon, a, o), t,
                  water: num(r[5]), waves: num(r[6]), period: num(r[7]), dir: num(r[8]), wind: num(r[9]), air: num(r[11]) });
   }
+  const currents: CurrentStation[] = [];
+  for (const r of rows("c")) {
+    const a = num(r[2]), o = num(r[3]), b = num(r[4]);
+    if (a === null || o === null || b === null || !Number.isInteger(b) || b < 0 || b > 99 ||
+        typeof r[0] !== "string" || !/^[0-9A-Za-z]{4,12}$/.test(r[0])) continue;
+    currents.push({ id: r[0], name: cleanText(r[1], 60), km: kmBetween(lat, lon, a, o), bin: b });
+  }
   stations.sort((x, y) => x.km - y.km);
   buoys.sort((x, y) => x.km - y.km);
-  const reader = safeUrl(d.reader);
-  return { stations, buoys, reader: reader.startsWith("https://") ? reader : "" };
+  currents.sort((x, y) => x.km - y.km);
+  const reader = safeUrl(d.reader), nb = num(d.nb);
+  return { stations, buoys, currents, nb: nb !== null && nb >= 0 ? nb : -1, reader: reader.startsWith("https://") ? reader : "" };
+}
+export function compass(deg: number): string {
+  return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.floor(((deg % 360) + 360 + 22.5) / 45) % 8];
+}
+/** A tidal-current event: [epoch, knots (flood +, ebb -), max Flood | max Ebb | Slack]. */
+export type Flow = [number, number, "F" | "E" | "S"];
+export interface Flows { ev: Flow[]; flood: number | null; ebb: number | null; error: string }
+/** NOAA's max flood, max ebb and slack times, asked for in GMT, in order, with
+ *  the directions flood and ebb run toward (degrees true). */
+export function parseCurrents(raw: unknown): Flows {
+  const d = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  if (d.error && typeof d.error === "object")
+    return { ev: [], flood: null, ebb: null, error: cleanText((d.error as Record<string, unknown>).message, 160) || "no predictions" };
+  const box = d.current_predictions && typeof d.current_predictions === "object" ? d.current_predictions as Record<string, unknown> : {};
+  const deg = (x: unknown): number | null => (typeof x === "number" && isFinite(x) && x >= 0 && x <= 360 ? x : null);
+  const ev: Flow[] = [];
+  let flood: number | null = null, ebb: number | null = null;
+  for (const x of Array.isArray(box.cp) ? box.cp as Record<string, unknown>[] : []) {
+    if (!x || typeof x !== "object") continue;
+    const m = typeof x.Time === "string" ? /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)$/.exec(x.Time) : null;
+    const v = typeof x.Velocity_Major === "number" ? x.Velocity_Major : parseFloat(String(x.Velocity_Major));
+    if (!m || !isFinite(v) || Math.abs(v) >= 15) continue;
+    const ty = String(x.Type).toLowerCase();
+    const k: Flow[2] = ty === "slack" ? "S" : ty === "flood" ? "F" : ty === "ebb" ? "E" : Math.abs(v) < 0.05 ? "S" : v > 0 ? "F" : "E";
+    ev.push([Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) / 1000, v, k]);
+    if (flood === null) flood = deg(x.meanFloodDir);
+    if (ebb === null) ebb = deg(x.meanEbbDir);
+  }
+  ev.sort((a, b) => a[0] - b[0]);
+  return { ev, flood, ebb, error: ev.length ? "" : "no predictions" };
+}
+/** The current at t between NOAA's events (knots, flood +): a quarter sine from
+ *  slack to the peak and back - tidal streams are close to sinusoidal - and a
+ *  smooth ease from peak to peak where the stream never stops. null outside. */
+export function flowAt(ev: Flow[], t: number): number | null {
+  for (let i = 0; i + 1 < ev.length; i++) {
+    const [t0, v0, k0] = ev[i], [t1, v1, k1] = ev[i + 1];
+    if (t0 <= t && t <= t1 && t1 > t0) {
+      const f = (t - t0) / (t1 - t0);
+      if (k0 === "S" && k1 !== "S") return v0 + (v1 - v0) * Math.sin(f * Math.PI / 2);
+      if (k0 !== "S" && k1 === "S") return v1 + (v0 - v1) * Math.cos(f * Math.PI / 2);
+      return v0 + (v1 - v0) * (1 - Math.cos(Math.PI * f)) / 2;
+    }
+  }
+  return null;
 }
 /** NOAA's high/low predictions, asked for in GMT: [epoch, feet, H|L], in order. */
 export function parsePredictions(raw: unknown): { hilo: Tide[]; error: string } {

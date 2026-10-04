@@ -41,6 +41,9 @@ const API = {
     author: [{ given: "Ngozi Ada", family: "Okafor" }, { given: "Wei", family: "Li" }, { name: "A consortium" }] } },
   "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&application=LowPingNews&begin_date=20261003&range=96&datum=MLLW&station=8516945&time_zone=gmt&interval=hilo&units=english&format=json":
     { predictions: [{ t: "2026-10-04 19:42", v: "7.3", type: "H", extra: "<script>" }] },
+  "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=currents_predictions&application=LowPingNews&begin_date=20261003&range=96&station=ACT3496&bin=1&time_zone=gmt&interval=MAX_SLACK&units=english&format=json":
+    { current_predictions: { units: "knots", cp: [{ Type: "flood", meanFloodDir: 179, Bin: "1", meanEbbDir: 7, Time: "2026-10-04 14:38", Depth: null,
+                                                    Velocity_Major: 0.42, extra: "<script>" }] } },
   "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A12345678%20AND%20SRC%3AMED&resultType=core&format=json&pageSize=1":
     { resultList: { result: [{ abstractText: "<h4>Background</h4>Plants make pigments.<h4>Results</h4>We found &amp; characterised an enzyme.",
       authorString: "Smith J, Jones A", journalTitle: "Plant Cell", pubYear: "2026" }] } },
@@ -174,6 +177,23 @@ await test("tides: one fixed NOAA query, only a station and a date pass through"
   assert.equal((await tideAsk("tide=8516945&d=20261003", "https://evil.example")).status, 403);
   const miss = await tideAsk("tide=9999999&d=20261003");
   assert.equal(miss.status, 502);
+});
+await test("currents: one fixed NOAA query, only a station, its bin and a date pass through", async () => {
+  const curAsk = (qs, origin = ORIGIN) => W.fetch(new Request("https://reader.example/?" + qs, { headers: origin ? { Origin: origin } : {} }), {});
+  fetched = [];
+  const r = await curAsk("cur=ACT3496&bin=1&d=20261003");
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { current_predictions: { cp: [{ Type: "flood", Time: "2026-10-04 14:38", Velocity_Major: 0.42,
+                                                                     meanFloodDir: 179, meanEbbDir: 7 }] } }, "only five fields pass");
+  for (const bad of ["cur=ACT3496%26product%3Dwater_level&bin=1&d=20261003", "cur=../x&bin=1&d=20261003", "cur=ACT3496&bin=1;x&d=20261003",
+                     "cur=ACT3496&bin=1&d=today", "cur=ACT3496&d=20261003"]) {
+    fetched = [];
+    const b = await curAsk(bad);
+    assert.equal(b.status, 400, bad);
+    assert.ok(!fetched.some((u) => u.includes("tidesandcurrents")), "nothing reached NOAA for " + bad);
+  }
+  assert.equal((await curAsk("cur=ACT3496&bin=1&d=20261003", "https://evil.example")).status, 403);
+  assert.equal((await curAsk("cur=ACT0000&bin=1&d=20261003")).status, 502);
 });
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");

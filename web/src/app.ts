@@ -1,7 +1,7 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
-import type { Tide } from "./core.js";
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions } from "./core.js";
+import type { Tide, CurrentStation, Flows } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -362,6 +362,29 @@ async function predictions(sid: string, force: boolean, reader: string): Promise
   else if (c && c.key === key && c.h && c.h.length) return { hilo: c.h, error: "" };   // offline: the last copy
   return p;
 }
+/** The nearest station NOAA predicts currents for (some list none), with its
+ *  max flood, max ebb and slack times: ~1 KB, kept 12 h like the tides. */
+async function currentsNear(cands: CurrentStation[], force: boolean, reader: string): Promise<{ st: CurrentStation; f: Flows }> {
+  const day = new Date((now() - 86400) * 1000).toISOString().slice(0, 10).replace(/-/g, "");
+  const key = (s: CurrentStation): string => s.id + "_" + s.bin + "_" + day;
+  const c = store<{ key: string; t: number; f: Flows } | null>("curpred", null);
+  const kept = c && c.f && Array.isArray(c.f.ev) && c.f.ev.length ? cands.find((s) => c.key === key(s)) : undefined;
+  if (!force && kept && now() - c!.t < 12 * 3600) return { st: kept, f: c!.f };
+  let last: Flows = { ev: [], flood: null, ebb: null, error: "no predictions" };
+  for (const s of cands) {
+    const q = "?product=currents_predictions&application=LowPingNews&begin_date=" + day + "&range=96&station=" + s.id +
+              "&bin=" + s.bin + "&time_zone=gmt&interval=MAX_SLACK&units=english&format=json";
+    let raw: unknown = null;
+    try { raw = (await getJSON(COOPS + q)).body; } catch { /* the browser may refuse NOAA (CORS): the reader asks for us */ }
+    if (!raw && reader) { try { raw = (await getJSON(reader + "?cur=" + s.id + "&bin=" + s.bin + "&d=" + day)).body; } catch { /* offline */ } }
+    const f = parseCurrents(raw);
+    if (f.ev.length) { keep("curpred", { key: key(s), t: now(), f }); return { st: s, f }; }
+    if (!raw) break;                       // nobody answered: offline, the next station would fail the same way
+    last = f;
+  }
+  if (kept) return { st: kept, f: c!.f };  // offline: the last copy
+  return { st: cands[0], f: last };
+}
 function dayWord(t: number): string {
   const d = new Date(t * 1000), n = new Date();
   const same = (a: Date, b: Date): boolean => a.toDateString() === b.toDateString();
@@ -422,8 +445,10 @@ async function showTides(force = false): Promise<void> {
   if (S.view !== "tides") return;
   box.replaceChildren();
   if (tile === null) box.append(el("p", "note warn", "Could not get the station list. Offline?"));
-  const { stations, buoys, reader } = parseTile(tile || {}, sp.lat, sp.lon, t);
+  const { stations, buoys, currents, nb, reader } = parseTile(tile || {}, sp.lat, sp.lon, t);
   const mi = (k: number): string => (k >= 1.6 ? Math.round(k / 1.609) + " mi" : "under a mile");
+  const cands = currents.filter((c) => c.km <= 40).slice(0, 3);
+  const flows = cands.length ? currentsNear(cands, force, reader) : null;     // asked alongside the tides
   const st = stations[0];
   if (!st || st.km > 60) {
     if (tile !== null) box.append(el("p", "note warn", "No NOAA tide station within 60 km. Predictions cover US coasts and territories."));
@@ -453,6 +478,32 @@ async function showTides(force = false): Promise<void> {
       }
     }
   }
+  if (flows) {
+    const { st: cs, f } = await flows;
+    if (S.view !== "tides") return;
+    box.append(el("h3", "", "Currents"), el("p", "note", "Station " + cs.name + ", " + mi(cs.km) + " away (NOAA " + cs.id + ")"));
+    if (!f.ev.length) box.append(el("p", "note warn", "NOAA gave no current predictions: " + f.error));
+    else {
+      const v = flowAt(f.ev, t);
+      const next = f.ev.filter((e) => e[0] > t);
+      const label = { F: "Max flood", E: "Max ebb", S: "Slack" };
+      if (v !== null && next.length) {
+        const ns = next.find((e) => e[2] === "S"), nm = next.find((e) => e[2] !== "S");
+        const to = v > 0 ? f.flood : f.ebb;
+        const state = Math.abs(v) < 0.1 ? "About slack"
+          : (v > 0 ? "Flooding " : "Ebbing ") + Math.abs(v).toFixed(1) + " kn" + (to !== null ? " toward " + compass(to) : "");
+        const then = Math.abs(v) >= 0.1 && ns ? "slack in " + wait(ns[0] - t) : nm ? label[nm[2]].toLowerCase() + " in " + wait(nm[0] - t) : "";
+        box.append(el("p", "now", "Now " + state.charAt(0).toLowerCase() + state.slice(1) + (then ? " \u00b7 " + then : "")));
+      }
+      const list = el("div", "tidelist");
+      for (const [tt, kv, k] of next.slice(0, 4))
+        list.append(el("div", k === "S" ? "trow cur" : "trow cur hi",
+          el("span", "k", label[k]), el("span", "c", clock(tt)), el("span", "v", k === "S" ? "" : Math.abs(kv).toFixed(1) + " kn"),
+          el("span", "w", tt - t < 12 * 3600 ? "in " + wait(tt - t) : dayWord(tt))));
+      box.append(list);
+      if (f.flood !== null && f.ebb !== null) box.append(el("p", "note", "Flood runs " + compass(f.flood) + ", ebb runs " + compass(f.ebb) + "."));
+    }
+  }
   const mo = moon(t);
   const md = (x: number): string => new Date(x * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   const ev = [[mo.next, "new"], [mo.full, "full"]].sort((a, b) => (a[0] as number) - (b[0] as number));
@@ -473,6 +524,9 @@ async function showTides(force = false): Promise<void> {
       box.append(el("p", "", b.id + " " + (b.name || "buoy") + ", " + mi(b.km) + ": " + (bits.join(", ") || "no readings") +
                     " \u00b7 " + ago(t - b.t) + " ago"));
     }
+  } else if (nb >= 0) {                     // a real tile: say why the list is empty
+    box.append(el("h3", "", "Buoys"), el("p", "note", nb === 0 ? "No buoy readings on the site right now: NDBC did not answer its last build."
+                                                              : "No buoy within 62 mi has reported in the last 3 hours."));
   }
   box.append(el("p", "note", "Predictions, not observations: wind and pressure can shift the water by a foot or more."));
 }

@@ -197,5 +197,34 @@ test("tides: the moon, the water level, and hostile tiles", () => {
   assert.deepEqual(p.hilo, [[Date.UTC(2026, 9, 4, 13, 30) / 1000, -0.2, "L"], [Date.UTC(2026, 9, 4, 19, 42) / 1000, 7.3, "H"]]);
   assert.match(C.parsePredictions({ error: { message: "No Predictions data was found." } }).error, /No Predictions/);
 });
+test("currents: NOAA's events, the stream between them, and hostile rows", () => {
+  const now = 1791140000;
+  const t = C.parseTile({ nb: 41, c: [["ACT3496", "Huntington Bay, off East Fort Point", 40.9267, -73.4175, 1], ["../evil", "x", 40.9, -73.41, 1],
+                                      ["ACT9999", "far", 41.3, -72.9, 2], ["AC1", "short id", 40.9, -73.41, 1], ["ACT2000", "bad bin", 40.9, -73.41, 1.5],
+                                      ["ACT2001", "\u001b[2Jnear", 40.901, -73.413, 3], "junk", [null]] }, 40.9, -73.412, now);
+  assert.deepEqual(t.currents.map((c) => c.id), ["ACT2001", "ACT3496", "ACT9999"], "nearest first; a malformed ID or bin never reaches NOAA");
+  assert.equal(t.currents[0].bin, 3);
+  assert.ok(!/\u001b/.test(t.currents[0].name));
+  assert.equal(t.nb, 41);
+  assert.equal(C.parseTile({}, 0, 0, now).nb, -1, "a missing tile says nothing about NDBC");
+  const T = (h, m) => Date.UTC(2026, 9, 4, h, m) / 1000;
+  const f = C.parseCurrents({ current_predictions: { units: "knots", cp: [
+    { Type: "slack", meanFloodDir: 179, Bin: "1", meanEbbDir: 7, Time: "2026-10-04 17:36", Depth: null, Velocity_Major: 0 },
+    { Type: "flood", meanFloodDir: 179, Bin: "1", meanEbbDir: 7, Time: "2026-10-04 14:38", Depth: null, Velocity_Major: 0.42 },
+    { Type: "ebb", meanFloodDir: 179, Bin: "1", meanEbbDir: 7, Time: "2026-10-04 20:05", Depth: null, Velocity_Major: -0.4 },
+    { Type: "flood", Time: "nonsense", Velocity_Major: 1 }, { Type: "ebb", Time: "2026-10-04 23:00", Velocity_Major: "x" },
+    { Type: "flood", Time: "2026-10-05 01:00", Velocity_Major: 99 }, null] } });
+  assert.deepEqual(f.ev, [[T(14, 38), 0.42, "F"], [T(17, 36), 0, "S"], [T(20, 5), -0.4, "E"]]);
+  assert.deepEqual([f.flood, f.ebb, C.compass(179), C.compass(7), C.compass(350), C.compass(-45), C.compass(225)], [179, 7, "S", "N", "N", "NW", "SW"]);
+  // from a peak the stream eases off as a quarter cosine; from slack it builds as a quarter sine
+  assert.ok(Math.abs(C.flowAt(f.ev, (T(14, 38) + T(17, 36)) / 2) - 0.42 * Math.SQRT1_2) < 1e-9);
+  assert.ok(Math.abs(C.flowAt(f.ev, (T(17, 36) + T(20, 5)) / 2) + 0.4 * Math.SQRT1_2) < 1e-9);
+  assert.ok(Math.abs(C.flowAt(f.ev, T(17, 36))) < 1e-9, "slack is slack");
+  assert.equal(C.flowAt(f.ev, T(12, 0)), null, "outside the predictions: unknown, not guessed");
+  assert.ok(Math.abs(C.flowAt([[0, 1, "F"], [100, 0.2, "F"]], 50) - 0.6) < 1e-9, "a stream that never stops eases peak to peak");
+  assert.match(C.parseCurrents({ error: { message: "Currents predictions are not available from the requested station" } }).error, /not available/);
+  assert.equal(C.parseCurrents("<html>").ev.length, 0);
+  assert.equal(C.parseCurrents({ current_predictions: { cp: "x" } }).error, "no predictions");
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

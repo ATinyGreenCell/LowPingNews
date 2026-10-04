@@ -230,13 +230,16 @@ def write_abstracts(m, out_dir, items, now):
 
 
 # ---- tides: one small tile per 1-degree square ---------------------------
-# NOAA's station list is megabytes and NDBC's buoys cannot be read from a web
-# page (no CORS), so this build gathers both and writes data/tides/<lat>_<lon>.json:
+# NOAA's station lists are megabytes and NDBC's buoys cannot be read from a web
+# page (no CORS), so this build gathers them and writes data/tides/<lat>_<lon>.json:
 # every tide station and buoy within about 100 km of that square, with each
-# buoy's latest reading. A phone fetches only its own tile (~1-3 KB).
+# buoy's latest reading, and the tidal-current stations within CURR_KM of it.
+# A phone fetches only its own tile (a few KB).
 TIDE_META = os.environ.get("LPN_TIDE_META") or "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions"
+CURR_META = os.environ.get("LPN_CURR_META") or "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=currentpredictions&units=english"
 NDBC = os.environ.get("LPN_NDBC") or "https://www.ndbc.noaa.gov"
 WEEK = 7 * 86400
+CURR_KM = 40        # a current is local, and harbours are dense with stations: keep tiles small
 
 
 def _get_text(url, timeout=30, cap=8 * 1024 * 1024):
@@ -282,6 +285,27 @@ def tide_stations():
     return out
 
 
+def current_stations():
+    """NOAA's tidal-current prediction stations: [id, name, lat, lon, bin].
+    The list repeats a station once per depth bin, shallowest first: keep the
+    shallowest, the water a boat or a swimmer is in. NOAA answers "not
+    available" for a station asked without one of its listed bins."""
+    d = json.loads(_get_text(CURR_META))
+    best = {}
+    for x in (d.get("stations") if isinstance(d, dict) else None) or []:
+        try:
+            sid, lat, lon = str(x["id"]), float(x["lat"]), float(x.get("lng", x.get("lon")))
+            b = x.get("currbin")
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if (not re.match(r"^[0-9A-Za-z]{4,12}$", sid) or isinstance(b, bool) or not isinstance(b, int)
+                or not 0 <= b <= 99 or not (-90 <= lat <= 90 and -180 <= lon <= 180)):
+            continue
+        if sid not in best or b < best[sid][4]:
+            best[sid] = [sid, clean(x.get("name"), 50), round(lat, 4), round(lon, 4), b]
+    return list(best.values())
+
+
 def buoy_names():
     import xml.etree.ElementTree as ET
     root = ET.fromstring(_get_text(NDBC + "/activestations.xml"))
@@ -321,6 +345,7 @@ def buoy_obs(now):
 def write_tides(m, out_dir, now):
     import math
     st = _weekly(m, "tide-stations.json", tide_stations, now)
+    cur = _weekly(m, "current-stations.json", current_stations, now)
     names = _weekly(m, "buoy-names.json", buoy_names, now)
     try:
         obs = buoy_obs(now)
@@ -336,14 +361,25 @@ def write_tides(m, out_dir, now):
             for dla in (-1, 0, 1):
                 for dlo in (-1, 0, 1):
                     k = "%d_%d" % (la + dla, (lo + dlo + 180) % 360 - 180)
-                    tiles.setdefault(k, {"s": [], "b": []})[kind].append(r)
+                    tiles.setdefault(k, {"s": [], "b": [], "c": []})[kind].append(r)
+    for r in cur:                       # only the squares it is within CURR_KM of, not all nine
+        la, lo = int(math.floor(r[2])), int(math.floor(r[3]))
+        for dla in (-1, 0, 1):
+            for dlo in (-1, 0, 1):
+                a0, o0 = la + dla, lo + dlo
+                if m.km(r[2], r[3], min(max(r[2], a0), a0 + 1), min(max(r[3], o0), o0 + 1)) <= CURR_KM:
+                    k = "%d_%d" % (a0, (o0 + 180) % 360 - 180)
+                    tiles.setdefault(k, {"s": [], "b": [], "c": []})["c"].append(r)
     tdir = os.path.join(out_dir, "data", "tides")
     os.makedirs(tdir, exist_ok=True)
     for k, d in tiles.items():
+        # nb: buoy readings in the whole build, so a phone can tell "none near
+        # you" from "NDBC did not answer this build"
         with io.open(os.path.join(tdir, k + ".json"), "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps({"v": 1, "t": int(now), "reader": READER, "s": d["s"], "b": d["b"]},
+            fh.write(json.dumps({"v": 1, "t": int(now), "reader": READER, "nb": len(obs),
+                                 "s": d["s"], "b": d["b"], "c": d["c"]},
                                 ensure_ascii=False, separators=(",", ":")))
-    return len(st), len(obs), len(tiles)
+    return len(st), len(obs), len(cur), len(tiles)
 
 
 def load_news():
@@ -451,7 +487,7 @@ def build(out_dir, now=None):
         sizes["(tides)"] = write_tides(m, out_dir, now)
     except Exception as e:                       # tides never stop the news
         print("  (tides skipped: %s)" % str(e)[:120])
-        sizes["(tides)"] = (0, 0, 0)
+        sizes["(tides)"] = (0, 0, 0, 0)
     return sizes
 
 
@@ -468,8 +504,8 @@ def main():
     copy_static(out)
     sizes = build(out)
     import gzip
-    ns, nb, nt = sizes.pop("(tides)")
-    print("  tides: %d stations, %d buoy readings, %d tiles" % (ns, nb, nt))
+    ns, nb, nc, nt = sizes.pop("(tides)")
+    print("  tides: %d stations, %d buoy readings, %d current stations, %d tiles" % (ns, nb, nc, nt))
     asked, written = sizes.pop("(abstracts)")
     print("  paper abstracts: %d published, %d outside requests this run" % (written, asked))
     for c, n in sorted(sizes.items()):

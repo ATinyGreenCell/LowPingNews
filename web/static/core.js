@@ -1,4 +1,4 @@
-export const APP_VERSION = "9.2";
+export const APP_VERSION = "9.3";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -303,10 +303,62 @@ export function parseTile(raw, lat, lon, now) {
         buoys.push({ id: cleanText(r[0], 10), name: cleanText(r[1], 50), km: kmBetween(lat, lon, a, o), t,
             water: num(r[5]), waves: num(r[6]), period: num(r[7]), dir: num(r[8]), wind: num(r[9]), air: num(r[11]) });
     }
+    const currents = [];
+    for (const r of rows("c")) {
+        const a = num(r[2]), o = num(r[3]), b = num(r[4]);
+        if (a === null || o === null || b === null || !Number.isInteger(b) || b < 0 || b > 99 ||
+            typeof r[0] !== "string" || !/^[0-9A-Za-z]{4,12}$/.test(r[0]))
+            continue;
+        currents.push({ id: r[0], name: cleanText(r[1], 60), km: kmBetween(lat, lon, a, o), bin: b });
+    }
     stations.sort((x, y) => x.km - y.km);
     buoys.sort((x, y) => x.km - y.km);
-    const reader = safeUrl(d.reader);
-    return { stations, buoys, reader: reader.startsWith("https://") ? reader : "" };
+    currents.sort((x, y) => x.km - y.km);
+    const reader = safeUrl(d.reader), nb = num(d.nb);
+    return { stations, buoys, currents, nb: nb !== null && nb >= 0 ? nb : -1, reader: reader.startsWith("https://") ? reader : "" };
+}
+export function compass(deg) {
+    return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.floor(((deg % 360) + 360 + 22.5) / 45) % 8];
+}
+export function parseCurrents(raw) {
+    const d = raw && typeof raw === "object" ? raw : {};
+    if (d.error && typeof d.error === "object")
+        return { ev: [], flood: null, ebb: null, error: cleanText(d.error.message, 160) || "no predictions" };
+    const box = d.current_predictions && typeof d.current_predictions === "object" ? d.current_predictions : {};
+    const deg = (x) => (typeof x === "number" && isFinite(x) && x >= 0 && x <= 360 ? x : null);
+    const ev = [];
+    let flood = null, ebb = null;
+    for (const x of Array.isArray(box.cp) ? box.cp : []) {
+        if (!x || typeof x !== "object")
+            continue;
+        const m = typeof x.Time === "string" ? /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)$/.exec(x.Time) : null;
+        const v = typeof x.Velocity_Major === "number" ? x.Velocity_Major : parseFloat(String(x.Velocity_Major));
+        if (!m || !isFinite(v) || Math.abs(v) >= 15)
+            continue;
+        const ty = String(x.Type).toLowerCase();
+        const k = ty === "slack" ? "S" : ty === "flood" ? "F" : ty === "ebb" ? "E" : Math.abs(v) < 0.05 ? "S" : v > 0 ? "F" : "E";
+        ev.push([Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) / 1000, v, k]);
+        if (flood === null)
+            flood = deg(x.meanFloodDir);
+        if (ebb === null)
+            ebb = deg(x.meanEbbDir);
+    }
+    ev.sort((a, b) => a[0] - b[0]);
+    return { ev, flood, ebb, error: ev.length ? "" : "no predictions" };
+}
+export function flowAt(ev, t) {
+    for (let i = 0; i + 1 < ev.length; i++) {
+        const [t0, v0, k0] = ev[i], [t1, v1, k1] = ev[i + 1];
+        if (t0 <= t && t <= t1 && t1 > t0) {
+            const f = (t - t0) / (t1 - t0);
+            if (k0 === "S" && k1 !== "S")
+                return v0 + (v1 - v0) * Math.sin(f * Math.PI / 2);
+            if (k0 !== "S" && k1 === "S")
+                return v1 + (v0 - v1) * Math.cos(f * Math.PI / 2);
+            return v0 + (v1 - v0) * (1 - Math.cos(Math.PI * f)) / 2;
+        }
+    }
+    return null;
 }
 export function parsePredictions(raw) {
     const d = raw && typeof raw === "object" ? raw : {};

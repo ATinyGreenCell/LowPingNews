@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "9.2"
+VERSION = "9.3"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -1895,15 +1895,17 @@ def radio_banner(loc):
 
 
 # ---- tides --------------------------------------------------------------
-# One tile from the app's site (~1-3 KB: the NOAA tide stations and buoys near
-# you, with the buoys' latest readings), one NOAA prediction request (~0.8 KB,
-# kept for the day), and the moon worked out here - no request at all.
+# One tile from the app's site (a few KB: the NOAA tide and current stations
+# and buoys near you, with the buoys' latest readings), one NOAA prediction
+# request for each of tides and currents (~1 KB each, kept for the day), and
+# the moon worked out here - no request at all.
 SITE = os.environ.get("LPN_SITE") or "https://atinygreencell.github.io/LowPingNews/"
 COOPS = os.environ.get("LPN_COOPS") or "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
 TIDEC = os.path.join(CD, "tide.json")
 TIDE_KM = 60          # nearest tide station must be this close
 BUOY_KM = 100
 BUOY_FRESH = 3 * 3600
+CUR_KM = 40           # a tidal current is local: farther than this says little
 SYNODIC = 29.530588853              # days, new moon to new moon (mean)
 NEW_MOON0 = 947182440.0             # 2000-01-06 18:14 UTC, a known new moon
 
@@ -1942,6 +1944,67 @@ def tide_level(hilo, t):
             f = (1 - math.cos(math.pi * (t - t0) / (t1 - t0))) / 2
             return v0 + (v1 - v0) * f, v1 > v0
     return None, None
+
+
+def compass(deg):
+    return ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[int((deg % 360 + 22.5) // 45) % 8]
+
+
+def flow_at(ev, t):
+    """The current at t between NOAA's events (knots, flood +): a quarter sine
+    from slack to the peak and back - tidal streams are close to sinusoidal -
+    and a smooth ease from peak to peak where the stream never stops."""
+    import math
+    for (t0, v0, k0), (t1, v1, k1) in zip(ev, ev[1:]):
+        if t0 <= t <= t1 and t1 > t0:
+            f = (t - t0) / float(t1 - t0)
+            if k0 == "S" and k1 != "S":
+                return v0 + (v1 - v0) * math.sin(f * math.pi / 2)
+            if k0 != "S" and k1 == "S":
+                return v1 + (v0 - v1) * math.cos(f * math.pi / 2)
+            return v0 + (v1 - v0) * (1 - math.cos(math.pi * f)) / 2
+    return None
+
+
+def current_predictions(sid, b, fresh):
+    """Max flood, max ebb and slack, yesterday through two days ahead, UTC:
+    ([[t, knots (flood +, ebb -), F|E|S]], flood direction, ebb direction).
+    NOAA's own refusal (a station with no predictions) raises ValueError."""
+    import calendar
+    day = time.strftime("%Y%m%d", time.gmtime(time.time() - 86400))
+    c = jread(TIDEC, {})
+    cc = c.get("cur") if isinstance(c.get("cur"), dict) else {}
+    key = "%s_%d%s" % (sid, b, day)
+    if not fresh and cc.get("key") == key and time.time() - cc.get("t", 0) < 12 * 3600 and cc.get("ev"):
+        return cc["ev"], cc.get("fd"), cc.get("ed"), 0
+    url = ("%s?product=currents_predictions&application=LowPingNews&begin_date=%s&range=96&station=%s&bin=%d"
+           "&time_zone=gmt&interval=MAX_SLACK&units=english&format=json" % (COOPS, day, sid, b))
+    raw, _h, wire, _p = get(url, 20, cap=128 * 1024)
+    d = json.loads(raw)
+    if isinstance(d, dict) and isinstance(d.get("error"), dict):
+        raise ValueError(clean(str(d["error"].get("message") or "no predictions"), 160))
+    cp = d.get("current_predictions") if isinstance(d, dict) else None
+    cp = cp.get("cp") if isinstance(cp, dict) else None
+    deg = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 360 else None
+    ev, fd, ed = [], None, None
+    for x in cp if isinstance(cp, list) else []:
+        try:
+            t = calendar.timegm(time.strptime(str(x["Time"]), "%Y-%m-%d %H:%M"))
+            v = float(x["Velocity_Major"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if not -15 < v < 15:
+            continue
+        ty = str(x.get("Type", "")).lower()
+        ev.append([t, v, {"slack": "S", "flood": "F", "ebb": "E"}.get(ty) or ("S" if abs(v) < 0.05 else "F" if v > 0 else "E")])
+        fd = deg(x.get("meanFloodDir")) if fd is None else fd
+        ed = deg(x.get("meanEbbDir")) if ed is None else ed
+    if not ev:
+        raise ValueError("no predictions")
+    ev.sort()
+    c["cur"] = {"key": key, "t": int(time.time()), "ev": ev, "fd": fd, "ed": ed}
+    jwrite(TIDEC, c)
+    return ev, fd, ed, wire
 
 
 def tide_tile(lat, lon, fresh):
@@ -2080,6 +2143,55 @@ def tides_show(a, P, loc):
                     for j, ch in enumerate(lab[:5]):
                         ticks[i + j] = ch
                 print("  " + D("".join(ticks).rstrip()))
+    cur = []
+    for x in tile.get("c") or []:
+        try:
+            if not re.match(r"^[0-9A-Za-z]{4,12}$", str(x[0])) or isinstance(x[4], bool) or not isinstance(x[4], int) \
+                    or not 0 <= x[4] <= 99:
+                continue
+            cur.append((km(loc["lat"], loc["lon"], float(x[2]), float(x[3])), str(x[0]), clean(str(x[1]), 60), x[4]))
+        except (IndexError, TypeError, ValueError):
+            continue
+    cur = sorted(c_ for c_ in cur if c_[0] <= CUR_KM)[:3]
+    if cur:
+        print()
+        print("  " + B("Currents"))
+        ev, why, pick = [], "", cur[0]
+        for cand in cur:              # the nearest NOAA predicts for: some stations have none
+            pick = cand
+            try:
+                ev, fd, ed, w = current_predictions(cand[1], cand[3], a.fresh)
+                wire += w
+                break
+            except ValueError as e:
+                why = clean(str(e), 120)
+            except Exception as e:    # offline: walking the list would only fail again
+                why = clean(str(e), 120)
+                break
+        say("Station %s, %s away (NOAA %s)" % (pick[2], mi(pick[0]), pick[1]))
+        if not ev:
+            say("NOAA gave no current predictions: %s" % why, P["yel"])
+        else:
+            v = flow_at(ev, now)
+            nxt = [e for e in ev if e[0] > now]
+            label = {"F": "Max flood", "E": "Max ebb", "S": "Slack"}
+            if v is not None and nxt:
+                ns = next((e for e in nxt if e[2] == "S"), None)
+                nm = next((e for e in nxt if e[2] != "S"), None)
+                if abs(v) < 0.1:
+                    state, then = "About slack", ("%s in %s" % (label[nm[2]].lower(), dur(nm[0] - now))) if nm else ""
+                else:
+                    to = fd if v > 0 else ed
+                    state = "%s %.1f kn%s" % ("Flooding" if v > 0 else "Ebbing", abs(v), (" toward " + compass(to)) if to is not None else "")
+                    then = ("slack in " + dur(ns[0] - now)) if ns else ("%s in %s" % (label[nm[2]].lower(), dur(nm[0] - now))) if nm else ""
+                print("  " + B("Now  " + state) + (D(" \u00b7 " + then) if then else ""))
+            print()
+            for t, kv, k in nxt[:4]:
+                print("  %s %s %s %s" % ((D if k == "S" else B)(label[k].ljust(9)), B(clock(t).rjust(8)),
+                                        ("%.1f kn" % abs(kv) if k != "S" else "").rjust(6),
+                                        D(("in " + dur(t - now)) if t - now < 12 * 3600 else day(t))))
+            if fd is not None and ed is not None:
+                say("Flood runs %s, ebb runs %s." % (compass(fd), compass(ed)))
     mo = moon(now)
     print()
     tip = {"spring": "spring tides: higher highs, lower lows",
@@ -2117,6 +2229,11 @@ def tides_show(a, P, loc):
                 bits.append("air " + deg(num(11)))
             say("%s %s, %s: %s \u00b7 %s" % (clean(str(x[0]), 12), clean(str(x[1] or ""), 50) or "buoy", mi(dk),
                                          ", ".join(bits) or "no readings", ago(now - float(x[4]))), None)
+    elif "nb" in tile:                # a real tile: say why the list is empty
+        print()
+        print("  " + B("Buoys"))
+        say("No buoy readings on the site right now: NDBC did not answer its last build." if not tile.get("nb")
+            else "No buoy within %d mi has reported in the last %d hours." % (BUOY_KM / 1.609, BUOY_FRESH // 3600))
     print()
     say("Predictions, not observations: wind and pressure can shift the water by a foot or more. "
         "%s used." % kbs(wire) if wire else "Predictions, not observations: wind and pressure "

@@ -8,7 +8,7 @@
 //
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
-const VERSION = "9.2";
+const VERSION = "9.3";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -374,10 +374,30 @@ async function tide(q, allow) {
         ? d.predictions.filter((x) => !!x && typeof x === "object").slice(0, 40)
             .map((x) => ({ t: String(x.t).slice(0, 16), v: String(x.v).slice(0, 10), type: String(x.type).slice(0, 2) }))
         : null;
-    const body = preds ? { predictions: preds } : { error: { message: d && d.error ? tidy(String(d.error.message || "")).slice(0, 160) : "NOAA " + (apiWhy || "did not answer") } };
-    return new Response(JSON.stringify(body), { status: preds ? 200 : 502, headers: {
+    return noaa(preds ? { predictions: preds } : null, d, allow);
+}
+/** Tidal-current maxima and slacks, on the same terms: only a station, its
+ *  depth bin and a date pass through, to one fixed NOAA query. */
+async function current(q, allow) {
+    const sid = q.get("cur") || "", bin = q.get("bin") || "", day = q.get("d") || "";
+    if (!/^[0-9A-Za-z]{4,12}$/.test(sid) || !/^\d{1,2}$/.test(bin) || !/^20\d{6}$/.test(day))
+        return reply({ v: 1, error: "bad request" }, 400, allow);
+    const url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=currents_predictions&application=LowPingNews" +
+        "&begin_date=" + day + "&range=96&station=" + sid + "&bin=" + bin + "&time_zone=gmt&interval=MAX_SLACK&units=english&format=json";
+    const d = await getJSON(url, TIMEOUT_MS * 2).catch(() => null);
+    const cp = d && d.current_predictions && Array.isArray(d.current_predictions.cp)
+        ? d.current_predictions.cp.filter((x) => !!x && typeof x === "object").slice(0, 60)
+            .map((x) => ({ Type: String(x.Type).slice(0, 8), Time: String(x.Time).slice(0, 16), Velocity_Major: Number(x.Velocity_Major),
+            meanFloodDir: Number(x.meanFloodDir), meanEbbDir: Number(x.meanEbbDir) }))
+        : null;
+    return noaa(cp && cp.length ? { current_predictions: { cp } } : null, d, allow);
+}
+/** NOAA's answer passed on: the trimmed body, or why there is none. */
+function noaa(body, d, allow) {
+    const out = body || { error: { message: d && d.error ? tidy(String(d.error.message || "")).slice(0, 160) : "NOAA " + (apiWhy || "did not answer") } };
+    return new Response(JSON.stringify(out), { status: body ? 200 : 502, headers: {
             "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": allow, Vary: "Origin",
-            "Cache-Control": preds ? "public, max-age=21600" : "no-store", "X-LPN-Reader": VERSION,
+            "Cache-Control": body ? "public, max-age=21600" : "no-store", "X-LPN-Reader": VERSION,
             "Access-Control-Expose-Headers": "X-LPN-Reader"
         } });
 }
@@ -404,6 +424,8 @@ export default {
         const q = new URL(req.url).searchParams;
         if (q.has("tide"))
             return tide(q, allow);
+        if (q.has("cur"))
+            return current(q, allow);
         const cat = q.get("cat") || "";
         const url = safeUrl(q.get("u"));
         if (!/^[a-z0-9_-]{1,24}$/.test(cat) || !url)

@@ -108,6 +108,10 @@ def sandbox():
     # what Termux sets; the host's own TERM (here "linux") would test a
     # different terminal - no alternate screen, another mouse encoding
     env["TERM"] = "xterm-256color"
+    # NOAA's station lists are megabytes: a site build in a test never fetches
+    # them (or NDBC's readings) unless the test serves its own
+    for k in ("LPN_TIDE_META", "LPN_CURR_META", "LPN_NDBC"):
+        env[k] = NOWHERE
     return d, env
 
 
@@ -3082,6 +3086,18 @@ def t_europe_pmc_feeds_list_the_newest_papers_first(env, srv):
     assert got == [old.replace("P_PDATE_D", "FIRST_PDATE_D")], "a saved list keeps the issue-date sort: %r" % got
 
 
+def _json_by_query(srv, path, pick):
+    """A JSON route whose answer depends on the query string: pick(query) -> obj."""
+    def h(req):
+        b = gzip.compress(json.dumps(pick(req.path.partition("?")[2])).encode())
+        req.send_response(200)
+        req.send_header("Content-Encoding", "gzip")
+        req.send_header("Content-Length", str(len(b)))
+        req.end_headers()
+        req.wfile.write(b)
+    srv.routes[path] = h
+
+
 def _text_route(srv, path, body, ctype="text/plain"):
     def h(req):
         b = body.encode("utf-8")
@@ -3122,10 +3138,21 @@ def t_tides_show_the_next_tides_clearly(env, srv):
     g = lambda t: time.strftime("%Y-%m-%d %H:%M", time.gmtime(t))
     hilo = [(base - 4 * 3600, "0.3", "L"), (base + 2 * 3600 + 1800, "7.4", "H"), (base + 8 * 3600 + 1800, "0.1", "L"),
             (base + 14 * 3600 + 1800, "6.9", "H"), (base + 21 * 3600, "-0.2", "L"), (base + 27 * 3600, "7.1", "H")]
-    srv.json("/coops", {"predictions": [{"t": g(t), "v": v, "type": k} for t, v, k in hilo]})
-    srv.json("/data/tides/40_-74.json", {"v": 1, "s": [["8516945", "Northport, NY", 40.90, -73.35],
+    tides = {"predictions": [{"t": g(t), "v": v, "type": k} for t, v, k in hilo]}
+    flows = [(base - 3600, 0.42, "flood"), (base + 4 * 3600, 0, "slack"), (base + 7 * 3600, -0.4, "ebb"),
+             (base + 10 * 3600, 0, "slack"), (base + 13 * 3600, 0.45, "flood")]
+    curr = {"current_predictions": {"units": "knots", "cp": [
+        {"Type": k, "meanFloodDir": 179, "Bin": "1", "meanEbbDir": 7, "Time": g(t), "Depth": None, "Velocity_Major": v}
+        for t, v, k in flows]}}
+    none = {"error": {"message": "Currents predictions are not available from the requested station"}}
+    _json_by_query(srv, "/coops", lambda q: tides if "product=predictions" in q else
+                   none if "station=ACT0001" in q else curr if "station=ACT3496&bin=1&" in q else {})
+    srv.json("/data/tides/40_-74.json", {"v": 1, "nb": 2, "s": [["8516945", "Northport, NY", 40.90, -73.35],
                                                        ["8516990", "Willets Point, NY", 40.79, -73.78],
                                                        ["BAD/ID", "x", 40.9, -73.4]],
+                                         "c": [["ACT3496", "Huntington Bay, off East Fort Point", 40.9267, -73.4175, 1],
+                                               ["ACT0001", "Centerport Harbor, no predictions", 40.901, -73.413, 1],
+                                               ["../evil", "x", 40.9, -73.41, 1]],
                                          "b": [["44040", "Western Long Island Sound", 40.956, -73.58, now - 1200, 18.0, 0.5, 4.0, 225, 6.2, 8.0, 19.0],
                                                ["44022", "Old buoy", 40.9, -73.7, now - 9 * 3600, 17.0, 1.0, 5.0, 0, 3.0, 4.0, 15.0]]})
     e = dict(env, LPN_SITE=srv.url("/"), LPN_COOPS=srv.url("/coops"))
@@ -3134,14 +3161,26 @@ def t_tides_show_the_next_tides_clearly(env, srv):
     flat = " ".join(out.split())                 # the terminal wraps at its width
     for want in ("TIDES Fleets Cove", "Station Northport, NY", "NOAA 8516945", "Now ", "rising", "Next tides",
                  "High", "7.4 ft", "Water highest", "least shore showing", "Water lowest", "most shore showing",
-                 "next 24 h", "Moon ", "% lit", "Buoys", "44040 Western Long Island Sound", "water 64\u00b0F", "wind SW 12 kt"):
+                 "next 24 h", "Moon ", "% lit", "Buoys", "44040 Western Long Island Sound", "water 64\u00b0F", "wind SW 12 kt",
+                 "Currents", "Station Huntington Bay, off East Fort Point", "NOAA ACT3496", "toward S \u00b7 slack in",
+                 "Max ebb", "0.4 kn", "Flood runs S, ebb runs N."):
         assert want in flat, "missing %r in:\n%s" % (want, out)
+    assert re.search(r"Now +Flooding 0\.[34] kn", out), "the stream now, between max flood and slack: " + out
+    assert "Centerport Harbor, no predictions" not in flat, "a station NOAA predicts nothing for gives way to the next"
+    assert not any("evil" in p for p, _h in srv.seen), "a malformed ID never reaches NOAA"
     assert "Old buoy" not in flat, "a reading 9 hours old is not current"
     assert re.search(r"High +\d{1,2}:\d\d [AP]M +7\.4 ft +in [12] h \d+ min", out), out
     assert "Water lowest" in out and "-0.2 ft" in out, "the lowest of the next 24 h, below chart datum"
     srv.json("/data/tides/40_-74.json", {"v": 1, "s": [["9999999", "Far away", 44.0, -70.0]], "b": []})
     out, err, rc = run(e, "tides", "-c", "40.900,-73.412", "--fresh", "--plain")
     assert rc == 0 and "No NOAA tide station within 60 km" in out and "Moon " in out, out
+    assert "Currents" not in out and "Buoys" not in out, "an old tile says nothing it does not know: " + out
+    srv.json("/data/tides/40_-74.json", {"v": 1, "nb": 0, "s": [], "b": []})
+    out, err, rc = run(e, "tides", "-c", "40.900,-73.412", "--fresh", "--plain")
+    assert "NDBC did not answer its last build" in " ".join(out.split()), "no readings anywhere: say whose fault: " + out
+    srv.json("/data/tides/40_-74.json", {"v": 1, "nb": 900, "s": [], "b": []})
+    out, err, rc = run(e, "tides", "-c", "40.900,-73.412", "--fresh", "--plain")
+    assert "No buoy within 62 mi has reported in the last 3 hours" in " ".join(out.split()), out
     out, err, rc = run(dict(e, LPN_SITE=srv.url("/nothing/")), "tides", "-c", "40.900,-73.412", "--fresh", "--plain")
     assert rc == 0 and "No NOAA tide station" in out, "a missing tile means no station nearby: " + out + err
 
@@ -3149,6 +3188,13 @@ def t_tides_show_the_next_tides_clearly(env, srv):
 @test
 def t_site_build_writes_tide_tiles(env, srv):
     now = time.time()
+    srv.json("/curr", {"count": 6, "stations": [
+        {"id": "ACT3496", "name": "Huntington Bay, off East Fort Point", "lat": 40.9267, "lng": -73.4175, "currbin": 2, "depth": 30.0},
+        {"id": "ACT3496", "name": "Huntington Bay, off East Fort Point", "lat": 40.9267, "lng": -73.4175, "currbin": 1, "depth": 12.0},
+        {"id": "ACT9001", "name": "Just over the line", "lat": 41.05, "lng": -73.5, "currbin": 1},
+        {"id": "ACT0091", "name": "Eastport, Friar Roads", "lat": 44.9, "lng": -66.98333, "currbin": 1},
+        {"id": "../evil", "name": "x", "lat": 40.9, "lng": -73.4, "currbin": 1},
+        {"id": "ACT9002", "name": "no bin", "lat": 40.9, "lng": -73.4, "currbin": None}]})
     srv.json("/meta", {"count": 2, "stations": [
         {"id": "8516945", "name": "Northport", "state": "NY", "lat": 40.9, "lng": -73.35},
         {"id": "../evil", "name": "x", "lat": 40.9, "lng": -73.35},
@@ -3171,15 +3217,20 @@ def t_site_build_writes_tide_tiles(env, srv):
         out = os.path.join(tmp, "site")
         r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            env=dict(env, LPN_WEB_FEEDS=fl, LPN_TIDE_META=srv.url("/meta"), LPN_NDBC=srv.url("/ndbc"),
-                                    LPN_READER_URL="https://lpn-reader.x.workers.dev"), timeout=120)
+                                    LPN_CURR_META=srv.url("/curr"), LPN_READER_URL="https://lpn-reader.x.workers.dev"), timeout=120)
         assert r.returncode == 0, r.stderr.decode()[-600:]
-        assert "tides: 2 stations, 1 buoy readings" in r.stdout.decode(), r.stdout.decode()
+        assert "tides: 2 stations, 1 buoy readings, 3 current stations" in r.stdout.decode(), r.stdout.decode()
         tile = json.load(io.open(os.path.join(out, "data", "tides", "40_-74.json"), encoding="utf-8"))
         assert [s[0] for s in tile["s"]] == ["8516945"] and tile["s"][0][1] == "Northport, NY", tile["s"]
         b = tile["b"][0]
         assert b[:2] == ["44040", "Western Long Island Sound"] and b[5] == 18.0 and b[6] == 0.5 and b[9] == 6.2, b
         assert abs(b[4] - (now - 1200)) < 120, "the reading's time, from NDBC's columns (month and minute share a name)"
         assert tile["reader"] == "https://lpn-reader.x.workers.dev"
+        assert tile["nb"] == 1, "how many buoy readings the whole build has: 0 would mean NDBC failed"
+        assert [c[0] for c in tile["c"]] == ["ACT3496", "ACT9001"], tile["c"]
+        assert tile["c"][0][4] == 1, "the shallowest bin: NOAA's own bin numbers, never a guess"
+        far = json.load(io.open(os.path.join(out, "data", "tides", "39_-75.json"), encoding="utf-8"))
+        assert not far["c"], "a current station is listed only near its own water, not 100 km out"
         for k in ("39_-75", "41_-73", "40_-73"):           # its neighbours list it too: a spot near a tile edge finds it
             assert os.path.exists(os.path.join(out, "data", "tides", k + ".json")), k
         assert os.path.exists(os.path.join(out, "data", "tides", "37_-123.json"))
