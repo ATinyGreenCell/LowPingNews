@@ -1,7 +1,7 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
 import type { Tide, CurrentStation, Flows } from "./core.js";
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -291,7 +291,8 @@ const US = /-US$/i.test(navigator.language || "") || (navigator.language || "") 
 
 function spotLine(sp: Spot): string {
   const how = sp.via === "device" ? "your phone's location" : sp.via === "place" ? "set by place name" : sp.via;
-  return "For " + sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " (" + how + ", " + ago(now() - sp.t) + " ago)";
+  const age = ago(now() - sp.t);
+  return "For " + sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " (" + how + ", " + (/^\d/.test(age) ? age + " ago" : age) + ")";
 }
 
 async function getJSON(url: string, headers?: Record<string, string>): Promise<{ ok: boolean; status: number; body: unknown }> {
@@ -397,33 +398,50 @@ function wait(sec: number): string {
   return m < 60 ? m + " min" : Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "");
 }
 function tideChart(hilo: Tide[], t0: number): SVGElement {
-  const NS = "http://www.w3.org/2000/svg", W = 320, H = 96, pad = 14;
+  // drawn like the weather chart: 24 hours across, labelled every six, with
+  // each high and low marked by a dot and its time
+  const NS = "http://www.w3.org/2000/svg", W = 288, H = 64, top = 14, axis = 16;
   const pts: [number, number][] = [];
   for (let i = 0; i <= 96; i++) { const l = tideLevel(hilo, t0 + i * 900); if (l) pts.push([i / 96, l.level]); }
   const svg = document.createElementNS(NS, "svg");
-  svg.setAttribute("viewBox", "0 0 " + W + " " + H); svg.setAttribute("class", "tidechart"); svg.setAttribute("role", "img");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + (H + axis)); svg.setAttribute("class", "chart tidechart"); svg.setAttribute("role", "img");
   svg.setAttribute("aria-label", "Water level over the next 24 hours");
   if (pts.length < 2) return svg;
   const lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(...pts.map((p) => p[1]));
-  const x = (f: number): number => f * W, y = (v: number): number => pad + (1 - (v - lo) / ((hi - lo) || 1)) * (H - 2 * pad);
+  const x = (f: number): number => f * W, y = (v: number): number => top + (1 - (v - lo) / ((hi - lo) || 1)) * (H - top - 4);
   const line = pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + " " + y(p[1]).toFixed(1)).join(" ");
-  const area = document.createElementNS(NS, "path");
-  area.setAttribute("d", line + " L" + x(pts[pts.length - 1][0]).toFixed(1) + " " + H + " L" + x(pts[0][0]).toFixed(1) + " " + H + " Z");
-  area.setAttribute("class", "fill");
-  const path = document.createElementNS(NS, "path");
-  path.setAttribute("d", line); path.setAttribute("class", "line");
-  svg.append(area, path);
+  const mk = (tag: string, attrs: Record<string, string>, text?: string): SVGElement => {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  svg.append(mk("path", { d: line + " L" + x(pts[pts.length - 1][0]).toFixed(1) + " " + H + " L" + x(pts[0][0]).toFixed(1) + " " + H + " Z", class: "fill" }),
+             mk("path", { d: line, class: "line" }));
   for (const [t, v, k] of hilo) {
     const f = (t - t0) / 86400;
     if (f < 0 || f > 1) continue;
-    const lab = document.createElementNS(NS, "text");
-    lab.setAttribute("x", String(Math.min(W - 30, Math.max(2, x(f) - 16))));
-    lab.setAttribute("y", String(k === "H" ? y(v) - 4 : Math.min(H - 2, y(v) + 12)));
-    lab.textContent = clock(t, true);
-    svg.append(lab);
+    const cx = x(f), cy = y(v);
+    svg.append(mk("circle", { cx: cx.toFixed(1), cy: cy.toFixed(1), r: "2.5", class: k === "H" ? "dot hi" : "dot" }),
+               mk("text", { x: String(Math.min(W - 26, Math.max(2, cx - 13))), y: String(k === "H" ? Math.max(9, cy - 5) : Math.min(H - 1, cy + 12)),
+                            class: "lab" }, clock(t, true)));
   }
+  for (let i = 0; i <= 18; i += 6)                                    // the time axis, as on the weather chart
+    svg.append(mk("text", { x: String(x(i / 24) + 1), y: String(H + 13) }, i ? clock(t0 + i * 3600, true) : "now"));
   return svg;
 }
+// one rule for every day label on this tab, so a list and a sentence never disagree
+function dayLabel(t: number): string {
+  const w = dayWord(t);
+  return w === "today" ? "Today" : w === "tomorrow" ? "Tmrw" : w;
+}
+const buoyName = (n: string): string => n.replace(/^(?:[A-Z0-9]{4,8}\s+)?\d{5,8}\s*-\s*/, "").replace(/^[\s-]+|[\s-]+$/g, "");
+function rows(cls: string): HTMLElement { return el("div", "trows " + cls); }
+function edgeTime(edge: number, tide: number): string {
+  const e = round5(edge);
+  return clock(e) + (dayWord(e) === dayWord(tide) ? "" : " " + dayLabel(e).toLowerCase());
+}
+
 async function showTides(force = false): Promise<void> {
   status();
   const main = $("main");
@@ -450,39 +468,74 @@ async function showTides(force = false): Promise<void> {
   const cands = currents.filter((c) => c.km <= 40).slice(0, 3);
   const flows = cands.length ? currentsNear(cands, force, reader) : null;     // asked alongside the tides
   const st = stations[0];
+  const dot = " \u00b7 ";
+  const when = (tt: number): string => clock(tt) + (dayWord(tt) === "today" ? "" : " " + dayLabel(tt).toLowerCase());
   if (!st || st.km > 60) {
     if (tile !== null) box.append(el("p", "note warn", "No NOAA tide station within 60 km. Predictions cover US coasts and territories."));
   } else {
-    box.append(el("p", "note", "Station " + st.name + ", " + mi(st.km) + " away (NOAA " + st.id + ")"));
     const pr = await predictions(st.id, force, reader);
     if (S.view !== "tides") return;
-    if (!pr.hilo.length) box.append(el("p", "note warn", "NOAA gave no predictions: " + pr.error));
+    if (!pr.hilo.length) box.append(el("p", "note", st.name + dot + mi(st.km)), el("p", "note warn", "NOAA gave no predictions: " + pr.error));
     else {
       const lv = tideLevel(pr.hilo, t);
       const next = pr.hilo.filter((h) => h[0] > t);
-      if (lv && next.length)
-        box.append(el("p", "now", "Now " + lv.level.toFixed(1) + " ft and " + (lv.rising ? "rising" : "falling") +
-                      " \u00b7 " + (next[0][2] === "H" ? "high" : "low") + " tide in " + wait(next[0][0] - t)));
-      const list = el("div", "tidelist");
-      for (const [tt, v, k] of next.slice(0, 4))
-        list.append(el("div", k === "H" ? "trow hi" : "trow",
-          el("span", "k", k === "H" ? "High" : "Low"), el("span", "c", clock(tt)), el("span", "v", v.toFixed(1) + " ft"),
-          el("span", "w", tt - t < 12 * 3600 ? "in " + wait(tt - t) : dayWord(tt))));
-      box.append(list);
+      if (lv && next.length) {
+        box.append(el("div", "thero",
+          el("span", "big", lv.level.toFixed(1)), el("span", "unit", "ft"),
+          el("span", "arrow", lv.rising ? "\u2191" : "\u2193"), el("span", "word", lv.rising ? "Rising" : "Falling")),
+          el("p", "small", (next[0][2] === "H" ? "High" : "Low") + " tide " + when(next[0][0]) + ", in " + wait(next[0][0] - t)));
+        // how long it holds: the window within a foot of the coming (or current) high or low
+        const i1 = pr.hilo.length - next.length;
+        const word = (k: string): string => (k === "H" ? "high" : "low");
+        const prev = i1 >= 1 ? nearWindow(pr.hilo, i1 - 1) : null, w1 = nearWindow(pr.hilo, i1);
+        let hold = "";
+        if (prev && !prev.whole && prev.end !== null && prev.end > t)
+          hold = "Within " + HOLD_FT + " ft of " + word(pr.hilo[i1 - 1][2]) + " now, until " + when(round5(prev.end)) + ".";
+        else if (!w1.whole && w1.start !== null && w1.end !== null)
+          hold = w1.start <= t ? "Within " + HOLD_FT + " ft of " + word(next[0][2]) + " now, until " + when(round5(w1.end)) + "."
+            : "Within " + HOLD_FT + " ft of " + word(next[0][2]) + " from " + when(round5(w1.start)) + " to " + when(round5(w1.end)) +
+              ", about " + wait(round5(w1.end) - round5(w1.start)) + ".";
+        if (hold) box.append(el("p", "hold", hold));
+      }
+      box.append(el("p", "tsub", st.name + dot + mi(st.km) + dot, el("span", "nw", "NOAA " + st.id)));
       const win = pr.hilo.filter((h) => h[0] >= t && h[0] <= t + 86400);
       if (win.length) {
         const top = win.reduce((a, b) => (b[1] > a[1] ? b : a)), bot = win.reduce((a, b) => (b[1] < a[1] ? b : a));
-        box.append(el("p", "", "Water highest " + clock(top[0]) + " " + dayWord(top[0]) + ", " + top[1].toFixed(1) + " ft: least shore showing"),
-                   el("p", "", "Water lowest " + clock(bot[0]) + " " + dayWord(bot[0]) + ", " + bot[1].toFixed(1) + " ft: most shore showing"),
-                   tideChart(pr.hilo, t), el("p", "note", "Next 24 hours, from now"));
+        // the true range: the highs and lows inside the 24 h and the level at its two ends
+        const span = [...win.map((h) => h[1]), ...[tideLevel(pr.hilo, t), tideLevel(pr.hilo, t + 86400)].filter((x) => x).map((x) => x!.level)];
+        box.append(el("h3", "", "Next 24 hours" + dot + Math.min(...span).toFixed(1) + "\u2013" + Math.max(...span).toFixed(1) + " ft"), tideChart(pr.hilo, t),
+          el("p", "small", "Highest " + when(top[0]) + ", " + top[1].toFixed(1) + " ft: least shore showing."),
+          el("p", "small", "Lowest " + when(bot[0]) + ", " + bot[1].toFixed(1) + " ft: most shore showing."));
       }
+      // the table: the day named once, as in a printed tide table; a bar for the height
+      const shown = next.slice(0, 4);
+      const lo = Math.min(...shown.map((h) => h[1]), 0), hi = Math.max(...shown.map((h) => h[1]));
+      const tbl = rows("tides");
+      let last = "";
+      let anyWhole = false;
+      shown.forEach(([tt, v, k], n) => {
+        const d = dayLabel(tt), bar = el("span", "range", el("i"));
+        (bar.firstChild as HTMLElement).style.width = Math.max(4, (v - lo) / ((hi - lo) || 1) * 100).toFixed(1) + "%";
+        const w = nearWindow(pr.hilo, pr.hilo.length - next.length + n);
+        anyWhole = anyWhole || w.whole;
+        const win = !w.whole && w.start !== null && w.end !== null
+          // an edge on another day than its tide says which: past midnight, a bare time reads a day off
+          ? "within " + HOLD_FT + " ft " + edgeTime(w.start, tt) + " \u2013 " + edgeTime(w.end, tt) + " \u00b7 " + wait(round5(w.end) - round5(w.start)) : "";
+        tbl.append(el("div", k === "H" ? "trow hi" : "trow",
+          el("span", "d", d === last ? "" : d), el("span", "c", clock(tt)), el("span", "k", k === "H" ? "High" : "Low"),
+          bar, el("span", "v", v.toFixed(1) + " ft"), win ? el("span", "win", win) : null));
+        last = d;
+      });
+      box.append(el("h3", "", "Tides"), tbl);
+      if (anyWhole) box.append(el("p", "small warn", "The tide here moves under " + 2 * HOLD_FT +
+        " ft between some highs and lows, so the water stays near them for hours: no single window to give."));
     }
   }
   if (flows) {
     const { st: cs, f } = await flows;
     if (S.view !== "tides") return;
-    box.append(el("h3", "", "Currents"), el("p", "note", "Station " + cs.name + ", " + mi(cs.km) + " away (NOAA " + cs.id + ")"));
-    if (!f.ev.length) box.append(el("p", "note warn", "NOAA gave no current predictions: " + f.error));
+    box.append(el("h3", "", "Currents"));
+    if (!f.ev.length) box.append(el("p", "note", cs.name + dot + mi(cs.km)), el("p", "note warn", "NOAA gave no current predictions: " + f.error));
     else {
       const v = flowAt(f.ev, t);
       const next = f.ev.filter((e) => e[0] > t);
@@ -490,45 +543,61 @@ async function showTides(force = false): Promise<void> {
       if (v !== null && next.length) {
         const ns = next.find((e) => e[2] === "S"), nm = next.find((e) => e[2] !== "S");
         const to = v > 0 ? f.flood : f.ebb;
-        const state = Math.abs(v) < 0.1 ? "About slack"
-          : (v > 0 ? "Flooding " : "Ebbing ") + Math.abs(v).toFixed(1) + " kn" + (to !== null ? " toward " + compass(to) : "");
-        const then = Math.abs(v) >= 0.1 && ns ? "slack in " + wait(ns[0] - t) : nm ? label[nm[2]].toLowerCase() + " in " + wait(nm[0] - t) : "";
-        box.append(el("p", "now", "Now " + state.charAt(0).toLowerCase() + state.slice(1) + (then ? " \u00b7 " + then : "")));
+        if (Math.abs(v) < 0.1) {
+          box.append(el("div", "thero", el("span", "word big2", "About slack")));
+          if (nm) box.append(el("p", "small", label[nm[2]] + " " + when(nm[0]) + ", in " + wait(nm[0] - t)));
+        } else {
+          const arrow = el("span", "arrow", "\u2191");
+          if (to !== null) { arrow.style.transform = "rotate(" + Math.round(to) + "deg)"; arrow.title = "toward " + compass(to); }
+          box.append(el("div", "thero", el("span", "big", Math.abs(v).toFixed(1)), el("span", "unit", "kn"), arrow,
+            el("span", "word", (v > 0 ? "Flooding" : "Ebbing") + (to !== null ? " toward " + compass(to) : ""))));
+          const nx = ns || nm;
+          if (nx) box.append(el("p", "small", label[nx[2]] + " " + when(nx[0]) + ", in " + wait(nx[0] - t)));
+        }
       }
-      const list = el("div", "tidelist");
-      for (const [tt, kv, k] of next.slice(0, 4))
-        list.append(el("div", k === "S" ? "trow cur" : "trow cur hi",
-          el("span", "k", label[k]), el("span", "c", clock(tt)), el("span", "v", k === "S" ? "" : Math.abs(kv).toFixed(1) + " kn"),
-          el("span", "w", tt - t < 12 * 3600 ? "in " + wait(tt - t) : dayWord(tt))));
-      box.append(list);
-      if (f.flood !== null && f.ebb !== null) box.append(el("p", "note", "Flood runs " + compass(f.flood) + ", ebb runs " + compass(f.ebb) + "."));
+      box.append(el("p", "tsub", cs.name + dot + mi(cs.km) + dot, el("span", "nw", "NOAA " + cs.id)));
+      const shown = next.slice(0, 4);
+      const top = Math.max(...shown.map((e) => Math.abs(e[1])), 0.1);
+      const tbl = rows("currents");
+      let last = "";
+      for (const [tt, kv, k] of shown) {
+        const d = dayLabel(tt), bar = el("span", "range", el("i"));
+        (bar.firstChild as HTMLElement).style.width = (k === "S" ? 0 : Math.max(4, Math.abs(kv) / top * 100)).toFixed(1) + "%";
+        tbl.append(el("div", k === "S" ? "trow" : "trow hi",
+          el("span", "d", d === last ? "" : d), el("span", "c", clock(tt)), el("span", "k", label[k]),
+          bar, el("span", "v", k === "S" ? "" : Math.abs(kv).toFixed(1) + " kn")));
+        last = d;
+      }
+      box.append(tbl);
+      if (f.flood !== null && f.ebb !== null) box.append(el("p", "small", "Floods toward " + compass(f.flood) + ", ebbs toward " + compass(f.ebb) + "."));
     }
   }
   const mo = moon(t);
   const md = (x: number): string => new Date(x * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  const ev = [[mo.next, "new"], [mo.full, "full"]].sort((a, b) => (a[0] as number) - (b[0] as number));
-  box.append(el("p", "", "Moon: " + mo.name + ", " + Math.round(mo.lit * 100) + "% lit \u00b7 " +
-                ev.map(([x, w]) => w + " " + md(x as number)).join(", ") +
-                (mo.tide === "spring" ? " \u00b7 spring tides: higher highs, lower lows" : mo.tide === "neap" ? " \u00b7 neap tides: a smaller range than usual" : "")));
+  const ev = ([[mo.next, "New"], [mo.full, "Full"]] as [number, string][]).sort((a, b) => a[0] - b[0]);
+  box.append(el("h3", "", "Moon"), el("div", "thero small2", el("span", "word", mo.name), el("span", "dimw", Math.round(mo.lit * 100) + "% lit")),
+             el("p", "small", ev.map(([x, w]) => w + " " + md(x)).join(dot)));
+  if (mo.tide) box.append(el("p", "small", mo.tide === "spring" ? "Spring tides: higher highs and lower lows than usual." : "Neap tides: a smaller range than usual."));
   const near = buoys.filter((b) => b.km <= 100).slice(0, 2);
   if (near.length) {
     box.append(el("h3", "", "Buoys"));
     const deg = (c: number): string => (US ? Math.round(c * 9 / 5 + 32) + "\u00b0F" : Math.round(c) + "\u00b0C");
-    const cmp = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     for (const b of near) {
       const bits: string[] = [];
       if (b.water !== null) bits.push("water " + deg(b.water));
       if (b.waves !== null) bits.push("waves " + (b.waves * 3.281).toFixed(1) + " ft" + (b.period ? " every " + Math.round(b.period) + " s" : ""));
-      if (b.wind !== null) bits.push("wind " + (b.dir !== null ? cmp[Math.floor((b.dir + 22.5) / 45) % 8] + " " : "") + Math.round(b.wind * 1.944) + " kt");
+      if (b.wind !== null) bits.push("wind " + (b.dir !== null ? compass(b.dir) + " " : "") + Math.round(b.wind * 1.944) + " kt");
       if (b.air !== null) bits.push("air " + deg(b.air));
-      box.append(el("p", "", b.id + " " + (b.name || "buoy") + ", " + mi(b.km) + ": " + (bits.join(", ") || "no readings") +
-                    " \u00b7 " + ago(t - b.t) + " ago"));
+      box.append(el("div", "tbuoy", el("div", "n", el("strong", "", buoyName(b.name) || "Buoy " + b.id),
+                                         el("span", "dimw", dot + mi(b.km) + dot + ago(t - b.t) + " ago")),
+                    el("p", "small", bits.join(dot) || "no readings")));
     }
   } else if (nb >= 0) {                     // a real tile: say why the list is empty
     box.append(el("h3", "", "Buoys"), el("p", "note", nb === 0 ? "No buoy readings on the site right now: NDBC did not answer its last build."
                                                               : "No buoy within 62 mi has reported in the last 3 hours."));
   }
-  box.append(el("p", "note", "Predictions, not observations: wind and pressure can shift the water by a foot or more."));
+  box.append(el("p", "note", "Heights are above NOAA's average lowest tide (MLLW), so a low can read below 0. Windows: when the water is within " +
+    HOLD_FT + " ft of each high or low, from NOAA's times, to about 5 min. Wind and pressure can shift real water a foot or more."));
 }
 
 async function findPlace(q: string): Promise<void> {

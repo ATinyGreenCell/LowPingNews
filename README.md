@@ -548,6 +548,15 @@ prediction points - tide stations (heights) and current stations (knots) - not
 buoys: a buoy is an instrument reporting what it measured, and NDBC's list
 has every one this uses.
 
+**How long a tide holds.** The water never stops; it moves slowest around each
+high and low. For each one, `tides` (and the web app's Tides tab) gives the
+window when the water is within 1 ft of it - for a low, roughly when the shore
+is near its widest. Worked out from NOAA's predicted times and heights along the
+standard tide curve, each side separately, and rounded to 5 minutes; checked
+against a minute-by-minute walk of the curve. Where the tide moves less than a
+foot, it says so instead of giving a window. Heights are above NOAA's average
+lowest tide (MLLW), so a low can read below zero.
+
 `lowpingnews radio` (or `noaa`) is a weather radio in text: active watches and
 warnings for your spot first, most severe first, then the National Weather
 Service forecast read period by period, the way the broadcast reads it. It

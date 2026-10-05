@@ -3131,6 +3131,39 @@ def t_moon_and_tide_maths(env, srv):
 
 
 @test
+def t_how_long_a_tide_holds_is_exact(env, srv):
+    """The window within 1 ft of each high and low, against a minute-by-minute
+    walk of the same curve: lopsided tides, a negative low, and a side that
+    never moves a foot (that is 'whole', never passed off as a hold)."""
+    m = load()
+    H = 3600
+    cases = [[[0, 0.4, "L"], [6.2 * H, 7.3, "H"], [12.4 * H, 0.7, "L"], [18.6 * H, 7.7, "H"], [24.8 * H, 0.5, "L"]],
+             [[0, 6.9, "H"], [5.5 * H, -0.6, "L"], [12.9 * H, 5.1, "H"], [18 * H, 1.2, "L"], [25 * H, 7.0, "H"]],
+             [[0, 2.0, "H"], [6 * H, 1.4, "L"], [12 * H, 3.9, "H"], [18.5 * H, 0.2, "L"], [24 * H, 3.0, "H"]]]
+    for h in cases:
+        for i in range(1, len(h) - 1):
+            a, b = m.near_window(h, i)
+            t0, v = h[i][0], h[i][1]
+
+            def walk(step, stop):
+                x = t0
+                while (x + step - stop) * step <= 0:
+                    lv = m.tide_level(h, x + step)[0]
+                    if lv is None or abs(lv - v) > 1.0:
+                        break
+                    x += step
+                return x
+            assert abs(a - walk(-60, h[i - 1][0])) <= 60 and abs(b - walk(60, h[i + 1][0])) <= 60, (h[i], a, b)
+    a, b = m.near_window(cases[0], 1)
+    assert 3 * H - 600 < b - a < 3 * H + 600, "a 7 ft tide holds within a foot about 3 h (rule of twelfths)"
+    assert m.near_window(cases[2], 1)[0] == cases[2][0][0], "a side under 1 ft runs to the next tide"
+    assert m.near_window(cases[0], 0)[0] is None and m.near_window(cases[0], 4)[1] is None, \
+        "no neighbouring tide predicted: that side is unknown, not guessed"
+    assert m.r5(1000) == 900 and m.r5(1200) == 1200
+    assert m.hm(time.mktime((2026, 10, 4, 23, 20, 0, 0, 0, -1))) in ("11:20p", "23:20")
+
+
+@test
 def t_tides_show_the_next_tides_clearly(env, srv):
     import calendar
     now = time.time()
@@ -3159,22 +3192,34 @@ def t_tides_show_the_next_tides_clearly(env, srv):
     out, err, rc = run(e, "tides", "-c", "40.900,-73.412", "--label", "Fleets Cove", "--plain")
     assert rc == 0, err
     flat = " ".join(out.split())                 # the terminal wraps at its width
-    for want in ("TIDES Fleets Cove", "Station Northport, NY", "NOAA 8516945", "Now ", "rising", "Next tides",
-                 "High", "7.4 ft", "Water highest", "least shore showing", "Water lowest", "most shore showing",
-                 "next 24 h", "Moon ", "% lit", "Buoys", "44040 Western Long Island Sound", "water 64\u00b0F", "wind SW 12 kt",
-                 "Currents", "Station Huntington Bay, off East Fort Point", "NOAA ACT3496", "toward S \u00b7 slack in",
-                 "Max ebb", "0.4 kn", "Flood runs S, ebb runs N."):
+    for want in ("Fleets Cove", "pinned", "Northport, NY \u00b7 3 mi \u00b7 NOAA 8516945", "Rising", "NEXT 24H", "TIDES",
+                 "High", "7.4 ft", "Highest", "least shore showing", "Lowest", "most shore showing",
+                 "MOON", "% lit", "BUOYS", "Western Long Island Sound", "water 64\u00b0F", "wind SW 12 kt",
+                 "CURRENTS", "Huntington Bay, off East Fort Point", "NOAA ACT3496", "Flooding toward S", "Slack",
+                 "Max ebb", "0.4 kn", "Floods toward S, ebbs toward N."):
         assert want in flat, "missing %r in:\n%s" % (want, out)
-    assert re.search(r"Now +Flooding 0\.[34] kn", out), "the stream now, between max flood and slack: " + out
+    assert re.search(r"0\.[34] kn +Flooding toward S", out), "the stream now, between max flood and slack: " + out
+    assert re.search(r"Slack \d{1,2}:\d\d [AP]M[^,]*, in \d+ h", flat), "when the stream next goes slack: " + out
+    assert "44040" not in flat and "KPTN6" not in flat, "buoys by place, not by code"
     assert "Centerport Harbor, no predictions" not in flat, "a station NOAA predicts nothing for gives way to the next"
     assert not any("evil" in p for p, _h in srv.seen), "a malformed ID never reaches NOAA"
     assert "Old buoy" not in flat, "a reading 9 hours old is not current"
-    assert re.search(r"High +\d{1,2}:\d\d [AP]M +7\.4 ft +in [12] h \d+ min", out), out
-    assert "Water lowest" in out and "-0.2 ft" in out, "the lowest of the next 24 h, below chart datum"
+    assert re.search(r"\d{1,2}:\d\d [AP]M +High +7\.4 ft", out), "an aligned row: time, high or low, height: " + out
+    assert re.search(r"Within 1 ft of (high|low) (now, until|from) \d{1,2}:\d\d [AP]M", flat), "how long the tide holds: " + out
+    assert "within 1 ft" in out and re.search(r"\d{1,2}:\d\d[ap]( \w+)?\u2013\d{1,2}:\d\d[ap]", out), "a window per tide: " + out
+    assert "MLLW" in flat, "what the heights are measured from, so a low below 0 is not misread"
+    rng = re.search(r"NEXT 24H +(-?\d+\.\d)\u2013(-?\d+\.\d) ft", out)
+    low_ = re.search(r"Lowest .*?, (-?\d+\.\d) ft", flat)
+    assert rng and low_ and rng.group(1) == low_.group(1), "the range and the lowest must agree: " + out
+    assert re.search(r"High tide \d{1,2}:\d\d [AP]M[^,]*, in [12] h \d+ min", flat), "the next tide, and how long until it: " + out
+    assert "Lowest" in out and "-0.2 ft" in out, "the lowest of the next 24 h, below chart datum"
+    rows_ = [l for l in out.splitlines() if re.search(r"\d:\d\d [AP]M +(High|Low) ", l)]
+    assert len(rows_) == 4 and sum(1 for l in rows_ if re.match(r"^  \S", l)) <= 2, \
+        "the table names a day once, not on every row: %r" % rows_
     srv.json("/data/tides/40_-74.json", {"v": 1, "s": [["9999999", "Far away", 44.0, -70.0]], "b": []})
     out, err, rc = run(e, "tides", "-c", "40.900,-73.412", "--fresh", "--plain")
-    assert rc == 0 and "No NOAA tide station within 60 km" in out and "Moon " in out, out
-    assert "Currents" not in out and "Buoys" not in out, "an old tile says nothing it does not know: " + out
+    assert rc == 0 and "No NOAA tide station within 60 km" in out and "MOON" in out, out
+    assert "CURRENTS" not in out and "BUOYS" not in out, "an old tile says nothing it does not know: " + out
     srv.json("/data/tides/40_-74.json", {"v": 1, "nb": 0, "s": [], "b": []})
     out, err, rc = run(e, "tides", "-c", "40.900,-73.412", "--fresh", "--plain")
     assert "NDBC did not answer its last build" in " ".join(out.split()), "no readings anywhere: say whose fault: " + out

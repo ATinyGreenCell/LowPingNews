@@ -1,4 +1,4 @@
-export const APP_VERSION = "9.3";
+export const APP_VERSION = "9.5";
 export const SHOW = 10;
 export const MORE = 10;
 const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -375,3 +375,21 @@ export function parsePredictions(raw) {
     out.sort((a, b) => a[0] - b[0]);
     return { hilo: out, error: out.length ? "" : "no predictions" };
 }
+export const HOLD_FT = 1;
+export function nearWindow(hilo, i, d = HOLD_FT) {
+    const [t, v] = hilo[i];
+    let whole = false;
+    const edge = (j) => {
+        if (j < 0 || j >= hilo.length)
+            return null;
+        const [tj, vj] = hilo[j], r = Math.abs(vj - v);
+        if (r <= d) {
+            whole = true;
+            return tj;
+        }
+        return t + (tj - t) * Math.acos(1 - 2 * d / r) / Math.PI;
+    };
+    const start = edge(i - 1), end = edge(i + 1);
+    return { start, end, whole };
+}
+export const round5 = (t) => Math.round(t / 300) * 300;

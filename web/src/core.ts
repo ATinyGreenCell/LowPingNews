@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "9.3";
+export const APP_VERSION = "9.5";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -419,3 +419,25 @@ export function parsePredictions(raw: unknown): { hilo: Tide[]; error: string } 
   out.sort((a, b) => a[0] - b[0]);
   return { hilo: out, error: out.length ? "" : "no predictions" };
 }
+
+// ---- how long a high or low "holds" -------------------------------------------
+// The tide never stops; it moves slowest near each high and low. A window is
+// when the water is within d ft of one. Each side is its own half cosine (the
+// falling and rising sides differ): with range R and fraction f of the way to
+// the next tide, |level - v| <= d until f = acos(1 - 2d/R) / pi. A side with
+// R <= d never gets d away and runs to the next tide: "whole", not a hold.
+export const HOLD_FT = 1;
+export function nearWindow(hilo: Tide[], i: number, d = HOLD_FT): { start: number | null; end: number | null; whole: boolean } {
+  const [t, v] = hilo[i];
+  let whole = false;
+  const edge = (j: number): number | null => {
+    if (j < 0 || j >= hilo.length) return null;
+    const [tj, vj] = hilo[j], r = Math.abs(vj - v);
+    if (r <= d) { whole = true; return tj; }
+    return t + (tj - t) * Math.acos(1 - 2 * d / r) / Math.PI;
+  };
+  const start = edge(i - 1), end = edge(i + 1);
+  return { start, end, whole };
+}
+/** To five minutes: a window from a curve fit is not good to the minute. */
+export const round5 = (t: number): number => Math.round(t / 300) * 300;

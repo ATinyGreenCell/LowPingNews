@@ -4,7 +4,7 @@ import datetime as dt, io, json, os, re, sys, time
 # Everything else is imported lazily. urllib.request alone drags in email and
 # http.client for ~100ms, and a cached run never opens a socket.
 
-VERSION = "9.3"
+VERSION = "9.5"
 def _base(env, win, fallback):
     """XDG where it exists, %APPDATA% on Windows, ~/... everywhere else."""
     v = os.environ.get(env)
@@ -1936,14 +1936,51 @@ def km(a1, o1, a2, o2):
 
 
 def tide_level(hilo, t):
-    """Water level at t between the predicted high and low around it: NOAA's
-    own curves are this cosine. (level, rising?) or (None, None) outside."""
+    """Water level at t between the predicted high and low around it, along
+    a half cosine - the standard shape between NOAA's predicted times, close to
+    (not exactly) NOAA's own curves. (level, rising?) or (None, None) outside."""
     import math
     for (t0, v0, _k0), (t1, v1, _k1) in zip(hilo, hilo[1:]):
         if t0 <= t <= t1 and t1 > t0:
             f = (1 - math.cos(math.pi * (t - t0) / (t1 - t0))) / 2
             return v0 + (v1 - v0) * f, v1 > v0
     return None, None
+
+
+HOLD_FT = 1.0       # "holding": the water within this much of a high or low
+
+
+def near_window(hilo, i, d=HOLD_FT):
+    """When the water is within d ft of the high or low hilo[i]: (start, end),
+    each side None where the predictions do not reach the neighbouring tide.
+    Each side is its own half cosine - falling and rising sides differ - so
+    for range R and fraction f of the way to the next tide,
+    level = v + (v_next - v) * (1 - cos(pi f)) / 2, and |level - v| <= d until
+    f = acos(1 - 2d/R) / pi. A side with R <= d never gets d away: it runs to
+    the next tide, and the caller says so rather than calling that a hold."""
+    import math
+    t, v, _k = hilo[i]
+
+    def edge(j):
+        if not 0 <= j < len(hilo):
+            return None
+        tj, vj = hilo[j][0], hilo[j][1]
+        r = abs(vj - v)
+        if r <= d:
+            return tj
+        return t + (tj - t) * math.acos(1 - 2.0 * d / r) / math.pi
+    return edge(i - 1), edge(i + 1)
+
+
+def r5(t):
+    """To five minutes: a window from a curve fit is not good to the minute."""
+    return round(t / 300.0) * 300
+
+
+def hm(t):
+    """A compact time for a narrow column: 11:20p, or 23:20 on a 24-hour clock."""
+    c = clock(t)
+    return c[:-3] + c[-2].lower() if c.endswith((" AM", " PM")) else c
 
 
 def compass(deg):
@@ -2062,26 +2099,65 @@ def dur(sec):
     return "%d min" % m_ if m_ < 60 else "%d h" % (m_ // 60) + (" %d min" % (m_ % 60) if m_ % 60 else "")
 
 
+def buoy_name(x):
+    """NDBC's names often lead with codes ("KPTN6 8516945 - Kings Point, NY"):
+    people know the place, so the codes go."""
+    n = clean(str(x or ""), 60)
+    n = re.sub(r"^(?:[A-Z0-9]{4,8}\s+)?\d{5,8}\s*-\s*", "", n)
+    return n.strip(" -") or ""
+
+
 def tides_show(a, P, loc):
+    """Laid out like the weather screen: where and when, the reading now in
+    big type, then sections - next 24 hours, the tide table, currents, moon,
+    buoys - each a dim heading over aligned rows and one plain sentence."""
     import textwrap
     B, D = P["b"], P["d"]
     cols = cols_()
     now = time.time()
+    asc = getattr(a, "ascii", False)
+    dot = " - " if asc else " \u00b7 "
 
     def say(txt, fn=None, ind="  "):
         for ln in textwrap.wrap(txt, max(16, cols - len(ind) - 1)) or [""]:
             print((fn or D)(ind + ln))
-    where = loc.get("label") or "%.4f,%.4f" % (loc["lat"], loc["lon"])
-    print(P["hdr"]("TIDES") + "  " + B(where[:max(10, cols - 9)]))
-    via = loc.get("via") or "device"
-    if via == "ip":
-        say("Placed from your network address, which can be miles off: tides differ "
-            "a lot along a coast. Pin your spot:", P["yel"])
-        say("lowpingnews tides -c LAT,LON --label NAME", B, "    ")
-    day = lambda t: ("today" if time.strftime("%Y%m%d", time.localtime(t)) == time.strftime("%Y%m%d", time.localtime(now))
-                     else "tomorrow" if time.strftime("%Y%m%d", time.localtime(t)) ==
-                     time.strftime("%Y%m%d", time.localtime(now + 86400)) else time.strftime("%a", time.localtime(t)))
+
+    def station(name_, dist_, sid_):
+        """Name, distance and NOAA ID on one line; where that cannot fit,
+        the ID whole on the next - never broken across two."""
+        one = "%s%s%s%sNOAA %s" % (name_, dot, dist_, dot, sid_)
+        if len(one) + 3 <= cols:
+            say(one)
+        else:
+            say("%s%s%s" % (name_, dot, dist_))
+            say("NOAA " + sid_)
+
+    def head(title, extra=""):
+        print()
+        print(D("  " + title) + (D("   " + extra) if extra and len(title) + len(extra) + 5 <= cols else ""))
+
+    ymd = lambda t: time.strftime("%Y%m%d", time.localtime(t))
+    # one rule for every day label on the screen, so a list and a sentence never disagree
+    day = lambda t: ("today" if ymd(t) == ymd(now) else "tmrw" if ymd(t) == ymd(now + 86400)
+                     else time.strftime("%a", time.localtime(t)))
     mi = lambda k: "%.0f mi" % (k / 1.609) if k >= 1.6 else "under a mile"
+
+    # ---- where and when, as on the weather screen
+    place = loc.get("label") or "%.3f,%.3f" % (loc["lat"], loc["lon"])
+    lt = time.localtime(now)
+    when_ = "%s %d %s %s" % (time.strftime("%a", lt), lt.tm_mday, time.strftime("%b", lt), clock(now))
+    if len(place) + 2 + len(when_) <= cols:
+        print(P["hdr"](place) + D("  " + when_))
+    else:
+        print(P["hdr"](place[:cols]))
+        print(D("  " + when_))
+    via = loc.get("via") or "device"
+    print(D("  %.4f,%.4f %s" % (loc["lat"], loc["lon"],
+                                 {"pinned": "pinned", "place": "matched", "ip": "from your network address"}.get(via, "via " + via))))
+    if via == "ip":
+        say("A network address can place you miles off, and tides differ along a coast. Pin your spot:", P["yel"])
+        say("lowpingnews tides -c LAT,LON --label NAME", B, "    ")
+
     wire = 0
     try:
         tile, w = tide_tile(loc["lat"], loc["lon"], a.fresh)
@@ -2105,44 +2181,92 @@ def tides_show(a, P, loc):
             "territories; inland, there is no tide to show." % TIDE_KM, P["yel"])
     else:
         dk, sid, name = st[0]
-        say("Station %s, %s away (NOAA %s)" % (name, mi(dk), sid))
         try:
             hilo, w = tide_predictions(sid, a.fresh)
             wire += w
         except Exception as e:
             say("NOAA gave no predictions: %s" % clean(str(e), 120), P["yel"])
+
+    # ---- the reading now, big
     if hilo:
         lvl, up = tide_level(hilo, now)
         nxt = [h for h in hilo if h[0] > now]
-        word = {"H": "High", "L": "Low "}
         if lvl is not None and nxt:
-            print()
-            print("  " + B("Now  %.1f ft and %s" % (lvl, "rising" if up else "falling")) +
-                  D(" \u00b7 %s tide in %s" % ("high" if nxt[0][2] == "H" else "low", dur(nxt[0][0] - now))))
-        print()
-        print("  " + B("Next tides"))
-        for t, v, k in nxt[:4]:
-            print("  %s %s %s %s" % ((P["b"] if k == "H" else D)(word[k]), B(clock(t).rjust(8)),
-                                    ("%.1f ft" % v).rjust(7), D(("in " + dur(t - now)) if t - now < 12 * 3600 else day(t))))
+            arrow = ("+" if up else "-") if asc else ("\u2191" if up else "\u2193")
+            print("  " + B(P["cyn"]("%.1f ft" % lvl)) + "  " + B("%s %s" % (arrow, "Rising" if up else "Falling")))
+            t1, _v1, k1 = nxt[0]
+            say("%s tide %s, in %s" % ("High" if k1 == "H" else "Low", clock(t1) + ("" if day(t1) == "today" else " " + day(t1)),
+                                       dur(t1 - now)))
+            i1 = hilo.index(nxt[0])
+            w0 = near_window(hilo, i1 - 1) if i1 >= 1 else (None, None)
+            w1 = near_window(hilo, i1)
+            word_ = lambda k: "high" if k == "H" else "low"
+            when_ = lambda t: clock(r5(t)) + ("" if day(t) == "today" else " " + day(t))
+            if w0[1] is not None and w0[1] > now and hilo[i1 - 1][0] <= now:      # inside the last one's window
+                say("Within %d ft of %s now, until %s." % (HOLD_FT, word_(hilo[i1 - 1][2]), when_(w0[1])), B)
+            elif w1[0] is not None and w1[1] is not None:
+                if w1[0] <= now:
+                    say("Within %d ft of %s now, until %s." % (HOLD_FT, word_(k1), when_(w1[1])), B)
+                else:
+                    say("Within %d ft of %s from %s to %s, about %s." % (
+                        HOLD_FT, word_(k1), when_(w1[0]), when_(w1[1]), dur(r5(w1[1]) - r5(w1[0]))), B)
+        dk, sid, name = st[0]
+        station(name, mi(dk), sid)
+
+        # ---- next 24 hours: a chart you can time-index, then a sentence
+        lv = [tide_level(hilo, now + i * 3600)[0] for i in range(min(25, max(13, cols - 4)))]
+        lv = [x for x in lv if x is not None]
         win = [h for h in hilo if now <= h[0] <= now + 86400]
-        if win:
+        if len(lv) >= 13 and win:
+            # the true range of the next 24 h: the highs and lows inside it and
+            # the level at its two ends - not hourly samples, which miss the turn
+            ends_ = [x for x in (tide_level(hilo, now)[0], tide_level(hilo, now + 86400)[0]) if x is not None]
+            span_ = [h[1] for h in win] + ends_
+            head("NEXT 24H", ("%.1f\u2013%.1f ft" if not asc else "%.1f-%.1f ft") % (min(span_), max(span_)))
+            print("  " + P["cyn"](spark(lv, asc)))
+            ax = [" "] * (len(lv) + 4)
+            for i in range(0, len(lv), 6):
+                lab = clock(now + i * 3600, short=True) if i else "now"
+                for j, ch in enumerate(lab[:5]):
+                    ax[i + j] = ch
+            print("  " + D("".join(ax).rstrip()))
             hi, lo = max(win, key=lambda h: h[1]), min(win, key=lambda h: h[1])
-            print()
-            say("Water highest %s %s, %.1f ft: least shore showing" % (clock(hi[0]), day(hi[0]), hi[1]), B)
-            say("Water lowest  %s %s, %.1f ft: most shore showing" % (clock(lo[0]), day(lo[0]), lo[1]), B)
-            print()
-            lv = [tide_level(hilo, now + i * 3600)[0] for i in range(25)]
-            lv = [x for x in lv if x is not None]
-            if len(lv) >= 13:
-                bars, a_, b_ = u"\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588", min(lv), max(lv)
-                line = "".join(bars[min(7, int((x - a_) / ((b_ - a_) or 1) * 7.999))] for x in lv)
-                print("  " + P["grn"](line) + D("  next 24 h"))
-                ticks = [" "] * (len(lv) + 4)
-                for i in range(0, len(lv), 6):
-                    lab = clock(now + i * 3600, short=True) if i else "now"
-                    for j, ch in enumerate(lab[:5]):
-                        ticks[i + j] = ch
-                print("  " + D("".join(ticks).rstrip()))
+            say("Highest %s %s, %.1f ft: least shore showing." % (clock(hi[0]), day(hi[0]), hi[1]))
+            say("Lowest %s %s, %.1f ft: most shore showing." % (clock(lo[0]), day(lo[0]), lo[1]))
+
+        # ---- the tide table: day, time, high or low, height - aligned
+        wide = cols >= 46                               # room for the window beside each row
+        print()
+        print(D("  TIDES" + (" " * 26 + "within %d ft" % HOLD_FT if wide else "")))
+        shown = None
+        small_range = False
+        first = len(hilo) - len(nxt)                    # nxt is the tail of hilo, in order
+        for i in range(first, min(first + 4, len(hilo))):
+            t, v, k = hilo[i]
+            dl = day(t) if day(t) != shown else ""       # a day named once, as in a printed tide table
+            shown = day(t)
+            row = "  %-5s %8s  %-5s %6s" % (dl, clock(t), "High" if k == "H" else "Low", "%.1f ft" % v)
+            a_, b_ = near_window(hilo, i)
+            whole = any(abs(hilo[j][1] - v) <= HOLD_FT for j in (i - 1, i + 1) if 0 <= j < len(hilo))
+            small_range = small_range or whole
+            # an edge on another day than its tide says which: past midnight, a bare time reads a day off
+            edge = lambda e: hm(r5(e)) + ("" if day(r5(e)) == day(t) else " " + day(r5(e)))
+            win = ("%s%s%s" % (edge(a_), "-" if asc else "\u2013", edge(b_))
+                   if a_ is not None and b_ is not None and not whole else "")
+            if wide and len(row) + 2 + len(win) > cols - 1:       # a long window gets a line of its own
+                print(B(row) if k == "H" else D(row))
+                print(D(" " * 8 + "within %d ft %s" % (HOLD_FT, win)))
+            elif wide:
+                print((B(row) if k == "H" else D(row)) + D("  " + win))
+            else:
+                print(B(row) if k == "H" else D(row))
+                if win:
+                    print(D(" " * 8 + "within %d ft %s" % (HOLD_FT, win)))
+        if small_range:
+            say("The tide here moves under %d ft between some highs and lows, so the water stays near "
+                "them for hours: no single window to give." % (2 * HOLD_FT), P["yel"])
+
+    # ---- currents
     cur = []
     for x in tile.get("c") or []:
         try:
@@ -2154,9 +2278,7 @@ def tides_show(a, P, loc):
             continue
     cur = sorted(c_ for c_ in cur if c_[0] <= CUR_KM)[:3]
     if cur:
-        print()
-        print("  " + B("Currents"))
-        ev, why, pick = [], "", cur[0]
+        ev, why, pick, fd, ed = [], "", cur[0], None, None
         for cand in cur:              # the nearest NOAA predicts for: some stations have none
             pick = cand
             try:
@@ -2168,7 +2290,13 @@ def tides_show(a, P, loc):
             except Exception as e:    # offline: walking the list would only fail again
                 why = clean(str(e), 120)
                 break
-        say("Station %s, %s away (NOAA %s)" % (pick[2], mi(pick[0]), pick[1]))
+        with_id = "%s%s%s%sNOAA %s" % (pick[2], dot, mi(pick[0]), dot, pick[1])
+        print()
+        if len(with_id) + 14 <= cols:                 # beside the heading, ID and all
+            print(D("  CURRENTS   ") + D(with_id))
+        else:
+            print(D("  CURRENTS"))
+            station(pick[2], mi(pick[0]), pick[1])
         if not ev:
             say("NOAA gave no current predictions: %s" % why, P["yel"])
         else:
@@ -2179,28 +2307,39 @@ def tides_show(a, P, loc):
                 ns = next((e for e in nxt if e[2] == "S"), None)
                 nm = next((e for e in nxt if e[2] != "S"), None)
                 if abs(v) < 0.1:
-                    state, then = "About slack", ("%s in %s" % (label[nm[2]].lower(), dur(nm[0] - now))) if nm else ""
+                    print("  " + B("About slack"))
+                    if nm:
+                        say("%s %s, in %s" % (label[nm[2]], clock(nm[0]), dur(nm[0] - now)))
                 else:
                     to = fd if v > 0 else ed
-                    state = "%s %.1f kn%s" % ("Flooding" if v > 0 else "Ebbing", abs(v), (" toward " + compass(to)) if to is not None else "")
-                    then = ("slack in " + dur(ns[0] - now)) if ns else ("%s in %s" % (label[nm[2]].lower(), dur(nm[0] - now))) if nm else ""
-                print("  " + B("Now  " + state) + (D(" \u00b7 " + then) if then else ""))
-            print()
+                    print("  " + B(P["cyn"]("%.1f kn" % abs(v))) + "  " +
+                          B("%s%s" % ("Flooding" if v > 0 else "Ebbing", (" toward " + compass(to)) if to is not None else "")))
+                    nx_ = ns or nm
+                    if nx_:
+                        say("%s %s%s, in %s" % (label[nx_[2]], clock(nx_[0]),
+                                               "" if day(nx_[0]) == "today" else " " + day(nx_[0]), dur(nx_[0] - now)))
+            shown = None
             for t, kv, k in nxt[:4]:
-                print("  %s %s %s %s" % ((D if k == "S" else B)(label[k].ljust(9)), B(clock(t).rjust(8)),
-                                        ("%.1f kn" % abs(kv) if k != "S" else "").rjust(6),
-                                        D(("in " + dur(t - now)) if t - now < 12 * 3600 else day(t))))
+                dl = day(t) if day(t) != shown else ""
+                shown = day(t)
+                row = "  %-5s %8s  %-9s %s" % (dl, clock(t), label[k], ("%.1f kn" % abs(kv)) if k != "S" else "")
+                print(D(row.rstrip()) if k == "S" else B(row))
             if fd is not None and ed is not None:
-                say("Flood runs %s, ebb runs %s." % (compass(fd), compass(ed)))
+                say("Floods toward %s, ebbs toward %s." % (compass(fd), compass(ed)))
+
+    # ---- moon
     mo = moon(now)
-    print()
-    tip = {"spring": "spring tides: higher highs, lower lows",
-           "neap": "neap tides: a smaller range than usual"}.get(mo["tide"], "")
     md = lambda t: "%s %d" % (time.strftime("%b", time.localtime(t)), time.localtime(t).tm_mday)
-    ev = sorted([(mo["new"], "new"), (mo["full"], "full")])        # the sooner first
-    say("Moon  %s, %d%% lit \u00b7 %s%s" % (
-        mo["name"], round(mo["lit"] * 100), ", ".join("%s %s" % (w, md(t)) for t, w in ev),
-        (" \u00b7 " + tip) if tip else ""), None)
+    print()
+    print(D("  MOON   ") + B("%s" % mo["name"]) + D("%s%d%% lit" % (dot, round(mo["lit"] * 100))))
+    evs = sorted([(mo["new"], "New"), (mo["full"], "Full")])        # the sooner first
+    say(dot.join("%s %s" % (w, md(t)) for t, w in evs).strip())
+    tip = {"spring": "Spring tides: higher highs and lower lows than usual.",
+           "neap": "Neap tides: a smaller range than usual."}.get(mo["tide"], "")
+    if tip:
+        say(tip)
+
+    # ---- buoys: the place first, then its readings
     by = []
     for x in tile.get("b") or []:
         try:
@@ -2209,35 +2348,33 @@ def tides_show(a, P, loc):
         except (IndexError, TypeError, ValueError):
             continue
     by = sorted([b for b in by if b[0] <= BUOY_KM], key=lambda b: b[0])[:2]
+    if by or "nb" in tile:
+        head("BUOYS")
     if by:
-        print()
-        print("  " + B("Buoys"))
         cel = getattr(a, "celsius", False)
         deg = lambda c_: ("%.0f\u00b0C" % c_) if cel else ("%.0f\u00b0F" % (c_ * 9 / 5 + 32))
         for dk, x in by:
             bits = []
-            num = lambda i: float(x[i]) if len(x) > i and isinstance(x[i], (int, float)) else None
+            num = lambda i: float(x[i]) if len(x) > i and isinstance(x[i], (int, float)) and not isinstance(x[i], bool) else None
             if num(5) is not None:
                 bits.append("water " + deg(num(5)))
             if num(6) is not None:
                 bits.append("waves %.1f ft" % (num(6) * 3.281) + (" every %.0f s" % num(7) if num(7) else ""))
             if num(9) is not None:
-                cmp_ = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-                d_ = cmp_[int(((num(8) or 0) + 22.5) // 45) % 8] + " " if num(8) is not None else ""
+                d_ = compass(num(8)) + " " if num(8) is not None else ""
                 bits.append("wind %s%.0f kt" % (d_, num(9) * 1.944))
             if num(11) is not None:
                 bits.append("air " + deg(num(11)))
-            say("%s %s, %s: %s \u00b7 %s" % (clean(str(x[0]), 12), clean(str(x[1] or ""), 50) or "buoy", mi(dk),
-                                         ", ".join(bits) or "no readings", ago(now - float(x[4]))), None)
+            nm_ = buoy_name(x[1] if len(x) > 1 else "") or "Buoy " + clean(str(x[0]), 12)
+            say("%s%s%s%s%s" % (nm_, dot, mi(dk), dot, ago(now - float(x[4]))), B)
+            say(dot.strip().join(" %s " % b_ for b_ in bits).strip() if bits else "no readings", None, "    ")
     elif "nb" in tile:                # a real tile: say why the list is empty
-        print()
-        print("  " + B("Buoys"))
         say("No buoy readings on the site right now: NDBC did not answer its last build." if not tile.get("nb")
             else "No buoy within %d mi has reported in the last %d hours." % (BUOY_KM / 1.609, BUOY_FRESH // 3600))
     print()
-    say("Predictions, not observations: wind and pressure can shift the water by a foot or more. "
-        "%s used." % kbs(wire) if wire else "Predictions, not observations: wind and pressure "
-        "can shift the water by a foot or more. Nothing downloaded.")
+    say("Heights are above NOAA's average lowest tide (MLLW), so a low can read below 0. "
+        "Windows: when the water is within %d ft of each high or low, from NOAA's times, to about 5 min. "
+        "Wind and pressure can shift real water a foot or more.%s" % (HOLD_FT, " %s used." % kbs(wire) if wire else ""))
     return 0
 
 

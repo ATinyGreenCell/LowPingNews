@@ -226,5 +226,29 @@ test("currents: NOAA's events, the stream between them, and hostile rows", () =>
   assert.equal(C.parseCurrents("<html>").ev.length, 0);
   assert.equal(C.parseCurrents({ current_predictions: { cp: "x" } }).error, "no predictions");
 });
+test("how long a tide holds: exact against a minute-by-minute walk", () => {
+  const H = 3600;
+  const cases = [[[0, 0.4, "L"], [6.2 * H, 7.3, "H"], [12.4 * H, 0.7, "L"], [18.6 * H, 7.7, "H"], [24.8 * H, 0.5, "L"]],
+                 [[0, 6.9, "H"], [5.5 * H, -0.6, "L"], [12.9 * H, 5.1, "H"], [18 * H, 1.2, "L"], [25 * H, 7.0, "H"]],
+                 [[0, 2.0, "H"], [6 * H, 1.4, "L"], [12 * H, 3.9, "H"], [18.5 * H, 0.2, "L"], [24 * H, 3.0, "H"]]];
+  for (const h of cases) for (let i = 1; i < h.length - 1; i++) {
+    const w = C.nearWindow(h, i), [t0, v] = h[i];
+    const walk = (step, stop) => {
+      let x = t0;
+      while ((x + step - stop) * step <= 0) {
+        const l = C.tideLevel(h, x + step);
+        if (!l || Math.abs(l.level - v) > 1) break;
+        x += step;
+      }
+      return x;
+    };
+    assert.ok(Math.abs(w.start - walk(-60, h[i - 1][0])) <= 60 && Math.abs(w.end - walk(60, h[i + 1][0])) <= 60, JSON.stringify([h[i], w]));
+  }
+  const w = C.nearWindow(cases[0], 1);
+  assert.ok(Math.abs(w.end - w.start - 3 * H) < 600 && !w.whole, "a 7 ft tide holds within a foot about 3 h (rule of twelfths)");
+  assert.ok(C.nearWindow(cases[2], 1).whole, "a side under 1 ft is flagged, never passed off as a hold");
+  assert.equal(C.nearWindow(cases[0], 0).start, null, "no neighbouring tide predicted: unknown, not guessed");
+  assert.equal(C.round5(1000), 900);
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);
