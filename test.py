@@ -3130,6 +3130,332 @@ def t_moon_and_tide_maths(env, srv):
     assert m.dur(45 * 60) == "45 min" and m.dur(130 * 60) == "2 h 10 min" and m.dur(120 * 60) == "2 h"
 
 
+def _inproc():
+    """The app in this process with every cache path in a scratch folder: an
+    in-process test must never read or write the real ones."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="lpn-inproc-")
+    m.CD = d
+    for k in ("WXC", "NWSC", "TIDEC"):
+        setattr(m, k, os.path.join(d, os.path.basename(getattr(m, k))))
+    return m, d
+
+
+HOSTILE = re.compile(u"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\ud800-\udfff]")
+
+
+@test
+def t_hostile_feeds_never_freeze_or_leak(env, srv):
+    m = load()
+    t0 = time.time()
+    m.parse_loose(("<rss>" + "<item>" * 50000).encode())
+    m.parse_loose(("<item><title>x" * 20000).encode())
+    m.extract(("<head>" + "<meta name=x " * 150000).encode())
+    m.extract(("<p>" + "<!--" * 20000 + "</p>").encode())
+    assert time.time() - t0 < 6, "unclosed tags must cost linear time (this took 68 s once): %.1fs" % (time.time() - t0)
+    cut = ("<rss><channel><item><title>Kept \x1b[2J\u202eone</title><link>https://a.example/1</link></item>"
+           "<item><title>Second</title><link>javascript:alert(1)</link></item><item><title>Third").encode()
+    got = m.parse_loose(cut)
+    assert [x["ti"] for x in got] == ["Kept one", "Second"] and got[1]["u"] == "", got
+    hn = json.dumps({"hits": [{"title": "Good", "url": "https://a.example/", "points": 5, "num_comments": 2, "created_at_i": 1700000000},
+                              {"title": "Bad counts", "points": "many", "num_comments": None, "created_at_i": "x", "objectID": "\x1b[2J"},
+                              "not an object", {"title": "\ud83d lone", "objectID": "123"}]}).encode()
+    hits = m.parse_hn(hn)
+    assert [h["ti"] for h in hits] == ["Good", "Bad counts", "lone"], hits
+    assert hits[1]["s"] == "0 points, 0 comments" and hits[1]["u"] == "" and hits[1]["d"] == 0
+    assert hits[2]["u"] == "https://news.ycombinator.com/item?id=123"
+    for junk in (b"[]", b"null", b'"x"', b'{"hits": 5}', b'{"resultList": [1, 2]}'):
+        assert m.parse_hn(junk) == [] and m.parse_epmc(junk) == [], junk
+    ep = json.dumps({"resultList": {"result": [{"title": "A", "pmid": "123", "source": "MED", "journalTitle": {"x": 1}},
+                                               {"title": "B", "doi": "10.1101/x\x1b", "source": "PPR", "firstPublicationDate": 2024},
+                                               None, {"title": "C", "doi": "10.1101/2024.01.01.000001", "source": "PPR"}]}}).encode()
+    eps = m.parse_epmc(ep)
+    assert [e["ti"] for e in eps] == ["A", "B", "C"] and eps[1]["u"] == "" and eps[2]["u"].startswith("https://doi.org/10.1101/"), eps
+    for s_ in ("\ud83d", "a\udc00b", "\x9b31m", "\u2066x\u2069", "x\u2028y"):
+        out_ = m.clean(s_)
+        out_.encode("utf-8")                      # must not raise: a lone surrogate cannot be written anywhere
+        assert not HOSTILE.search(out_), repr(s_)
+    assert m.clean("Kept \x1b[2J\u202eone \x1b]0;title\x07x \x9b31mred") == "Kept one x red", "whole escape sequences go"
+    assert m.clean("plain [2J text") == "plain [2J text", "text that only looks like one stays"
+    assert m.clean(float("nan")) == "" and m.clean(float("inf")) == "" and m.clean([None]) == "" and m.clean(7) == "7"
+    assert m.clean_alert([None], 50) == "" and m.clean_alert(float("nan"), 9) == ""
+
+
+@test
+def t_links_are_never_terminal_controls(env, srv):
+    m = load()
+    for bad in ("https://a.example/\x1b[2J", "https://a.example/\u202e", "https://a.example/\ud83d", "https://a.example/\x9bx",
+                "https://", "https:///path", "javascript:alert(1)", "ftp://a.example/", "https://a.example/" + "x" * 3000,
+                "https://a.example/\x00", 'https://a.example/"><script>', None, 5, ["https://a.example/"]):
+        assert m.safe_url(bad) == "", repr(bad)[:60]
+    assert m.safe_url(" https://a.example/a b ") == "https://a.example/a%20b", "a stray space is encoded, not fatal"
+    assert m.safe_url("HTTPS://A.example/x?y=1#z") == "HTTPS://A.example/x?y=1#z"
+    assert m.safe_url("https://a.example") == "https://a.example" and m.safe_url("https://\u00e9t\u00e9.example/\u00e9") != ""
+
+
+def _forecast(now):
+    hrs = [now + 3600 * i for i in range(24)]
+    days = [now - now % 86400 + 86400 * i for i in range(7)]
+    return {"utc_offset_seconds": -14400, "current": {"time": now, "temperature_2m": 61.3, "apparent_temperature": 59.0,
+            "weather_code": 2, "wind_speed_10m": 8.2, "wind_gusts_10m": 15.1, "wind_direction_10m": 230, "relative_humidity_2m": 70,
+            "is_day": 1}, "hourly": {"time": hrs, "temperature_2m": [60.0 + i % 5 for i in range(24)],
+            "precipitation_probability": [0] * 24, "precipitation": [0.0] * 24, "weather_code": [2] * 24},
+            "daily": {"time": days, "weather_code": [2, 3, 61, 0, 1, 95, 71], "temperature_2m_max": [65, 66, 60, 70, 71, 59, 50],
+                      "temperature_2m_min": [50, 52, 48, 55, 56, 45, 33], "precipitation_probability_max": [0, 20, 80, 0, 5, 90, 40],
+                      "precipitation_sum": [0, 0.1, 0.8, 0, 0, 1.2, 0.3], "sunrise": [d + 25000 for d in days],
+                      "sunset": [d + 66000 for d in days]}}
+
+
+@test
+def t_weather_never_invents_a_reading(env, srv):
+    """A reading missing from the reply stays missing: never calm wind, 0%
+    humidity, dry skies or a clear day."""
+    import contextlib
+    m, d = _inproc()
+    try:
+        now = int(time.time())
+        f = _forecast(now)
+        for k in ("wind_speed_10m", "wind_gusts_10m", "wind_direction_10m", "relative_humidity_2m", "weather_code"):
+            f["current"][k] = None
+        f["hourly"]["precipitation_probability"] = [None] * 24
+        f["daily"]["precipitation_probability_max"][1] = None
+        f["daily"]["weather_code"][2] = None
+        c = m.wx_clean(f)
+        assert c and c["current"]["wind_speed_10m"] is None and c["current"]["relative_humidity_2m"] is None
+        a = m.fastparse(["weather"]) or m.argparse_ns({})
+        a.unit, a.ascii = "fahrenheit", False
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m.wx_show(a, m.pal(False), {"lat": 40.9, "lon": -73.4, "label": "Test", "via": "pinned"}, f, 100, 0, False)
+        out = buf.getvalue()
+        for lie in ("Wind calm", "Humidity 0%", "No rain expected"):
+            assert lie not in out, "invented %r:\n%s" % (lie, out)
+        assert "Rain chance not reported" in out and "Unknown" in out and "\u2013" in out, out
+        assert "61\u00b0F" in out and "Feels like 59" in out, "what is known is still shown:\n" + out
+        for junk in (None, [], {"current": {}}, {"current": {"time": now, "temperature_2m": float("nan")}},
+                     {"current": {"time": "x", "temperature_2m": 50}}):
+            assert m.wx_clean(junk) is None, junk
+        f2 = _forecast(now)
+        f2["hourly"]["temperature_2m"][5] = None                 # a broken hour ends the run of hours
+        f2["daily"]["temperature_2m_max"][3] = "hot"              # a day without both temperatures is dropped
+        f2["current"]["relative_humidity_2m"] = 140               # impossible: not reported
+        c2 = m.wx_clean(f2)
+        assert len(c2["hourly"]["time"]) == 5 and len(c2["daily"]["time"]) == 6 and c2["current"]["relative_humidity_2m"] is None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def t_a_bad_forecast_never_replaces_a_good_one(env, srv):
+    m, d = _inproc()
+    try:
+        now = int(time.time())
+        reply = [json.dumps(_forecast(now)).encode()]
+        m.get = lambda url, *a_, **k_: (reply[0], {}, len(reply[0]), False)
+        loc = {"lat": 40.9, "lon": -73.4}
+        good, w, age, stale = m.wx_fetch(loc, "fahrenheit", True)
+        assert good and not stale and os.path.exists(m.WXC)
+        for broken in (b'{"current": {"time": 1}}', b"[]", b"<html>oops</html>", b'{"error": true, "reason": "\x1b[2Jbusy"}'):
+            reply[0] = broken
+            again, w, age, stale = m.wx_fetch(loc, "fahrenheit", True)
+            assert stale and again["current"]["temperature_2m"] == 61.3, "a broken reply must fall back to the good forecast"
+            assert json.load(io.open(m.WXC))["d"]["current"]["temperature_2m"] == 61.3, "and must never be cached"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def t_screens_survive_hostile_data(env, srv):
+    """Weather, radio and tides, through their real fetch, parse and cache code,
+    fed mutated replies: never a crash, never a control character on screen."""
+    import contextlib, random
+    m, d = _inproc()
+    R = random.Random(20261004)
+    now = int(time.time())
+    junk = [None, "", "x", "\x1b[2J\u202e\ud83d", -1, 1e308, float("nan"), float("-inf"), True, [], {}, [None], 10 ** 20]
+
+    def mut(v, rate=0.15):
+        if R.random() < rate:
+            return R.choice(junk)
+        if isinstance(v, dict):
+            return {k: mut(x, rate) for k, x in v.items() if R.random() > rate / 3}
+        if isinstance(v, list):
+            return [mut(x, rate) for x in (v[:R.randint(0, len(v))] if R.random() < rate else v)]
+        return v
+    g = lambda t: time.strftime("%Y-%m-%d %H:%M", time.gmtime(t))
+    tile = {"v": 1, "nb": 40, "s": [["8516945", "Northport, NY", 40.9, -73.35]], "c": [["ACT3116", "Northport Bay", 40.93, -73.36, 1]],
+            "b": [["44040", "W LIS", 40.956, -73.58, now - 1200, 18.0, 0.5, 4.0, 225, 6.2, 8.0, 19.0]]}
+    preds = {"predictions": [{"t": g(now + h * 3600), "v": v, "type": k} for h, v, k in
+                             [(-4, "0.3", "L"), (2.5, "7.4", "H"), (8.5, "0.1", "L"), (14.5, "6.9", "H"), (21, "-0.2", "L")]]}
+    cur = {"current_predictions": {"cp": [{"Type": k, "Time": g(now + h * 3600), "Velocity_Major": v, "meanFloodDir": 95,
+                                           "meanEbbDir": 275} for k, h, v in [("slack", -3, 0), ("ebb", 0.5, -0.4), ("slack", 4, 0)]]}}
+    points = {"properties": {"forecast": "https://api.weather.gov/gridpoints/OKX/1,1/forecast", "gridId": "OKX",
+                             "relativeLocation": {"properties": {"city": "Huntington", "state": "NY"}},
+                             "forecastZone": "https://api.weather.gov/zones/forecast/NYZ078"}}
+    alerts = {"features": [{"properties": {"event": "Coastal Flood Advisory", "severity": "Minor", "status": "Actual",
+              "headline": "x", "description": "* WHAT...flooding.", "ends": "2099-01-01T00:00:00-05:00"}}]}
+    fc = {"properties": {"periods": [{"name": "Tonight", "detailedForecast": "Clear.", "temperature": 50, "temperatureUnit": "F",
+                                      "isDaytime": False}]}}
+    loc = {"lat": 40.871, "lon": -73.426, "label": "Huntington", "via": "pinned"}
+    bad = []
+    try:
+        for i in range(120):
+            os.environ["COLUMNS"] = str(R.choice([16, 46, 120]))
+            P = m.pal(R.random() < 0.5)
+            jobs = []
+            fx = mut(_forecast(now))
+            a1 = m.fastparse(["weather"]) or m.argparse_ns({})
+            a1.unit, a1.ascii = R.choice(["fahrenheit", "celsius"]), R.random() < 0.2
+            jobs.append(("weather", lambda: m.wx_show(a1, P, loc, fx, 1, 0, False)))
+            pay = (mut(points), mut(alerts), mut(fc))
+            m.nws_get = lambda url, cap, pay=pay: (pay[0] if "/points/" in url else pay[1] if "/alerts" in url else pay[2], 9)
+            a2 = m.fastparse(["radio"]) or m.argparse_ns({})
+            a2.fresh = True
+            jobs.append(("radio", lambda: m.radio_show(a2, P, loc, m.nws_fetch(loc, True, None))))
+            tp = (mut(tile), mut(preds), mut(cur))
+            m.get = lambda url, *a_, tp=tp, **k_: (json.dumps(tp[0] if "/data/tides/" in url else tp[2] if "currents" in url
+                                                              else tp[1]).encode("utf-8", "surrogatepass"), {}, 9, False)
+            a3 = m.fastparse(["tides"]) or m.argparse_ns({})
+            a3.fresh = True
+            jobs.append(("tides", lambda: m.tides_show(a3, P, loc)))
+            for name, job in jobs:
+                for f_ in os.listdir(d):
+                    os.remove(os.path.join(d, f_))
+                buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        job()
+                except SystemExit:
+                    pass
+                except Exception as e:
+                    bad.append("%s: %s: %s" % (name, type(e).__name__, str(e)[:80]))
+                    continue
+                h = HOSTILE.search(buf.getvalue())
+                if h:
+                    bad.append("%s: %r on screen" % (name, h.group()))
+        assert not bad, "%d failures, e.g.:\n  %s" % (len(bad), "\n  ".join(sorted(set(bad))[:8]))
+    finally:
+        os.environ.pop("COLUMNS", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def t_a_slow_server_cannot_hold_the_refresh(env, srv):
+    """A server dripping a byte at a time never trips an idle timeout; one that
+    hangs makes its other feeds wait in line. Neither may hold the refresh, and
+    a healthy feed on another server still arrives."""
+    def drip(h):
+        h.send_response(200)
+        h.send_header("Content-Length", "100000")
+        h.end_headers()
+        try:
+            for _ in range(200):
+                h.wfile.write(b"<")
+                h.wfile.flush()
+                time.sleep(0.3)
+        except OSError:
+            pass
+
+    def hang(h):
+        time.sleep(30)
+    srv.routes["/drip"] = drip
+    srv.routes["/hang1"] = hang
+    srv.routes["/hang2"] = hang
+    srv.feed("/fine", [item("A healthy feed on another server")])
+    port = srv.url("/").split(":")[2].split("/")[0]
+    sources(env, [{"id": "dr", "name": "Drip", "url": srv.url("/drip"), "cats": ["top"], "kind": "rss", "timeout": 1},
+                  {"id": "h1", "name": "Hang one", "url": srv.url("/hang1"), "cats": ["top"], "kind": "rss", "timeout": 1},
+                  {"id": "h2", "name": "Hang two", "url": srv.url("/hang2"), "cats": ["top"], "kind": "rss", "timeout": 1},
+                  {"id": "ok", "name": "Fine", "url": "http://localhost:%s/fine" % port, "cats": ["top"], "kind": "rss"}])
+    t0 = time.time()
+    out, err, rc = run(dict(env, LPN_REQ_MAX="3"), "--plain", "-f", "all")
+    took = time.time() - t0
+    assert "Traceback" not in err and "A healthy feed on another server" in out, out + err
+    assert took < 15, "a dripping and two hanging feeds held the refresh %.1f s (each alone is bounded)" % took
+
+
+@test
+def t_web_policy_allows_exactly_what_the_app_uses(env, srv):
+    """The page's security policy: every service the app's code contacts is
+    allowed (or a new feature would be silently blocked on the phone), nothing
+    more is, scripts are its own only, and the built site names the real reader."""
+    page = io.open(os.path.join(WEB, "static", "index.html"), encoding="utf-8").read()
+    pol = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', page)
+    assert pol, "the page must carry a security policy"
+    rules = dict((r.split()[0], r.split()[1:]) for r in pol.group(1).split(";") if r.strip())
+    assert rules["script-src"] == ["'self'"] and rules["object-src"] == ["'none'"] and rules["base-uri"] == ["'none'"]
+    code = "".join(io.open(os.path.join(WEB, "src", f), encoding="utf-8").read() for f in ("app.ts", "sw.ts", "core.ts"))
+    # hosts that only appear as links shown to the reader, never fetched by the page
+    shown_only = {"https://github.com", "https://doi.org"}
+    used = set(re.findall(r"https://[a-z0-9.-]+\.[a-z]{2,}", code)) - shown_only
+    for h in shown_only:                       # and they really are never fetched
+        assert not re.search(r"(fetch|getJSON)\(\s*[\"']" + re.escape(h), code), h + " is fetched: allow it in the policy"
+    allowed = set(x for x in rules["connect-src"] if x.startswith("https://"))
+    assert used <= allowed, "contacted but not allowed: %s" % sorted(used - allowed)
+    assert allowed <= used, "allowed but never contacted: %s" % sorted(allowed - used)
+    assert "__READER_ORIGIN__" in rules["connect-src"], "the reader's origin is filled in by the build"
+    tmp = tempfile.mkdtemp()
+    try:
+        fl = os.path.join(tmp, "feeds.json")
+        json.dump([], io.open(fl, "w"))
+        for reader, want in (("https://lpn-reader.someone.workers.dev/", "https://lpn-reader.someone.workers.dev"), ("", None)):
+            out = os.path.join(tmp, "site")
+            shutil.rmtree(out, ignore_errors=True)
+            r = subprocess.run([sys.executable, os.path.join(WEB, "build_digest.py"), out], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=dict(env, LPN_WEB_FEEDS=fl, LPN_READER_URL=reader, LPN_TIDE_META=NOWHERE, LPN_NDBC=NOWHERE,
+                                        LPN_CURRENT_META=NOWHERE), timeout=120)
+            assert r.returncode == 0, r.stderr.decode()[-300:]
+            built = io.open(os.path.join(out, "index.html"), encoding="utf-8").read()
+            assert "__READER_ORIGIN__" not in built, "the placeholder must never reach the phone"
+            cs = re.search(r'Content-Security-Policy" content="([^"]+)"', built).group(1)
+            conn = [r_ for r_ in cs.split(";") if r_.strip().startswith("connect-src")][0].split()
+            assert (want in conn) if want else not any("workers.dev" in x for x in conn), conn
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_the_command_runs_from_cached_bytecode(env, srv):
+    """lowpingnews loads news as a module, so Python keeps its compiled bytecode
+    (a script is recompiled every run: ~70% of a warm list). Same behaviour as
+    running news directly; the cache lives in the cache folder; an updated news
+    is never served from a stale cache."""
+    tmp = tempfile.mkdtemp()
+    try:
+        bin_ = os.path.join(tmp, "bin")
+        os.makedirs(bin_)
+        for f in ("news", "lowpingnews"):
+            shutil.copy(os.path.join(HERE, f), os.path.join(bin_, f))
+            os.chmod(os.path.join(bin_, f), 0o755)
+        e = dict(env, PREFIX=tmp)
+        w = lambda *a: subprocess.run(["sh", os.path.join(bin_, "lowpingnews")] + list(a), env=e, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, timeout=60)
+        direct = subprocess.run([sys.executable, os.path.join(bin_, "news"), "--version"], env=e, stdout=subprocess.PIPE, timeout=60)
+        r1, r2 = w("--version"), w("--version")
+        assert r1.returncode == 0 and r1.stdout == r2.stdout == direct.stdout, (r1.stdout, r2.stdout, direct.stdout, r1.stderr[-300:])
+        pyc = [os.path.join(dp, f) for dp, _d, fs in os.walk(os.path.join(env["XDG_CACHE_HOME"], "lowpingnews", "pyc"))
+               for f in fs if f.endswith(".pyc")]
+        assert pyc, "the compiled bytecode should be kept in the cache folder"
+        assert not os.path.exists(os.path.join(bin_, "__pycache__")), "never a __pycache__ beside the program"
+        bad = w("--no-such-flag-anywhere")
+        assert bad.returncode != 0 and b"Traceback" not in bad.stderr, "errors exit the same way, without a traceback"
+        probe = subprocess.run(["sh", "-c", 'printf "%%s" "$(sh %s/lowpingnews --version)"' % bin_], env=e, stdout=subprocess.PIPE)
+        assert probe.stdout.strip() == direct.stdout.strip()
+        src = io.open(os.path.join(bin_, "news"), encoding="utf-8").read()
+        new = re.sub(r'^VERSION = "[^"]+"', 'VERSION = "99.9"', src, count=1, flags=re.M)
+        io.open(os.path.join(bin_, "news"), "w", encoding="utf-8").write(new + "\n# changed\n")
+        assert b"99.9" in w("--version").stdout, "an updated news must never be served from the old cache"
+        argv0 = subprocess.run([sys.executable, "-c", "import sys; print(sys.argv)"], stdout=subprocess.PIPE).returncode == 0
+        src2 = io.open(os.path.join(bin_, "news"), encoding="utf-8").read().replace(
+            "def main():", "def main():\n    if os.environ.get('LPN_PROBE_ARGV0'):\n        print('ARGV0=' + sys.argv[0]); return\n", 1)
+        io.open(os.path.join(bin_, "news"), "w", encoding="utf-8").write(src2)
+        got = subprocess.run(["sh", os.path.join(bin_, "lowpingnews"), "--version"], env=dict(e, LPN_PROBE_ARGV0="1"),
+                             stdout=subprocess.PIPE, timeout=60).stdout.decode()
+        assert argv0 and "ARGV0=" + os.path.join(bin_, "news") in got, "self-update finds itself by argv[0]: " + got
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @test
 def t_how_long_a_tide_holds_is_exact(env, srv):
     """The window within 1 ft of each high and low, against a minute-by-minute

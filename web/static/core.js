@@ -1,16 +1,23 @@
-export const APP_VERSION = "9.5";
+export const APP_VERSION = "9.6";
 export const SHOW = 10;
 export const MORE = 10;
-const CTRL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
+const ANSI = /(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,2000}(?:\x07|\x1b\\|\x9c)?|\x1b[@-Z\\\-_]/g;
+const CTRL = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]/gu;
+export function cut(s, n) {
+    if (s.length <= n)
+        return s;
+    const c = s.charCodeAt(n - 1);
+    return s.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+}
 export function cleanParas(v, max) {
     if (typeof v !== "string")
         return "";
-    return v.split(/\n\s*\n/).map((p) => cleanText(p, max)).filter(Boolean).join("\n\n").slice(0, max);
+    return cut(v.split(/\n\s*\n/).map((p) => cleanText(p, max)).filter(Boolean).join("\n\n"), max);
 }
 export function cleanText(v, max) {
     if (typeof v !== "string")
         return "";
-    return v.replace(CTRL, " ").replace(/\s+/g, " ").trim().slice(0, max);
+    return cut(v.replace(ANSI, "").replace(CTRL, " ").replace(/\s+/g, " ").trim(), max);
 }
 export function safeUrl(v) {
     if (typeof v !== "string" || v.length > 2000)

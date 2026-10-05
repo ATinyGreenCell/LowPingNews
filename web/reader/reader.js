@@ -8,7 +8,7 @@
 //
 // Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
 // file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
-const VERSION = "9.5";
+const VERSION = "9.6";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -31,19 +31,44 @@ export function decodeEntities(s) {
         return NAMED[e.toLowerCase()] ?? m;
     });
 }
-const CTRL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
-const tidy = (s) => decodeEntities(s).replace(CTRL, " ").replace(/\s+/g, " ").trim();
+// the u flag makes the surrogate range match only LONE surrogates (from a
+// JSON "\ud83d" alone); without it, the halves of every emoji would go too
+const CTRL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]/gu;
+const ANSI = /(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,2000}(?:\x07|\x1b\\|\x9c)?|\x1b[@-Z\\\-_]/g;
+const tidy = (s) => decodeEntities(s).replace(ANSI, "").replace(CTRL, " ").replace(/\s+/g, " ").trim();
 /** Paragraph text only, like the terminal reader. */
+/** Comments and the contents of script-like blocks, removed whole (so a "<"
+ *  inside a script can never open a tag) in ONE forward pass. Lazy regexes
+ *  (<!--[\s\S]*?-->) rescan to the end from every unclosed opening: a page of
+ *  unclosed "<!--" cost quadratic CPU, and a Worker's CPU limit is ~10 ms. */
+export function stripBlocks(html) {
+    const lower = html.replace(/[A-Z]+/g, (x) => x.toLowerCase()); // ASCII only: the same length
+    const open = /<!--|<(script|style|noscript|svg|template|iframe)\b/g;
+    let out = "", i = 0, m;
+    while ((m = open.exec(lower))) {
+        out += html.slice(i, m.index) + " ";
+        const close = m[1] ? lower.indexOf("</" + m[1], open.lastIndex) : lower.indexOf("-->", open.lastIndex);
+        if (close < 0)
+            return out; // never closed: the rest is not text
+        const gt = m[1] ? lower.indexOf(">", close) : close + 2;
+        if (gt < 0)
+            return out;
+        i = gt + 1;
+        open.lastIndex = i;
+    }
+    return out + html.slice(i);
+}
 export function extract(html) {
-    // contents that are not text at all: removed whole, so a "<" inside a
-    // script can never open a tag
-    const h = html.replace(/<!--[\s\S]*?-->/g, " ")
-        .replace(/<(script|style|noscript|svg|template|iframe)\b[\s\S]*?<\/\1\s*>/gi, " ");
+    const h = stripBlocks(html);
     const out = [];
     let depth = 0, cur = null;
+    // a tag match can only fail by running off the end where no ">" is left; text
+    // after the last ">" holds no tag, so it is set aside first: no rescans, linear
     const re = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*?(\/?)>|([^<]+)|</g;
     let m;
-    while ((m = re.exec(h)) && out.length < MAX_PARAS) {
+    const cut = h.lastIndexOf(">") + 1;
+    const body0 = h.slice(0, cut);
+    while ((m = re.exec(body0)) && out.length < MAX_PARAS) {
         if (m[4] !== undefined) {
             if (!depth && cur)
                 cur.push(m[4]);
@@ -82,6 +107,25 @@ export function extract(html) {
     }
     return body;
 }
+/** Every <meta ...> tag in the text, found in one forward pass (at most 400, each at most 4 KB). */
+export function metaTags(head) {
+    const lower = head.replace(/[A-Z]+/g, (x) => x.toLowerCase());
+    const out = [];
+    let i = 0;
+    while (out.length < 400) {
+        const at = lower.indexOf("<meta", i);
+        if (at < 0)
+            break;
+        const gt = lower.indexOf(">", at);
+        if (gt < 0)
+            break; // no tag can close past here
+        const last = lower.lastIndexOf("<meta", gt); // unclosed ones before it: the tag that closes here
+        if (gt - last <= 4096)
+            out.push(head.slice(last, gt + 1));
+        i = gt + 1;
+    }
+    return out;
+}
 export function metaFallback(html) {
     const m = /"articleBody"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(html);
     if (m) {
@@ -96,14 +140,22 @@ export function metaFallback(html) {
     }
     // journals and preprint servers tag the abstract itself; a page's general
     // description is often a site-wide tagline ("bioRxiv - the preprint server
-    // for biology..."), so it must be long to count
-    for (const re of [/<meta[^>]+name=["']citation_abstract["'][^>]+content=["']([^"']{80,})/i,
-        /<meta[^>]+name=["']dc\.description["'][^>]+content=["']([^"']{80,})/i,
-        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{160,})/i,
-        /<meta[^>]+name=["']description["'][^>]+content=["']([^"']{160,})/i]) {
-        const d = re.exec(html);
-        if (d)
-            return tidy(d[1]);
+    // for biology..."), so it must be long to count. Description tags live in the
+    // head: searching only there is faster on every page, and bounded repeats keep
+    // a page of unclosed <meta from going quadratic.
+    // each meta tag is found once, in one pass over the head, and only the small
+    // tag string is searched: linear whatever the page holds (a regex per tag
+    // start rescanned the head, 400 ms on a page of unclosed <meta)
+    const tags = metaTags(html.slice(0, 200000));
+    for (const [attr, name, min] of [["name", "citation_abstract", 80], ["name", "dc.description", 80],
+        ["property", "og:description", 160], ["name", "description", 160]]) {
+        for (const tg of tags) {
+            const n = new RegExp("\\b" + attr + "\\s*=\\s*[\"']" + name.replace(".", "\\.") + "[\"']", "i").test(tg);
+            const c = n ? /\bcontent\s*=\s*"([^"]*)"|\bcontent\s*=\s*'([^']*)'/i.exec(tg) : null;
+            const v = c ? (c[1] ?? c[2] ?? "") : "";
+            if (v.length >= min)
+                return tidy(v);
+        }
     }
     return "";
 }

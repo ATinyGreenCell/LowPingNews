@@ -198,7 +198,8 @@ install_launchers() {
   # else's - an older weather script is the user's to keep or move.
   w="$BIN/weather"
   sh_="$(command -v sh || echo /bin/sh)"
-  want="$(printf '#!%s\n%s\nexec "%s" weather "$@"\n' "$sh_" "$LAUNCH_MARK" "$BIN/news")"
+  # through the wrapper, so it too runs from cached bytecode
+  want="$(printf '#!%s\n%s\nexec "%s" weather "$@"\n' "$sh_" "$LAUNCH_MARK" "$BIN/lowpingnews")"
   if [ -e "$w" ] || [ -L "$w" ]; then
     if [ -L "$w" ] || ! grep -qF "$LAUNCH_MARK" "$w" 2>/dev/null; then
       say "kept your own $w - it is not ours, so \`weather\` still runs it"
@@ -224,7 +225,7 @@ check_shadows() {
     esac
     for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
       [ -f "$rc" ] || continue
-      grep -nE "^[[:space:]]*(alias[[:space:]]+$c=|(function[[:space:]]+)?$c[[:space:]]*\(\))" "$rc" 2>/dev/null \
+      grep -nE "^[[:space:]]*(alias[[:space:]]+${c}=|(function[[:space:]]+)?${c}[[:space:]]*\(\))" "$rc" 2>/dev/null \
         | grep -v -e lowpingnews -e 'lpn' | head -2 | while IFS=: read -r ln _rest; do
           say "note: $rc line $ln redefines \`$c\` in your shell, hiding LowPingNews"
           say "  delete that line, then run: unalias $c 2>/dev/null; hash -r"
@@ -601,6 +602,20 @@ cmd_clean() {
   say "removed $n stale download(s)"
 }
 
+# Run news through Python's module loader, not as a script: a script is
+# compiled from source on every run (~70 ms of a ~95 ms warm list), while a
+# loaded module's bytecode is cached and reused until the file changes (its
+# size and time are checked). Still __main__, same arguments, same argv[0].
+# The cache lives in the cache folder, not as __pycache__ beside the program.
+run_news() {
+  exec "$PY" -c 'import os, sys, importlib.machinery as M, importlib.util as U
+c = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+sys.pycache_prefix = os.path.join(c, "lowpingnews", "pyc")
+p = sys.argv[1]; sys.argv = sys.argv[1:]
+l = M.SourceFileLoader("__main__", p); m = U.module_from_spec(U.spec_from_loader("__main__", l))
+sys.modules["__main__"] = m; l.exec_module(m)' "$BIN/news" "$@"
+}
+
 usage() {
   cat <<'EOF'
 lowpingnews - the reader, plus its dev loop
@@ -635,7 +650,7 @@ EOF
 c="${1:-}"
 case "$c" in
   update|status|sync|install|test|pull|ship|release|clean|web|reader|-h|--help|help) shift ;;
-  *) exec "$BIN/news" "$@" ;;
+  *) run_news "$@" ;;
 esac
 case "$c" in
   update)  cmd_update ;;

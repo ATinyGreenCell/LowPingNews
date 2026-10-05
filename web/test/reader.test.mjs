@@ -195,6 +195,26 @@ await test("currents: one fixed NOAA query, only a station, its bin and a date p
   assert.equal((await curAsk("cur=ACT3496&bin=1&d=20261003", "https://evil.example")).status, 403);
   assert.equal((await curAsk("cur=ACT0000&bin=1&d=20261003")).status, 502);
 });
+await test("hostile pages cost linear time, and the text stays clean", () => {
+  const pages = ["<p>hi</p>" + "<!--".repeat(20000) + "x".repeat(400000), "<script>".repeat(30000), "<p".repeat(300000),
+                 "<head>" + "<meta name=x ".repeat(150000), "<".repeat(1500000)];
+  for (const p of pages) {
+    const t = performance.now();
+    R.extract(p);
+    assert.ok(performance.now() - t < 150, "took " + (performance.now() - t).toFixed(0) + " ms on " + JSON.stringify(p.slice(0, 20)));
+  }
+  const page = "<html><head><meta name=\"citation_abstract\" content=\"" + "An abstract that is long enough. ".repeat(4) + "\"></head>" +
+               "<body><!-- <p>hidden comment paragraph that should never show up here</p> --><script>var p = '<p>not text</p>';</script>" +
+               "<p>A real paragraph about tides \ud83c\udf0a with a lone \ud83d and \u001b[2Jescape code in it. " +
+               "It goes on long enough to be the article itself, not a teaser, so the body wins over the abstract.</p>" +
+               "<p>A second paragraph keeps the page well past the threshold for a real article body here.</p></body></html>";
+  const out = R.extract(page);
+  assert.ok(!/hidden comment|not text/.test(out), out);
+  assert.ok(out.includes("\ud83c\udf0a") && !/\u001b|\[2J/.test(out) && !/[\ud800-\udbff](?![\udc00-\udfff])/.test(out.replace("\ud83c\udf0a", "")), out);
+  assert.match(R.metaFallback("<head>" + "<meta name=x ".repeat(5000) + "<meta name=\"citation_abstract\" content=\"" +
+               "Long enough abstract text here. ".repeat(4) + "\"></head>"), /Long enough abstract/, "found past many broken tags");
+  assert.deepEqual(R.metaTags("<META NAME=a CONTENT=b><meta name=c><meta name=d"), ["<META NAME=a CONTENT=b>", "<meta name=c>"]);
+});
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");
   assert.equal(R.extract("<p>Ctrl \u0007chars\u202e and a long enough paragraph to keep here.</p>"), "Ctrl chars and a long enough paragraph to keep here.");

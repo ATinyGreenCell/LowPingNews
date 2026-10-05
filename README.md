@@ -33,6 +33,33 @@ title, tap or `j`/`k` to move, Enter to read, `q` to quit.
 
 ---
 
+## Robustness
+
+Everything the app reads from outside - feeds, article pages, forecasts, NOAA
+alerts, tides, currents, buoys, the catalog, its own saved files - is treated as
+possibly broken or hostile, and the test suite fuzzes it with thousands of
+mutated inputs every run:
+
+- **Nothing reaches your terminal raw.** Escape sequences are removed whole
+  (never leaving "[2J" behind), with invisible direction overrides and
+  unprintable characters; links must be plain http(s) to a real host.
+- **A missing reading stays missing.** A forecast without wind says nothing
+  about wind - never "calm"; unknown rain is "not reported", never "no rain
+  expected"; an unknown sky is "Unknown", never "Clear". A broken forecast never
+  replaces a good saved one.
+- **One bad item never costs a feed**, and nothing a server sends can freeze a
+  parser: every text scan is linear, whatever the input.
+- **No server can hold a refresh.** Each request has a total time limit (25 s)
+  as well as an idle one; a cut download keeps its bytes and resumes next time;
+  a server that times out has its other feeds served from cache for that round.
+- **Fast starts.** `lowpingnews` loads the app as a module, so Python keeps its
+  compiled form (in `~/.cache/lowpingnews/pyc`) instead of recompiling 6,500
+  lines on every run: a warm list in ~37 ms instead of ~100 ms here.
+- **The web app** carries a security policy (its own scripts only, and only the
+  five services it reads), and the site's build job - which reads the outside
+  feeds - cannot publish; only the deploy job can, with every action pinned to
+  an exact commit.
+
 ## On a phone, in the browser (iPhone or Android)
 
 Open **https://atinygreencell.github.io/LowPingNews/** in Safari or Chrome, then:

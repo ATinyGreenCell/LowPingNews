@@ -28,7 +28,7 @@ test("dangerous or odd links are dropped, the story kept", () => {
 
 test("control and direction characters are stripped", () => {
   const d = C.parseDigest(doc([[0, "A\u0000B\u001b[2JC\u202eD", "x\u200by", "", NOW]]), NOW);
-  assert.equal(d.items[0].title, "A B [2JC D");
+  assert.equal(d.items[0].title, "A BC D", "the whole escape sequence goes, not just its first byte");
   assert.equal(d.items[0].summary, "x y");
 });
 
@@ -249,6 +249,53 @@ test("how long a tide holds: exact against a minute-by-minute walk", () => {
   assert.ok(C.nearWindow(cases[2], 1).whole, "a side under 1 ft is flagged, never passed off as a hold");
   assert.equal(C.nearWindow(cases[0], 0).start, null, "no neighbouring tide predicted: unknown, not guessed");
   assert.equal(C.round5(1000), 900);
+});
+test("text: whole escape sequences go, emoji never split, lone surrogates never kept", () => {
+  assert.equal(C.cleanText("Kept \u001b[2J\u202eone \u001b]0;title\u0007x \u009b31mred", 99), "Kept one x red");
+  assert.equal(C.cleanText("plain [2J text", 99), "plain [2J text");
+  assert.equal(C.cleanText("wave \ud83c\udf0a and lone \ud83d end", 99), "wave \ud83c\udf0a and lone end");
+  const s = C.cleanText("ab\ud83c\udf0a", 3);
+  assert.equal(s, "ab", "a cut never leaves half an emoji");
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(C.cut("x\ud83d\ude00y", 2) + C.cleanParas("p\ud83d\ude00q\n\nr", 3)));
+});
+test("fuzz: tides, currents and windows survive anything a tile or NOAA could send", () => {
+  let seed = 4242;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const atoms = [null, undefined, true, 0, -1, 1e308, -1e308, NaN, Infinity, "", "x", "\u001b[2J\u202e\ud83d", "8516945", "ACT3116",
+                 "../evil", "2026-10-04 19:42", "garbage", "H", "L", "flood", "ebb", "slack", 40.9, -73.4, [], {}];
+  const junk = (d) => {
+    const r = rnd();
+    if (d > 3 || r < 0.35) return pick(atoms);
+    if (r < 0.75) return Array.from({ length: Math.floor(rnd() * 7) }, () => junk(d + 1));
+    const o = {};
+    for (const k of ["v", "nb", "reader", "s", "b", "c", "predictions", "current_predictions", "cp", "error", "message", "t", "type",
+                     "Time", "Type", "Velocity_Major", "meanFloodDir", "meanEbbDir", "units"]) if (rnd() < 0.4) o[k] = junk(d + 1);
+    return o;
+  };
+  const bad = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+  const finiteOrNull = (v, where) => assert.ok(v === null || (typeof v === "number" && isFinite(v)), where + ": " + v);
+  for (let n = 0; n < 3000; n++) {
+    const now = 1791100000 + Math.floor(rnd() * 1e6);
+    const t = C.parseTile(junk(0), 40.9, -73.4, now);
+    for (const s of t.stations) { assert.match(s.id, /^[0-9A-Z]{5,10}$/); assert.ok(isFinite(s.km) && !bad.test(s.name)); }
+    for (const c of t.currents) { assert.match(c.id, /^[0-9A-Za-z]{3,12}$/); assert.ok(isFinite(c.km)); }
+    for (const b of t.buoys) for (const k of ["water", "waves", "period", "dir", "wind", "air"]) finiteOrNull(b[k], "buoy " + k);
+    assert.ok(t.reader === "" || t.reader.startsWith("https://"));
+    const p = C.parsePredictions(junk(0));
+    for (const [tt, v, k] of p.hilo) assert.ok(isFinite(tt) && isFinite(v) && (k === "H" || k === "L"));
+    for (let i = 0; i < p.hilo.length; i++) {
+      const w = C.nearWindow(p.hilo, i);
+      for (const x of [w.start, w.end]) finiteOrNull(x, "window");
+    }
+    const l = C.tideLevel(p.hilo, now);
+    if (l) assert.ok(isFinite(l.level));
+    const cr = C.parseCurrents(junk(0));
+    const ev = cr.ev || cr.events || [];
+    const f = C.flowAt(ev, now);
+    assert.ok(f === null || isFinite(typeof f === "number" ? f : f.knots ?? 0), "flow " + JSON.stringify(f));
+    assert.ok(!bad.test(p.error || "") && !bad.test(cr.error || ""));
+  }
 });
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

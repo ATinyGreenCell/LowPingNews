@@ -320,7 +320,6 @@ def buoy_obs(now):
     if not head:
         return []
     col = {h.upper(): i for i, h in enumerate(head)}
-    need = ("STN", "LAT", "LON", "YYYY", "MM", "DD", "HH", "MM_")
     out = []
     for l in lines:
         if l.startswith("#") or not l.strip():
@@ -496,6 +495,17 @@ def copy_static(out_dir):
         src = os.path.join(STATIC, name)
         if os.path.isfile(src):
             shutil.copy(src, os.path.join(out_dir, name))
+    # the page's security policy names the one reader it may talk to: its origin
+    # only (scheme and host), from the checked READER address, or nothing
+    idx = os.path.join(out_dir, "index.html")
+    if os.path.exists(idx):
+        import urllib.parse
+        u = urllib.parse.urlsplit(READER) if READER else None
+        origin = "%s://%s" % (u.scheme, u.netloc) if u and u.scheme == "https" and re.match(r"^[a-z0-9.-]+(:\d+)?$", u.netloc, re.I) else ""
+        with io.open(idx, encoding="utf-8") as fh:
+            page = fh.read()
+        with io.open(idx, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(page.replace(" __READER_ORIGIN__", (" " + origin) if origin else ""))
 
 
 def main():
