@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
+import { APP_VERSION, SHOW, Arrival, takeLines, backoff, covers, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -22,14 +22,17 @@ function store(k, fallback) {
 function keep(k, v) {
     try {
         localStorage.setItem(k, JSON.stringify(v));
+        return true;
     }
-    catch { }
+    catch {
+        return false;
+    }
 }
 const S = {
     view: store("view", "weather"),
     cats: [["top", "Headlines"]],
     digest: null,
-    offline: false,
+    offline: "",
     limit: SHOW,
     shown: [],
     known: new Set(),
@@ -70,8 +73,9 @@ function status() {
         if (!S.offline)
             void diagnose(d);
     }
-    s.textContent = (S.offline ? "offline \u00b7 saved copy, " : "") + text;
-    s.classList.add(S.offline || st.level === "stale" ? "bad" : st.level === "aging" ? "warn" : "ok");
+    s.textContent = (S.offline === "offline" ? "offline \u00b7 saved copy, " : S.offline === "slow" ? "slow connection \u00b7 saved copy, " : "") +
+        text + (NEWS.checking ? " \u00b7 checking\u2026" : "");
+    s.classList.add(S.offline === "offline" || st.level === "stale" ? "bad" : S.offline || st.level === "aging" ? "warn" : "ok");
 }
 const WHY = { at: 0, forT: 0, text: "" };
 async function diagnose(d) {
@@ -82,8 +86,8 @@ async function diagnose(d) {
     WHY.text = "";
     let w;
     try {
-        const r = await fetch(d.reader + (d.reader.includes("?") ? "&" : "?") + "why=1", { cache: "no-store" });
-        w = parseWhy(r.ok ? await r.json() : null);
+        const r = await getJSON(d.reader + (d.reader.includes("?") ? "&" : "?") + "why=1", { cache: "no-store" });
+        w = parseWhy(r.ok ? r.body : null);
     }
     catch {
         return;
@@ -98,30 +102,117 @@ async function diagnose(d) {
     if (WHY.text)
         status();
 }
-async function loadNews(cat, manual = false) {
-    status();
-    let raw = null;
-    let offline = false;
+const QUICK = { wait: 10, idle: 8, total: 30 };
+async function fetchT(url, init = {}, lim = QUICK) {
+    const ac = new AbortController();
+    let idle = 0;
+    const arm = (sec) => { window.clearTimeout(idle); idle = window.setTimeout(() => ac.abort(), sec * 1000); };
+    const all = window.setTimeout(() => ac.abort(), lim.total * 1000);
+    arm(lim.wait);
     try {
-        const r = await fetch("./data/" + encodeURIComponent(cat) + ".json", { cache: "no-cache" });
-        offline = r.headers.get("x-lpn-offline") === "1";
-        if (r.ok)
-            raw = await r.json();
+        const r = await fetch(url, { ...init, signal: ac.signal });
+        arm(lim.idle);
+        const rd = r.body && r.body.getReader ? r.body.getReader() : null;
+        if (!rd)
+            return { r, text: await r.text() };
+        const dec = new TextDecoder();
+        let text = "";
+        for (;;) {
+            const { done, value } = await rd.read();
+            if (done)
+                break;
+            arm(lim.idle);
+            text += dec.decode(value, { stream: true });
+        }
+        return { r, text: text + dec.decode() };
+    }
+    finally {
+        window.clearTimeout(idle);
+        window.clearTimeout(all);
+    }
+}
+async function getJSON(url, o = {}) {
+    const { r, text } = await fetchT(url, { headers: o.headers, cache: o.cache || "no-cache" }, o.lim || QUICK);
+    let body = null;
+    try {
+        body = JSON.parse(text);
+    }
+    catch { }
+    const sv = r.headers.get("x-lpn-saved");
+    return { ok: r.ok, status: r.status, body,
+        saved: sv === "slow" ? "slow" : sv || r.headers.get("x-lpn-offline") === "1" ? "offline" : "" };
+}
+const linkWord = () => (navigator.onLine === false ? "offline" : "slow");
+const NEWS = { gen: 0, tries: 0, timer: 0, checking: false };
+async function savedSite(path) {
+    try {
+        const hit = await caches.match(new URL(path, location.href).href, { cacheName: "lpn-data" });
+        if (!hit)
+            return null;
+        const when = Date.parse(hit.headers.get("date") || "");
+        return { body: await hit.json(), age: isFinite(when) ? Math.max(0, now() - when / 1000) : Infinity };
     }
     catch {
-        offline = true;
+        return null;
     }
-    const d = raw ? parseDigest(raw, now()) : null;
+}
+async function savedNews(cat) {
+    const hit = await savedSite("./data/" + encodeURIComponent(cat) + ".json");
+    return hit ? parseDigest(hit.body, now()) : null;
+}
+async function loadNews(cat, manual = false) {
+    const gen = ++NEWS.gen;
+    window.clearTimeout(NEWS.timer);
+    const asked = getJSON("./data/" + encodeURIComponent(cat) + ".json", { lim: { wait: 12, idle: 10, total: 90 } })
+        .catch(() => null);
+    if (!S.digest) {
+        const saved = await savedNews(cat);
+        if (saved && gen === NEWS.gen && cat === S.view && !S.digest)
+            adopt(saved, false, true);
+    }
+    const slow = window.setTimeout(() => { if (gen === NEWS.gen) {
+        NEWS.checking = true;
+        status();
+    } }, 1500);
+    status();
+    let raw = null;
+    let how = "";
+    const r = await asked;
+    if (!r)
+        how = linkWord();
+    else {
+        how = r.saved;
+        if (r.ok)
+            raw = r.body;
+    }
+    window.clearTimeout(slow);
+    if (gen !== NEWS.gen)
+        return;
+    NEWS.checking = false;
     if (cat !== S.view)
         return;
-    S.offline = offline;
+    S.offline = how;
+    if (how) {
+        NEWS.tries++;
+        NEWS.timer = window.setTimeout(() => {
+            if (S.view === cat && document.visibilityState === "visible")
+                void loadNews(cat);
+        }, backoff(NEWS.tries, 10, 300) * 1000);
+    }
+    else
+        NEWS.tries = 0;
+    const d = raw ? parseDigest(raw, now()) : null;
     if (!d) {
         status();
         if (manual)
-            toast(offline ? "offline: nothing saved for this section" : "could not read the news file");
-        renderNews();
+            toast(how === "offline" ? "offline: nothing saved for this section" : how ? "no answer from the site yet" : "could not read the news file");
+        if (!S.digest)
+            renderNews();
         return;
     }
+    adopt(d, manual, !!how);
+}
+function adopt(d, manual, saved) {
     const same = !!S.digest && S.digest.cat === d.cat;
     const w = adoptWindow(S.shown, S.known, S.limit, d.items, same);
     S.digest = d;
@@ -129,20 +220,38 @@ async function loadNews(cat, manual = false) {
     S.known = new Set(d.items.map((i) => i.key));
     if (d.cats.length)
         S.cats = d.cats;
-    S.fetched = now();
+    if (!saved)
+        S.fetched = now();
     renderTabs();
+    const back = anchor();
     renderNews();
+    back();
     status();
     if (w.fresh)
         toast(w.fresh + " new at the top");
     else if (manual)
-        toast(offline ? "offline: showing the saved copy" : "nothing new");
+        toast(S.offline === "offline" ? "offline: showing the saved copy" : S.offline ? "slow connection: showing the saved copy" : "nothing new");
     if (newerVersion(d.app, APP_VERSION))
         showUpdate(d.app);
     else if (d.app === APP_VERSION) {
         mem("lpn-updating", null);
         mem("lpn-hard", null);
     }
+}
+function anchor() {
+    if (window.scrollY < 8 || S.reading)
+        return () => undefined;
+    const top = $("tabs").getBoundingClientRect().bottom;
+    const first = Array.from(document.querySelectorAll("main article.card"))
+        .find((c) => c.getBoundingClientRect().bottom > top + 1);
+    if (!first)
+        return () => undefined;
+    const k = first.dataset.k, y = first.getBoundingClientRect().top;
+    return () => {
+        const again = Array.from(document.querySelectorAll("main article.card")).find((c) => c.dataset.k === k);
+        if (again)
+            window.scrollBy(0, again.getBoundingClientRect().top - y);
+    };
 }
 function mem(k, v) {
     try {
@@ -175,13 +284,14 @@ async function updateNow(b) {
     const sws = navigator.serviceWorker;
     if (sws) {
         const changed = new Promise((res) => sws.addEventListener("controllerchange", () => res(), { once: true }));
-        try {
-            const reg = await sws.getRegistration();
-            if (reg)
-                await reg.update();
-        }
-        catch { }
-        await Promise.race([changed, new Promise((r) => setTimeout(r, 6000))]);
+        const coming = await Promise.race([
+            sws.getRegistration().then(async (reg) => { if (!reg)
+                return false; await reg.update(); return !!(reg.installing || reg.waiting); })
+                .catch(() => false),
+            new Promise((r) => setTimeout(() => r(true), 8000))
+        ]);
+        if (coming)
+            await Promise.race([changed, new Promise((r) => setTimeout(r, 20000))]);
     }
     location.reload();
 }
@@ -193,8 +303,19 @@ async function hardUpdate(b) {
         return;
     }
     updating = true;
-    mem("lpn-hard", "1");
     b.textContent = "Updating\u2026";
+    let reached = false;
+    try {
+        const r = await getJSON("./data/" + encodeURIComponent(S.cats[0][0]) + ".json");
+        reached = r.ok && !r.saved;
+    }
+    catch { }
+    if (!reached) {
+        updating = false;
+        b.textContent = "Could not update now: the connection is too weak. Tap to try again later.";
+        return;
+    }
+    mem("lpn-hard", "1");
     try {
         for (const k of await caches.keys())
             if (k.startsWith("lpn-shell-"))
@@ -206,14 +327,16 @@ async function hardUpdate(b) {
     catch { }
     location.reload();
 }
-function card(it) {
+function card(it, kept) {
     const read = S.read.has(it.key);
     const age = it.t ? ago(now() - it.t) : "?";
     const c = el("article", "card" + (read ? " read" : ""), el("div", "meta", (read ? "" : "\u25cf ") + it.src + " \u00b7 " + age), el("h2", "", it.title));
     if (it.summary)
         c.append(el("p", "sum", it.summary));
-    if (savedArticle(it.key))
-        c.querySelector(".meta").append(" \u00b7 saved");
+    const part = kept.get(it.key);
+    if (part !== undefined)
+        c.querySelector(".meta").append(part ? " \u00b7 part saved" : " \u00b7 saved");
+    c.dataset.k = it.key;
     c.tabIndex = 0;
     c.setAttribute("role", "button");
     c.onclick = () => openReader(it);
@@ -226,7 +349,7 @@ function renderNews() {
     main.replaceChildren();
     const d = S.digest;
     if (!d) {
-        main.append(el("p", "empty", S.offline ? "Offline, and this section has not been saved yet." : "Loading\u2026"));
+        main.append(el("p", "empty", S.offline ? "No connection, and this section has not been saved yet. It will load when the connection is back." : "Loading\u2026"));
         return;
     }
     if (!d.items.length) {
@@ -234,8 +357,9 @@ function renderNews() {
         return;
     }
     S.shown = d.items.slice(0, S.limit);
+    const kept = savedIndex();
     for (const it of S.shown)
-        main.append(card(it));
+        main.append(card(it, kept));
     const left = d.items.length - S.shown.length;
     if (left > 0) {
         const nxt = d.items[Math.min(d.items.length, S.limit + 10) - 1];
@@ -252,19 +376,52 @@ function renderNews() {
         main.append(el("p", "note", "Not updated this time: " + d.failed.map(([n, a]) => n + (a > 0 ? " (copy " + ago(a) + " old)" : "")).join(", ")));
     }
 }
-function savedArticle(key) { return store("art:" + key, null); }
-function saveArticle(key, a) {
-    const idx = store("arts", []).filter((k) => k !== key);
-    idx.push(key);
-    while (idx.length > 40) {
-        const old = idx.shift();
-        try {
-            localStorage.removeItem("art:" + old);
+function savedArticle(key) {
+    const v = store("art:" + key, null);
+    return v && typeof v === "object" && v.a && typeof v.a.text === "string" ? v : null;
+}
+function savedIndex() {
+    const cut = new Set(store("artcut", []));
+    return new Map(store("arts", []).map((k) => [k, cut.has(k)]));
+}
+function saveArticle(key, a, more) {
+    let idx = store("arts", []).filter((k) => k !== key);
+    let cut = store("artcut", []).filter((k) => k !== key);
+    const drop = (n) => {
+        while (idx.length > n) {
+            const old = idx.shift();
+            cut = cut.filter((k) => k !== old);
+            try {
+                localStorage.removeItem("art:" + old);
+            }
+            catch { }
         }
-        catch { }
+    };
+    drop(39);
+    const rec = more ? { t: now(), a, h: more.h, n: more.n, of: more.of, cut: more.cut } : { t: now(), a };
+    let ok = keep("art:" + key, rec);
+    while (!ok && idx.length) {
+        drop(Math.max(0, idx.length - 5));
+        ok = keep("art:" + key, rec);
     }
-    keep("art:" + key, { t: now(), a });
+    if (ok) {
+        idx.push(key);
+        if (more && more.cut)
+            cut.push(key);
+    }
     keep("arts", idx);
+    keep("artcut", cut);
+}
+const READ = { gen: 0, att: 0, timer: 0, retry: null, abort: null,
+    save: null };
+function stopReading() {
+    READ.gen++;
+    window.clearTimeout(READ.timer);
+    if (READ.save)
+        READ.save();
+    if (READ.abort)
+        READ.abort();
+    READ.retry = READ.abort = READ.save = null;
 }
 function openReader(it, fromHistory = false) {
     S.reading = it;
@@ -278,92 +435,259 @@ function closeReader() {
     if (!S.reading)
         return;
     S.reading = null;
+    stopReading();
     renderNews();
 }
+const NOTHING = { text: "", complete: false, note: "", error: "" };
 async function renderReader(it, force = false) {
+    stopReading();
+    const gen = READ.gen, cat = S.view;
+    const live = () => gen === READ.gen && S.reading === it;
     const main = $("main");
     const back = el("button", "back", "\u2039 Back");
     back.onclick = () => history.back();
-    const body = el("div", "body", el("p", "empty", "Getting the text\u2026"));
+    const paras = el("div", "paras"), prog = el("div", "prog"), notes = el("div", "notes");
+    const body = el("div", "body", paras, prog, notes);
+    if (it.link) {
+        const a_ = el("a", "go", "Open the original page \u2197");
+        a_.href = it.link;
+        a_.target = "_blank";
+        a_.rel = "noopener noreferrer";
+        body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
+    }
     main.replaceChildren(back, el("div", "meta", it.src + (it.t ? " \u00b7 " + ago(now() - it.t) + " ago" : "")), el("h1", "headline", it.title), body);
-    const show = (a, why, savedAgo) => {
-        if (S.reading !== it)
-            return;
-        body.replaceChildren();
-        if (a && a.text) {
-            for (const p of a.text.split("\n\n"))
-                body.append(el("p", "", p));
+    let standIn = false;
+    const fill = (text, stand, cls = "") => {
+        paras.replaceChildren(...text.split("\n\n").filter(Boolean).map((p) => el("p", cls, p)));
+        standIn = stand;
+    };
+    const say = (text, warn = false, frac = -1, button) => {
+        prog.className = "prog" + (warn ? " warn" : "");
+        prog.replaceChildren(text);
+        if (button) {
+            const b = el("button", "small", button[0]);
+            b.onclick = button[1];
+            prog.append(" ", b);
+        }
+        if (frac >= 0) {
+            const bar = el("div", "bar", el("i"));
+            bar.firstChild.style.width = Math.round(Math.min(1, frac) * 100) + "%";
+            prog.append(bar);
+        }
+    };
+    const finish = (a, savedAgo, why = "") => {
+        prog.replaceChildren();
+        prog.className = "prog";
+        notes.replaceChildren();
+        if (a.text) {
+            if (standIn || !paras.childElementCount)
+                fill(a.text, false);
             if (!a.complete)
-                body.append(el("p", "note warn", a.note || "This may be only part of the article."));
+                notes.append(el("p", "note warn", a.note || "This may be only part of the article."));
             else if (a.note)
-                body.append(el("p", "note", a.note));
+                notes.append(el("p", "note", a.note));
+            if (why)
+                notes.append(el("p", "note warn", why));
             if (savedAgo >= 0)
-                body.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
+                notes.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
         }
         else {
-            if (it.summary)
-                body.append(el("p", "", it.summary));
-            body.append(el("p", "note warn", why));
-        }
-        if (it.link) {
-            const a_ = el("a", "go", "Open the original page \u2197");
-            a_.href = it.link;
-            a_.target = "_blank";
-            a_.rel = "noopener noreferrer";
-            body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
+            if (!paras.childElementCount && it.summary)
+                fill(it.summary, false);
+            notes.append(el("p", "note warn", why));
         }
     };
     const saved0 = savedArticle(it.key);
     const saved = saved0 && (saved0.a.complete || !preprintId(it.link)) ? saved0 : null;
-    if (!force && saved && saved.a.text && saved.a.complete) {
-        show(saved.a, "", now() - saved.t);
+    if (!force && saved && saved.a.text && saved.a.complete && !saved.cut) {
+        finish(saved.a, now() - saved.t);
         return;
     }
-    const reader = S.digest ? S.digest.reader : "";
     if (!it.link) {
-        show(null, "This feed gives no link to the full article.", -1);
+        finish(NOTHING, -1, "This feed gives no link to the full article.");
         return;
     }
+    const arr = new Arrival(saved && saved.h ? { h: saved.h, n: saved.n, of: saved.of, text: saved.a.text } : undefined);
+    if (arr.n)
+        fill(arr.text, false);
+    else if (saved && saved.a.text)
+        fill(saved.a.text, true);
+    else if (it.summary)
+        fill(it.summary, true, "feed");
+    const part = () => (arr.of ? arr.n + " of " + arr.of + " paragraphs" : "");
+    say(arr.n && arr.n < arr.of ? "Saved " + part() + " \u00b7 getting the rest\u2026" : saved ? "Checking for a newer copy\u2026" : "Getting the text\u2026");
     const pre = paperId(it.link);
-    if (pre) {
+    if (pre && !arr.n) {
         try {
-            const r = await fetch(abstractFile(pre));
-            const a = r.ok ? parseAbstractDoc(await r.json(), pre) : null;
+            const { r, text } = await fetchT(abstractFile(pre));
+            const a = r.ok ? parseAbstractDoc(JSON.parse(text), pre) : null;
+            if (!live())
+                return;
             if (a && a.text) {
                 saveArticle(it.key, a);
-                show(a, "", -1);
+                fill(a.text, false);
+                finish(a, -1);
                 return;
             }
         }
         catch { }
+        if (!live())
+            return;
     }
+    const reader = S.digest ? S.digest.reader : "";
     if (!reader) {
-        show(null, "Full-text reading is not set up for this app yet.", -1);
+        if (saved && saved.a.text)
+            finish(saved.a, now() - saved.t);
+        else
+            finish(NOTHING, -1, "Full-text reading is not set up for this app yet.");
         return;
     }
-    try {
-        const r = await fetch(reader + "?cat=" + encodeURIComponent(S.view) + "&u=" + encodeURIComponent(it.link));
-        let raw = null;
+    const base = reader + (reader.includes("?") ? "&" : "?") + "cat=" + encodeURIComponent(cat) + "&u=" + encodeURIComponent(it.link) + "&s=1";
+    let tries = 0, keptN = arr.n;
+    const keepPart = () => {
+        if (arr.n > keptN && !arr.done) {
+            saveArticle(it.key, arr.article(), { h: arr.h, n: arr.n, of: arr.of, cut: true });
+            keptN = arr.n;
+        }
+    };
+    READ.save = keepPart;
+    class Again extends Error {
+    }
+    const step = (st) => {
+        if (st === "bad")
+            throw new Again();
+        if (st === "reset") {
+            paras.replaceChildren();
+            standIn = false;
+        }
+        if (st === "p") {
+            if (standIn) {
+                paras.replaceChildren();
+                standIn = false;
+            }
+            if (arr.last)
+                paras.append(el("p", "new", arr.last));
+        }
+        if (st === "head" || st === "p" || st === "reset")
+            say("Loading \u00b7 " + part(), false, arr.of ? arr.n / arr.of : 0);
+    };
+    const retryNow = () => {
+        if (!live())
+            return;
+        window.clearTimeout(READ.timer);
+        if (READ.abort)
+            READ.abort();
+        void attempt();
+    };
+    const attempt = async () => {
+        const me = ++READ.att, had = arr.n;
+        READ.retry = null;
+        const ac = new AbortController();
+        READ.abort = () => ac.abort();
+        let timer = 0, outcome = "again", why = "";
+        const arm = (sec) => { window.clearTimeout(timer); timer = window.setTimeout(() => ac.abort(), sec * 1000); };
+        arm(30);
+        const hint = window.setTimeout(() => {
+            if (live() && me === READ.att && !arr.done)
+                say((arr.n ? part() + " \u00b7 " : "") + "Still waiting for the reader\u2026", false, -1, ["Try again", retryNow]);
+        }, 8000);
         try {
-            raw = await r.json();
+            const r = await fetch(base + arr.resume(), { signal: ac.signal });
+            window.clearTimeout(hint);
+            if (!r.ok) {
+                let err = "";
+                try {
+                    err = parseArticle(JSON.parse(await r.text())).error;
+                }
+                catch { }
+                if (r.status === 429 || (r.status >= 500 && r.status !== 502))
+                    throw new Again();
+                outcome = "final";
+                why = err || "the reader answered " + r.status;
+            }
+            else {
+                const json = /json/i.test(r.headers.get("content-type") || "");
+                arm(12);
+                const rd = r.body.getReader(), dec = new TextDecoder();
+                let buf = "";
+                for (;;) {
+                    const { done, value } = await rd.read();
+                    if (done)
+                        break;
+                    arm(12);
+                    buf += dec.decode(value, { stream: true });
+                    if (json)
+                        continue;
+                    const [lines, rest] = takeLines(buf);
+                    buf = rest;
+                    for (const ln of lines)
+                        step(arr.take(ln));
+                    if (buf.length > 1048576)
+                        throw new Again();
+                }
+                buf += dec.decode();
+                if (json) {
+                    const a = parseArticle(JSON.parse(buf));
+                    if (!live() || me !== READ.att)
+                        return;
+                    if (a.text) {
+                        saveArticle(it.key, a);
+                        fill(a.text, false);
+                        finish(a, -1);
+                        return;
+                    }
+                    outcome = "final";
+                    why = a.error || "the reader found no text";
+                }
+                else
+                    outcome = arr.done ? "ok" : "again";
+            }
         }
-        catch { }
-        const a = parseArticle(raw);
-        if (a.text) {
-            saveArticle(it.key, a);
-            show(a, "", -1);
+        catch {
+            outcome = "again";
         }
-        else if (saved && saved.a.text)
-            show(saved.a, "", now() - saved.t);
-        else
-            show(null, "Could not get the text: " + (a.error || "the reader answered " + r.status) + ".", -1);
-    }
-    catch {
-        if (saved && saved.a.text)
-            show(saved.a, "", now() - saved.t);
-        else
-            show(null, "Offline: this article has not been saved yet.", -1);
-    }
+        finally {
+            window.clearTimeout(timer);
+            window.clearTimeout(hint);
+            if (me === READ.att)
+                READ.abort = null;
+        }
+        if (outcome !== "ok")
+            keepPart();
+        if (!live() || me !== READ.att)
+            return;
+        if (outcome === "ok") {
+            if (!arr.text) {
+                finish(NOTHING, -1, "Could not get the text: the page had no readable text.");
+                return;
+            }
+            saveArticle(it.key, arr.article(), { h: arr.h, n: arr.n, of: arr.of, cut: false });
+            keptN = arr.n;
+            finish(arr.article(), -1);
+            return;
+        }
+        if (outcome === "final") {
+            if (arr.n)
+                finish(arr.article(), -1, "Could not get the rest: " + why + ".");
+            else if (saved && saved.a.text)
+                finish(saved.a, now() - saved.t);
+            else
+                finish(NOTHING, -1, "Could not get the text: " + why + ".");
+            return;
+        }
+        tries = arr.n > had ? 1 : tries + 1;
+        const left = part() ? " \u00b7 " + part() : "", frac = arr.of ? arr.n / arr.of : -1;
+        const word = navigator.onLine === false ? "Offline" : "Connection lost";
+        READ.retry = retryNow;
+        if (tries > 12) {
+            say(word + left + ".", true, frac, ["Try again", () => { tries = 0; retryNow(); }]);
+            return;
+        }
+        const wait = backoff(tries, 2, 60);
+        say(word + left + " \u00b7 trying again in " + wait + " s", true, frac, ["Try now", retryNow]);
+        READ.timer = window.setTimeout(retryNow, wait * 1000);
+    };
+    await attempt();
 }
 function renderTabs() {
     const nav = $("tabs");
@@ -382,11 +706,14 @@ function go(view) {
     }
     S.view = view;
     keep("view", view);
+    if (S.reading)
+        stopReading();
     S.digest = null;
     S.limit = SHOW;
     S.shown = [];
     S.known = new Set();
     S.reading = null;
+    S.offline = "";
     renderTabs();
     window.scrollTo(0, 0);
     if (view === "weather")
@@ -403,15 +730,6 @@ function spotLine(sp) {
     const how = sp.via === "device" ? "your phone's location" : sp.via === "place" ? "set by place name" : sp.via;
     const age = ago(now() - sp.t);
     return "For " + sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " (" + how + ", " + (/^\d/.test(age) ? age + " ago" : age) + ")";
-}
-async function getJSON(url, headers) {
-    const r = await fetch(url, { headers, cache: "no-cache" });
-    let body = null;
-    try {
-        body = await r.json();
-    }
-    catch { }
-    return { ok: r.ok, status: r.status, body };
 }
 async function showWeather(force = false) {
     status();
@@ -435,12 +753,16 @@ async function showWeather(force = false) {
         return;
     }
     main.append(el("h2", "place", sp.label || "Your spot"), el("p", "note", spotLine(sp)));
-    const alertsBox = el("section", "alerts");
+    const alertsBox = el("section", "alerts", el("p", "note", "Checking for alerts\u2026"));
     const wxBox = el("section", "wx", el("p", "empty", "Loading the forecast\u2026"));
     main.append(alertsBox, wxBox);
-    void renderAlerts(sp, alertsBox, force);
-    void renderForecast(sp, wxBox, force);
+    WX.failed = false;
+    const missed = (ok) => { if (!ok)
+        WX.failed = true; };
+    void renderAlerts(sp, alertsBox, force).then(missed);
+    void renderForecast(sp, wxBox, force).then(missed);
 }
+const WX = { failed: false }, TD = { failed: false };
 function locate() {
     if (!navigator.geolocation) {
         toast("this browser cannot share its location");
@@ -464,12 +786,14 @@ function locatePrecise() {
         void showTides(true);
     }, () => toast("location not shared - set a place in Weather instead"), { enableHighAccuracy: true, maximumAge: 300000, timeout: 20000 });
 }
+const SPAN = 26 * 3600;
 async function predictions(sid, force, reader) {
-    const day = new Date((now() - 86400) * 1000).toISOString().slice(0, 10).replace(/-/g, "");
-    const key = sid + day;
+    const t = now();
+    const day = new Date((t - 86400) * 1000).toISOString().slice(0, 10).replace(/-/g, "");
     const c = store("tidepred", null);
-    if (!force && c && c.key === key && now() - c.t < 12 * 3600 && Array.isArray(c.h) && c.h.length)
-        return { hilo: c.h, error: "" };
+    const mine = c && Array.isArray(c.h) && c.h.length && (c.sid || String(c.key).slice(0, -8)) === sid ? c : null;
+    if (!force && mine && covers(mine.h, t, t + SPAN))
+        return { hilo: mine.h, error: "" };
     const q = "?product=predictions&application=LowPingNews&begin_date=" + day + "&range=96&datum=MLLW&station=" + sid +
         "&time_zone=gmt&interval=hilo&units=english&format=json";
     let raw = null;
@@ -484,18 +808,23 @@ async function predictions(sid, force, reader) {
         catch { }
     }
     const p = parsePredictions(raw);
+    if (!raw)
+        TD.failed = true;
     if (p.hilo.length)
-        keep("tidepred", { key, t: now(), h: p.hilo });
-    else if (c && c.key === key && c.h && c.h.length)
-        return { hilo: c.h, error: "" };
+        keep("tidepred", { key: sid + day, sid, t: now(), h: p.hilo });
+    else if (mine && covers(mine.h, t, t))
+        return { hilo: mine.h, error: "" };
+    else if (!raw)
+        return { hilo: [], error: "could not reach NOAA (no connection?)" };
     return p;
 }
 async function currentsNear(cands, force, reader) {
     const day = new Date((now() - 86400) * 1000).toISOString().slice(0, 10).replace(/-/g, "");
     const key = (s) => s.id + "_" + s.bin + "_" + day;
     const c = store("curpred", null);
-    const kept = c && c.f && Array.isArray(c.f.ev) && c.f.ev.length ? cands.find((s) => c.key === key(s)) : undefined;
-    if (!force && kept && now() - c.t < 12 * 3600)
+    const kept = c && c.f && Array.isArray(c.f.ev) && c.f.ev.length ? cands.find((s) => String(c.key).startsWith(s.id + "_" + s.bin + "_")) : undefined;
+    const t = now();
+    if (!force && kept && covers(c.f.ev, t, t + SPAN))
         return { st: kept, f: c.f };
     let last = { ev: [], flood: null, ebb: null, error: "no predictions" };
     for (const s of cands) {
@@ -517,11 +846,13 @@ async function currentsNear(cands, force, reader) {
             keep("curpred", { key: key(s), t: now(), f });
             return { st: s, f };
         }
-        if (!raw)
+        if (!raw) {
+            TD.failed = true;
             break;
+        }
         last = f;
     }
-    if (kept)
+    if (kept && covers(c.f.ev, t, t))
         return { st: kept, f: c.f };
     return { st: cands[0], f: last };
 }
@@ -603,17 +934,24 @@ async function showTides(force = false) {
     const box = el("section", "tides", el("p", "empty", "Loading tides\u2026"));
     main.append(box);
     const t = now();
-    let tile = null;
-    try {
-        const r = await fetch("./data/tides/" + tileKey(sp.lat, sp.lon) + ".json");
-        tile = r.ok ? await r.json() : r.status === 404 ? {} : null;
+    TD.failed = false;
+    const path = "./data/tides/" + tileKey(sp.lat, sp.lon) + ".json";
+    const kept = force ? null : await savedSite(path);
+    let tile = kept && kept.age < 1800 ? kept.body : null;
+    if (tile === null) {
+        try {
+            const { r, text } = await fetchT(path);
+            tile = r.ok ? JSON.parse(text) : r.status === 404 ? {} : null;
+        }
+        catch { }
     }
-    catch { }
-    if (S.view !== "tides")
+    if (!box.isConnected)
         return;
     box.replaceChildren();
-    if (tile === null)
+    if (tile === null) {
+        TD.failed = true;
         box.append(el("p", "note warn", "Could not get the station list. Offline?"));
+    }
     const { stations, buoys, currents, nb, reader } = parseTile(tile || {}, sp.lat, sp.lon, t);
     const mi = (k) => (k >= 1.6 ? Math.round(k / 1.609) + " mi" : "under a mile");
     const cands = currents.filter((c) => c.km <= 40).slice(0, 3);
@@ -626,9 +964,12 @@ async function showTides(force = false) {
             box.append(el("p", "note warn", "No NOAA tide station within 60 km. Predictions cover US coasts and territories."));
     }
     else {
+        const waiting = el("p", "empty", "Getting the tide times\u2026");
+        box.append(waiting);
         const pr = await predictions(st.id, force, reader);
-        if (S.view !== "tides")
+        if (!box.isConnected)
             return;
+        waiting.remove();
         if (!pr.hilo.length)
             box.append(el("p", "note", st.name + dot + mi(st.km)), el("p", "note warn", "NOAA gave no predictions: " + pr.error));
         else {
@@ -679,7 +1020,7 @@ async function showTides(force = false) {
     }
     if (flows) {
         const { st: cs, f } = await flows;
-        if (S.view !== "tides")
+        if (!box.isConnected)
             return;
         box.append(el("h3", "", "Currents"));
         if (!f.ev.length)
@@ -782,37 +1123,53 @@ async function findPlace(q) {
         toast("offline: could not look the place up");
     }
 }
-async function cachedJSON(name, key, url, maxAge, force, headers) {
+async function freshJSON(name, key, url, maxAge, force, alive, valid, draw, headers) {
     const c = store(name, null);
-    if (!force && c && c.key === key && now() - c.t < maxAge)
-        return { body: c.body, age: now() - c.t, fresh: true, status: 200 };
+    const mine = c && c.key === key ? c : null;
+    if (!force && mine && now() - mine.t < maxAge) {
+        draw(mine.body, now() - mine.t, "", 200);
+        return true;
+    }
+    if (mine)
+        draw(mine.body, now() - mine.t, "updating", 200);
+    let r = null;
     try {
-        const r = await getJSON(url, headers);
-        if (r.ok) {
-            keep(name, { t: now(), key, body: r.body });
-            return { body: r.body, age: 0, fresh: true, status: r.status };
-        }
-        return { body: null, age: -1, fresh: false, status: r.status };
+        r = await getJSON(url, { headers });
     }
-    catch {
-        if (c && c.key === key)
-            return { body: c.body, age: now() - c.t, fresh: false, status: 0 };
-        return { body: null, age: -1, fresh: false, status: 0 };
+    catch { }
+    if (!alive())
+        return true;
+    if (r && r.ok && valid(r.body)) {
+        keep(name, { t: now(), key, body: r.body });
+        draw(r.body, 0, "", r.status);
+        return true;
     }
+    const reached = !!r && (r.status === 404 || r.status === 400);
+    if (mine)
+        draw(mine.body, now() - mine.t, reached ? "failed" : "offline", 0);
+    else
+        draw(null, -1, reached ? "failed" : "offline", r ? r.status : 0);
+    return reached;
 }
-async function renderAlerts(sp, box, force) {
+const since = (age) => (age < 60 ? "a moment ago" : ago(age) + " ago");
+function renderAlerts(sp, box, force) {
     const key = sp.lat.toFixed(4) + "," + sp.lon.toFixed(4);
-    const r = await cachedJSON("alerts", key, "https://api.weather.gov/alerts/active?point=" + key, 300, force, { Accept: "application/geo+json" });
+    return freshJSON("alerts", key, "https://api.weather.gov/alerts/active?point=" + key, 300, force, () => box.isConnected, (body) => liveAlerts(body, now()) !== null, (body, age, shown, st) => drawAlerts(box, body, age, shown, st), { Accept: "application/geo+json" });
+}
+function drawAlerts(box, body, age, shown, status) {
     box.replaceChildren();
-    if (r.status === 404 || r.status === 400)
+    if (status === 404 || status === 400)
         return;
-    const live = r.body ? liveAlerts(r.body, now()) : null;
+    const live = body ? liveAlerts(body, now()) : null;
     if (!live) {
-        box.append(el("p", "alert unknown", "ALERTS UNKNOWN \u2014 could not reach weather.gov. This is not an all-clear."));
+        box.append(shown === "updating" ? el("p", "note", "Checking for alerts\u2026")
+            : el("p", "alert unknown", "ALERTS UNKNOWN \u2014 could not reach weather.gov. This is not an all-clear."));
         return;
     }
-    if (!r.fresh)
-        box.append(el("p", "note warn", "Alerts checked " + ago(r.age) + " ago (offline) - may be out of date"));
+    if (shown === "updating")
+        box.append(el("p", "note", "Alerts checked " + since(age) + " \u00b7 checking again\u2026"));
+    else if (shown)
+        box.append(el("p", "note warn", "Alerts checked " + since(age) + (shown === "offline" ? " (no connection)" : "") + " - may be out of date"));
     if (!live.alerts.length) {
         box.append(el("p", "ok", "\u2713 No NOAA alerts for this spot"));
         return;
@@ -832,23 +1189,33 @@ async function renderAlerts(sp, box, force) {
         box.append(card_);
     }
 }
-async function renderForecast(sp, box, force) {
+function renderForecast(sp, box, force) {
     const key = sp.lat.toFixed(3) + "," + sp.lon.toFixed(3) + (US ? ",f" : ",c");
     const url = "https://api.open-meteo.com/v1/forecast?latitude=" + sp.lat.toFixed(4) + "&longitude=" + sp.lon.toFixed(4) +
         "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,wind_gusts_10m,relative_humidity_2m,is_day" +
         "&hourly=precipitation_probability,temperature_2m&forecast_hours=24" +
         "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset" +
         "&forecast_days=7&timezone=auto&timeformat=unixtime" + (US ? "&temperature_unit=fahrenheit&wind_speed_unit=mph" : "");
-    const r = await cachedJSON("wx", key, url, 1800, force);
+    return freshJSON("wx", key, url, 1800, force, () => box.isConnected, isForecast, (body, age, shown) => drawForecast(box, body, age, shown));
+}
+function isForecast(b) {
+    const f = b;
+    return !!f && typeof f === "object" && !!f.current && !!f.daily && !!f.hourly &&
+        Array.isArray(f.daily.time) && Array.isArray(f.hourly.time);
+}
+function drawForecast(box, body, age, shown) {
     box.replaceChildren();
-    const f = r.body;
-    if (!f || !f.current || !f.daily || !f.hourly) {
-        box.append(el("p", "empty", "No forecast: offline, and none saved for this spot."));
+    if (!isForecast(body)) {
+        box.append(el("p", "empty", shown === "updating" ? "Loading the forecast\u2026"
+            : "No forecast: " + (shown === "offline" ? "no connection" : "the forecast service did not answer") + ", and none saved for this spot."));
         return;
     }
+    const f = body;
     const tz = typeof f.timezone === "string" ? f.timezone : undefined;
-    if (!r.fresh)
-        box.append(el("p", "note warn", "Forecast from " + ago(r.age) + " ago (offline)"));
+    if (shown === "updating")
+        box.append(el("p", "note", "Forecast from " + since(age) + " \u00b7 updating\u2026"));
+    else if (shown)
+        box.append(el("p", "note warn", "Forecast from " + since(age) + (shown === "offline" ? " (no connection)" : " (could not update)")));
     const u = US ? "\u00b0F" : "\u00b0C";
     const c = f.current;
     const w = wmo(c.weather_code, c.is_day !== 0);
@@ -914,15 +1281,43 @@ function start() {
     $("update").onclick = () => void updateNow($("update"));
     $("ver").textContent = "v" + APP_VERSION;
     renderTabs();
-    go(S.view === "weather" ? "weather" : S.view);
+    if (S.view === "weather")
+        void showWeather();
+    else if (S.view === "tides")
+        void showTides();
+    else {
+        renderNews();
+        void loadNews(S.view);
+    }
     window.addEventListener("popstate", () => { if (S.reading)
         closeReader(); });
     document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible" && S.view !== "weather" && S.view !== "tides" && now() - S.fetched > 15 * 60)
+        if (document.visibilityState !== "visible") {
+            if (READ.save)
+                READ.save();
+            return;
+        }
+        if (READ.retry)
+            READ.retry();
+        if (S.view !== "weather" && S.view !== "tides" && (now() - S.fetched > 15 * 60 || S.offline))
             void loadNews(S.view);
     });
-    window.addEventListener("online", () => { if (S.view !== "weather" && S.view !== "tides")
-        void loadNews(S.view); });
+    window.addEventListener("online", () => {
+        if (READ.retry)
+            READ.retry();
+        if (S.view === "weather") {
+            if (WX.failed)
+                void showWeather();
+        }
+        else if (S.view === "tides") {
+            if (TD.failed)
+                void showTides();
+        }
+        else
+            void loadNews(S.view);
+    });
+    window.addEventListener("offline", () => { if (READ.abort)
+        READ.abort(); });
     const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
     const standalone = navigator.standalone === true ||
         matchMedia("(display-mode: standalone)").matches;

@@ -1,6 +1,7 @@
 // Tests for the web app's core logic. Run: node web/test/core.test.mjs
 import assert from "node:assert/strict";
 import * as C from "../static/core.js";
+import * as R from "../reader/reader.js";
 
 let ran = 0, failed = 0;
 function test(name, fn) {
@@ -313,6 +314,130 @@ test("why the news is stale, in words: this week's stuck update, and every other
     assert.equal(C.whyText(C.parseWhy(junk), fri, NY), "", JSON.stringify(junk));
   const odd = C.parseWhy({ state: "waiting", since: NaN, lastOk: -5, run: "24", schedule: "yes" });
   assert.deepEqual([odd.since, odd.lastOk, odd.run, odd.schedule], [0, 0, 0, false]);
+});
+
+// ---- an article a paragraph at a time: the reader's real lines, the app's assembler ----
+const PARAS = Array.from({ length: 12 }, (_, i) => "Paragraph " + (i + 1) + ": " + "words of the article ".repeat(5 + i) + "end.");
+const ART = { v: 1, url: "https://news.example/a", text: PARAS.join("\n\n"), complete: true };
+const feed = (arr, chunk) => { const [lines, rest] = C.takeLines(chunk); return { steps: lines.map((l) => arr.take(l)), rest }; };
+const ask = (arr, out = ART) => {                        // what the app sends, answered as the Worker would
+  const m = /from=(\d+)&h=([0-9a-f]{8})/.exec(arr.resume());
+  return R.streamLines(out, m ? +m[1] : 0, m ? m[2] : "");
+};
+test("a streamed article arrives paragraph by paragraph, and ends whole", () => {
+  const a = new C.Arrival();
+  const { steps, rest } = feed(a, R.streamLines(ART, 0, ""));
+  assert.equal(rest, "");
+  assert.deepEqual(steps, ["head", ...PARAS.map(() => "p"), "end"]);
+  assert.equal(a.text, ART.text);
+  assert.ok(a.done && a.article().complete);
+  assert.equal(a.of, 12); assert.equal(a.n, 12);
+});
+test("cut at ANY point, it carries on from the last whole paragraph and ends identical", () => {
+  const whole = R.streamLines(ART, 0, "");
+  for (let cut = 0; cut <= whole.length; cut += 7) {
+    const a = new C.Arrival();
+    feed(a, whole.slice(0, cut));                       // the link drops here: the partial last line is dropped too
+    const kept = a.n;
+    const more = ask(a);
+    if (kept) assert.match(more.split("\n")[0], new RegExp('"from":' + kept), "asks only for the rest, cut at " + cut);
+    const { steps } = feed(a, more);
+    assert.ok(!steps.includes("bad"), "cut at " + cut + ": " + steps.join(","));
+    assert.equal(a.text, ART.text, "cut at " + cut);
+    assert.ok(a.done);
+  }
+});
+test("several drops in a row, and repeated paragraphs, change nothing", () => {
+  const a = new C.Arrival();
+  let guard = 0;
+  while (!a.done && guard++ < 50) { const next = ask(a); feed(a, next.slice(0, Math.ceil(next.length / 3))); }
+  feed(a, ask(a));
+  assert.equal(a.text, ART.text);
+  const b = new C.Arrival();
+  const lines = R.streamLines(ART, 0, "").split("\n");
+  feed(b, [lines[0], lines[1], lines[1], lines[2], lines[1]].join("\n") + "\n");
+  assert.equal(b.n, 2, "a paragraph it already has is skipped");
+});
+test("the text changed since the drop: it starts over, and says so", () => {
+  const a = new C.Arrival();
+  feed(a, R.streamLines(ART, 0, "").split("\n").slice(0, 5).join("\n") + "\n");
+  assert.equal(a.n, 4);
+  const changed = { ...ART, text: "A rewritten first paragraph, after a correction.\n\n" + PARAS.slice(1).join("\n\n") };
+  const { steps } = feed(a, ask(a, changed));
+  assert.equal(steps[0], "reset", "the page must clear what it showed");
+  assert.equal(a.text, changed.text);
+});
+test("a saved part seeds the next visit; junk seeds nothing", () => {
+  const a = new C.Arrival();
+  feed(a, R.streamLines(ART, 0, "").split("\n").slice(0, 4).join("\n") + "\n");
+  const again = new C.Arrival({ h: a.h, n: a.n, of: a.of, text: a.text });
+  assert.equal(again.resume(), "&from=3&h=" + a.h);
+  feed(again, ask(again));
+  assert.equal(again.text, ART.text);
+  for (const bad of [undefined, null, {}, { h: "xyz", n: 3, text: "t" }, { h: a.h, n: 0, text: "t" }, { h: a.h, n: -1, text: "t" },
+                     { h: a.h, n: 2.5, text: "t" }, { h: a.h, n: 9999, text: "t" }, { h: a.h, n: 3, text: 7 }, { h: a.h.toUpperCase(), n: 3, text: "t" }])
+    assert.equal(new C.Arrival(bad).resume(), "", JSON.stringify(bad));
+});
+test("lines out of order or out of bounds are refused, never shown", () => {
+  const head = (o) => JSON.stringify({ k: "head", h: "0123abcd", n: 3, from: 0, ...o });
+  const P = (i, t = "text " + i) => JSON.stringify({ k: "p", i, t });
+  const a = new C.Arrival();
+  assert.equal(a.take(P(0)), "bad", "a paragraph before any head");
+  assert.equal(a.take(JSON.stringify({ k: "end", complete: true })), "bad", "an end before any head");
+  for (const h of [head({ h: "nothex!!" }), head({ n: -1 }), head({ n: 9000 }), head({ from: 4 }), head({ n: "3" }), head({ from: 1.5 })])
+    assert.equal(new C.Arrival().take(h), "bad", h);
+  assert.equal(a.take(head()), "head");
+  assert.equal(a.take(P(1)), "bad", "a gap");
+  assert.equal(a.take(P(0)), "p");
+  assert.equal(a.take(P(0)), "", "a repeat");
+  assert.equal(a.take(JSON.stringify({ k: "end", complete: true })), "bad", "an end before the last paragraph");
+  assert.equal(a.take(P(1)), "p"); assert.equal(a.take(P(2)), "p");
+  assert.equal(a.take(P(3)), "bad", "more paragraphs than the head said");
+  for (const junk of ["", "{", "null", "[]", "42", '"s"', '{"k":"other"}', "<html>"]) assert.equal(a.take(junk), "", junk);
+  assert.equal(a.take(JSON.stringify({ k: "end", complete: true, note: "x\u0000y" })), "end");
+  assert.equal(a.note, "x y");
+  const cont = new C.Arrival({ h: "0123abcd", n: 2, of: 3, text: "a\n\nb" });
+  assert.equal(cont.take(head({ from: 1 })), "bad", "a continuation from the wrong place");
+  assert.equal(cont.take(head({ from: 2, h: "fedc4321" })), "bad", "a continuation of another text");
+  assert.equal(cont.take(head({ from: 2 })), "head");
+});
+test("streamed text is cleaned like everything else, and bounded", () => {
+  const a = new C.Arrival();
+  a.take(JSON.stringify({ k: "head", h: "0123abcd", n: 3, from: 0 }));
+  a.take(JSON.stringify({ k: "p", i: 0, t: "\u001b[2Jclean‮ me <b>not html</b>" }));
+  a.take(JSON.stringify({ k: "p", i: 1, t: "\u0000\u0007" }));       // nothing left: counted, not shown
+  a.take(JSON.stringify({ k: "p", i: 2, t: "x".repeat(9000) }));
+  assert.equal(a.n, 3);
+  const ps = a.text.split("\n\n");
+  assert.equal(ps[0], "clean me <b>not html</b>", "the page puts text in with textContent: tags stay text");
+  assert.equal(ps.length, 2);
+  assert.ok(ps[1].length <= 6000);
+  const big = new C.Arrival();
+  big.take(JSON.stringify({ k: "head", h: "0123abcd", n: 60, from: 0 }));
+  for (let i = 0; i < 60; i++) big.take(JSON.stringify({ k: "p", i, t: "y".repeat(5000) }));
+  assert.ok(big.text.length <= C.MAX_TEXT, "capped at " + C.MAX_TEXT);
+  assert.equal(big.n, 60, "still counted, so the next try asks from the right place");
+});
+test("lines from a growing buffer: whole ones out, the rest kept", () => {
+  assert.deepEqual(C.takeLines(""), [[], ""]);
+  assert.deepEqual(C.takeLines("abc"), [[], "abc"]);
+  assert.deepEqual(C.takeLines("a\nb"), [["a"], "b"]);
+  assert.deepEqual(C.takeLines("a\nb\n"), [["a", "b"], ""]);
+  assert.deepEqual(C.takeLines("\n\n"), [["", ""], ""]);
+});
+test("retry pacing doubles, has a ceiling, and never goes wrong", () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6, 7, 100].map((k) => C.backoff(k, 2, 60)), [2, 4, 8, 16, 32, 60, 60, 60]);
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map((k) => C.backoff(k, 10, 300)), [10, 20, 40, 80, 160, 300]);
+  assert.equal(C.backoff(0, 2, 60), 2);
+  assert.equal(C.backoff(1e9, 2, 60), 60);
+});
+test("saved tide predictions are reused while they span the next day", () => {
+  const h = [[NOW - 7200, 1, "L"], [NOW + 15000, 7, "H"], [NOW + 60000, 0, "L"], [NOW + 100000, 7, "H"]];
+  assert.ok(C.covers(h, NOW, NOW + 26 * 3600));
+  assert.ok(!C.covers(h, NOW, NOW + 30 * 3600), "not far enough ahead");
+  assert.ok(!C.covers(h, NOW - 9000, NOW), "not far enough back");
+  assert.ok(C.covers(h, NOW - 7200, NOW + 100000), "the ends count");
+  for (const bad of [[], null, "x", [[NaN, 1, "H"]], [["a", 1, "H"]], [null]]) assert.ok(!C.covers(bad, NOW, NOW), JSON.stringify(bad));
 });
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

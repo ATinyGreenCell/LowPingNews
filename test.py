@@ -1176,6 +1176,31 @@ def t_tui_star_works_while_reading(env, srv):
     assert "starred" in out, "the hint offered s while reading, but it did nothing"
 
 
+@test
+def t_tui_a_stalled_page_never_freezes_the_reader(env, srv):
+    """Opening a story fetched its page with the screen waiting: on a stalled
+    link nothing moved for 20 s, and not even b (back) worked."""
+    def stall(h):
+        h.send_response(200)
+        h.send_header("Content-Type", "text/html")
+        h.send_header("Content-Length", "200000")
+        h.end_headers()
+        h.wfile.write(b"<html><body><p>" + b"x" * 300)
+        h.wfile.flush()
+        time.sleep(30)                                # the link goes silent, still open
+    srv.routes["/stall"] = stall
+    srv.feed("/f", [item("Stalled story", body="The feed's own summary of it.", link=srv.url("/stall"))])
+    sources(env, [{"id": "a", "name": "A", "kind": "rss", "cats": ["top"], "url": srv.url("/f")}])
+    e = dict(env); e["LPN_NO_PING"] = "1"
+    t0 = time.time()
+    out = _drive_tui(e, [b"\r", b"j", b"b", b"q"], cols=80, settle=1.0)
+    took = time.time() - t0
+    assert "Traceback" not in out, out[-400:]
+    assert "getting the page" in out, "no sign of the page loading:\n" + out[-600:]
+    assert "feed's own summary" in out, "the summary should show while the page loads"
+    assert took < 15, "the keys waited for the stalled page: %.1f s" % took
+
+
 # ---------------------------------------------------------------- efficiency
 @test
 def t_a_304_is_not_reported_as_free(env, srv):

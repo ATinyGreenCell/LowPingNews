@@ -304,6 +304,86 @@ await test("?why: one small answer for the app, kept at the edge, never for othe
   } finally { globalThis.fetch = real; delete globalThis.caches; }
 });
 
+// ---- a paragraph per line (s=1), and picking up after a dropped link ----------
+const lines = async (r) => (await r.text()).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const askS = (u, extra = "", env = {}, ctx) =>
+  W.fetch(new Request("https://reader.example/?cat=top&u=" + encodeURIComponent(u) + "&s=1" + extra, { headers: { Origin: ORIGIN } }), env, ctx);
+await test("s=1: a head, one line per paragraph, an end - the same text as the JSON answer", async () => {
+  const whole = await (await ask("https://news.example/a")).json();
+  const r = await askS("https://news.example/a");
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /^text\/plain/, "text/plain, so Cloudflare compresses it");
+  assert.equal(r.headers.get("access-control-allow-origin"), ORIGIN);
+  const L = await lines(r);
+  const [head, ...rest] = L, end = rest.pop();
+  assert.deepEqual([head.k, head.from, head.n, head.h], ["head", 0, rest.length, R.hashText(whole.text)]);
+  assert.ok(rest.every((x, i) => x.k === "p" && x.i === i), "paragraphs in order, numbered");
+  assert.equal(rest.map((x) => x.t).join("\n\n"), whole.text, "the same text, split at its paragraphs");
+  assert.deepEqual([end.k, end.complete], ["end", whole.complete]);
+  const js = await (await askS("https://news.example/js")).text();
+  assert.match(js.trim().split("\n").pop(), /"note":"this looks like only part/, "a partial article's note rides on the end line");
+});
+await test("a cut answer continues where it stopped; a changed text starts over", async () => {
+  const L = await lines(await askS("https://news.example/a"));
+  const h = L[0].h, n = L[0].n;
+  const more = await lines(await askS("https://news.example/a", "&from=3&h=" + h));
+  assert.equal(more[0].from, 3);
+  assert.deepEqual(more.slice(1, -1).map((x) => x.i), Array.from({ length: n - 3 }, (_, i) => i + 3), "only the missing paragraphs");
+  assert.equal(more.slice(1, -1).map((x) => x.t).join("\n\n"), L.slice(4, -1).map((x) => x.t).join("\n\n"));
+  for (const [q, why] of [["&from=3&h=0badc0de", "another text"], ["&from=" + (n + 1) + "&h=" + h, "past the end"],
+                          ["&from=3", "no hash"], ["&from=-2&h=" + h, "negative"], ["&from=3&h=" + h.toUpperCase(), "not a hash"]]) {
+    const again = await lines(await askS("https://news.example/a", q));
+    assert.equal(again[0].from, 0, why + ": the whole text again");
+    assert.equal(again.length, L.length, why);
+  }
+  const none = await lines(await askS("https://news.example/a", "&from=" + n + "&h=" + h));
+  assert.deepEqual(none.map((x) => x.k), ["head", "end"], "already complete: a refresh costs two short lines");
+});
+await test("the hash is stable and sensitive", () => {
+  assert.equal(R.hashText(""), "811c9dc5");
+  assert.equal(R.hashText("a"), "e40c292c", "FNV-1a, as published");
+  assert.notEqual(R.hashText("Paragraph one.\n\nTwo"), R.hashText("Paragraph one.\n\nTwo."));
+  assert.equal(R.hashText("😀 café"), R.hashText("😀 café"));
+});
+await test("a slow site: the app hears back in time, and the finished work answers its next try", async () => {
+  const real = globalThis.fetch, store = new Map(), kept = [];
+  globalThis.caches = { default: { match: async (k) => store.get(k.url)?.clone(), put: async (k, r) => { store.set(k.url, r); } } };
+  globalThis.fetch = async (u, init) => {
+    if (String(u) !== "https://news.example/late") return real(u, init);
+    await new Promise((res) => setTimeout(res, 1600));        // a site that ignores the reader's patience
+    return new Response(ARTICLE, { headers: { "content-type": "text/html" } });
+  };
+  listedUrls.push("https://news.example/late");
+  try {
+    const t0 = Date.now();
+    const r = await askS("https://news.example/late", "", { TIMEOUT_MS: "300" }, { waitUntil: (p) => kept.push(p) });
+    assert.equal(r.status, 504, "answered at the deadline, not left hanging");
+    assert.ok(Date.now() - t0 < 1500, "took " + (Date.now() - t0) + " ms");
+    assert.equal(kept.length, 1, "the work goes on after the answer");
+    await kept[0];
+    const t1 = Date.now();
+    const r2 = await askS("https://news.example/late", "", { TIMEOUT_MS: "300" });
+    assert.equal(r2.status, 200);
+    assert.ok(Date.now() - t1 < 200, "the next try comes from the edge cache");
+    const L = await lines(r2);
+    assert.equal(L[0].k, "head"); assert.ok(L[0].n >= 6);
+  } finally { globalThis.fetch = real; delete globalThis.caches; listedUrls.pop(); }
+});
+await test("a stalled headline file cannot hold the reader", async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = async (u, init) => {
+    if (String(u) === SITE + "data/top.json")
+      return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))));
+    return real(u, init);
+  };
+  try {
+    const t0 = Date.now();
+    const r = await askS("https://news.example/a", "", { TIMEOUT_MS: "300" });   // 8 s for real, 1 s here
+    assert.equal(r.status, 404);
+    assert.ok(Date.now() - t0 < 2500, "took " + (Date.now() - t0) + " ms");
+  } finally { globalThis.fetch = real; }
+});
+
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");
   assert.equal(R.extract("<p>Ctrl \u0007chars\u202e and a long enough paragraph to keep here.</p>"), "Ctrl chars and a long enough paragraph to keep here.");

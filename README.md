@@ -75,7 +75,24 @@ story opens its **text only**, like the terminal app: a few KB instead of the
 whole website. Articles you open are kept on the phone (the last 40), so
 reading one again costs nothing and works offline.
 
-**Data.** The whole app is about 15 KB the first time, then kept on the phone. A
+On a slow link the text fills in paragraph by paragraph as it arrives, with the
+feed's summary shown meanwhile. If the connection drops, what arrived stays on
+screen (and on the phone: the story is marked "part saved"), and only the rest
+is fetched when the link is back - at once when the phone reports it is online
+again, otherwise after 2, 4, 8... seconds. Refreshing an article you already
+have costs about 100 bytes when it has not changed.
+
+**Bad connections.** Nothing waits on a stalled link: every request has time
+limits - for the answer to start, for silence in the middle of it, and overall.
+The news, forecast, alerts and tide times you last had show at once, with their
+age, and a newer copy replaces them when it arrives; the status line says
+"offline" or "slow connection" while it shows the saved copy, and the app tries
+again by itself. Tide predictions are astronomy, fixed in advance, so a saved
+set that spans the next day is reused without asking NOAA. A Wi-Fi sign-in
+page answers "200 OK" too, so it is never saved in place of the news or the
+forecast.
+
+**Data.** The whole app is about 30 KB the first time, then kept on the phone. A
 news section is one small file (roughly 5-8 KB) and costs a few hundred bytes
 when nothing has changed. Weather comes straight from Open-Meteo and
 weather.gov, a few KB each, and is reused for half an hour (alerts: five minutes).
@@ -115,8 +132,9 @@ lpn web                     # turns on GitHub Pages and prints the address
 
 **The article reader** (once, about five minutes, free). A browser cannot fetch
 other sites' pages, so a small Cloudflare Worker does it on request: it fetches
-the one page she taps, keeps only the paragraphs, and sends back the text.
-Nothing is stored or published - publishing copies of articles on the app's
+the one page she taps, keeps only the paragraphs, and sends back the text - a
+paragraph per line, so the app shows each one as it lands and, after a dropped
+link, asks only for the paragraphs it is missing. Nothing is stored or published - publishing copies of articles on the app's
 public site would invite copyright takedowns. It answers only the app's own
 address, and only for links in the app's current headline files, so it is not
 an open proxy.
@@ -804,7 +822,11 @@ ordinary text stream.
 ## Reading an article
 
 Pressing enter in `--tui`, or `news -r N`, fetches the article itself rather
-than the feed blurb, and says which of three things you actually got:
+than the feed blurb, and says which of three things you actually got. In the
+interactive reader the article opens at once on the feed's summary while the
+page loads beside it, with the bytes so far on the bottom line: on a stalled
+link the keys keep working and **b** goes back, and the text is saved whenever
+it arrives.
 
 ```
   full article

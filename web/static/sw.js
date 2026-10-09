@@ -1,6 +1,6 @@
 "use strict";
 const sw = self;
-const VERSION = "9.7";
+const VERSION = "9.8";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
 const CORE = ["./", "./index.html", "./app.js", "./core.js"];
@@ -24,6 +24,17 @@ sw.addEventListener("activate", (e) => {
         .then((ks) => Promise.all(ks.filter((k) => k.startsWith("lpn-shell-") && k !== SHELL).map((k) => caches.delete(k))))
         .then(() => sw.clients.claim()));
 });
+const WAIT_MS = 4000;
+const usable = (r) => r.ok && /json/i.test(r.headers.get("content-type") || "");
+async function savedCopy(url, why) {
+    const hit = await caches.match(url, { cacheName: DATA });
+    if (!hit)
+        return undefined;
+    const h = new Headers(hit.headers);
+    h.set("x-lpn-offline", "1");
+    h.set("x-lpn-saved", why);
+    return new Response(await hit.blob(), { status: 200, headers: h });
+}
 sw.addEventListener("fetch", (e) => {
     const req = e.request;
     const url = new URL(req.url);
@@ -32,20 +43,25 @@ sw.addEventListener("fetch", (e) => {
     if (url.pathname.includes("/data/abs/"))
         return;
     if (url.pathname.includes("/data/")) {
-        e.respondWith(fetch(req).then((r) => {
-            if (r.ok) {
-                const copy = r.clone();
-                void caches.open(DATA).then((c) => c.put(req.url, copy));
-            }
-            return r;
-        }).catch(async () => {
-            const hit = await caches.match(req.url, { cacheName: DATA });
-            if (!hit)
-                return new Response("", { status: 503, statusText: "offline" });
-            const h = new Headers(hit.headers);
-            h.set("x-lpn-offline", "1");
-            return new Response(await hit.blob(), { status: 200, headers: h });
-        }));
+        const net = fetch(req);
+        e.waitUntil(net.then((r) => {
+            if (!usable(r))
+                return undefined;
+            const copy = r.clone();
+            return caches.open(DATA).then((c) => c.put(req.url, copy));
+        }).catch(() => undefined));
+        e.respondWith((async () => {
+            let timer;
+            const late = new Promise((res) => { timer = setTimeout(() => res("slow"), WAIT_MS); });
+            const first = await Promise.race([net.catch(() => "offline"), late]);
+            clearTimeout(timer);
+            if (first instanceof Response && usable(first))
+                return first;
+            const saved = await savedCopy(req.url, first === "slow" ? "slow" : "offline");
+            if (saved)
+                return saved;
+            return first instanceof Response ? first : net.catch(() => new Response("", { status: 503, statusText: "offline" }));
+        })());
         return;
     }
     e.respondWith(caches.match(req, { ignoreSearch: true }).then((hit) => hit || caches.match(req.mode === "navigate" ? "./index.html" : req.url).then((h2) => h2 || fetch(req))));

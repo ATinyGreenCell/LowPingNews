@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "9.7";
+export const APP_VERSION = "9.8";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -111,6 +111,80 @@ export function parseArticle(raw: unknown): Article {
   const d = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const text = typeof d.text === "string" ? d.text.split("\n\n").map((p) => cleanText(p, 6000)).filter(Boolean).join("\n\n").slice(0, 200000) : "";
   return { text, complete: d.complete === true, note: cleanText(d.note, 200), error: cleanText(d.error, 200) };
+}
+
+// ---- an article arriving a paragraph at a time ---------------------------------
+// The reader's s=1 answer is one JSON object per line: a head (the text's hash,
+// its paragraph count, where this answer starts), each paragraph, an end. An
+// Arrival gathers them across connections: a dropped link keeps every whole
+// paragraph that came, and the next answer, asked from=n with the hash, carries
+// on - or, if the text changed meanwhile, starts over (a "reset").
+export const MAX_TEXT = 200000;
+export type Step = "" | "head" | "p" | "end" | "reset" | "bad";
+const whole = (x: unknown): number | null => (typeof x === "number" && Number.isInteger(x) && x >= 0 ? x : null);
+const HASH = /^[0-9a-f]{8}$/;
+export class Arrival {
+  h = "";            // the text's hash, from the reader
+  of = 0;            // how many paragraphs it has
+  n = 0;             // how many arrived (empty ones too: the reader numbers them)
+  text = "";         // what arrived, cleaned, paragraphs joined by blank lines
+  last = "";         // the paragraph just taken; "" when cleaning left nothing
+  complete = false;  // the reader judged the article whole (not a teaser)
+  note = "";
+  done = false;      // the end line came, after every paragraph
+  constructor(saved?: { h?: unknown; n?: unknown; of?: unknown; text?: unknown }) {
+    const n = saved ? whole(saved.n) : null, of = saved ? whole(saved.of) : null;
+    if (saved && typeof saved.h === "string" && HASH.test(saved.h) && n && n <= 5000 && typeof saved.text === "string") {
+      this.h = saved.h; this.n = n; this.of = Math.max(n, of || 0); this.text = saved.text.slice(0, MAX_TEXT);
+    }
+  }
+  /** What to add to the reader's address to carry on from here. */
+  resume(): string { return this.h && this.n ? "&from=" + this.n + "&h=" + this.h : ""; }
+  /** Take one line. "bad" means this answer cannot be used past here: ask again. */
+  take(line: string): Step {
+    let d: Record<string, unknown>;
+    try { d = JSON.parse(line); } catch { return ""; }
+    if (!d || typeof d !== "object") return "";
+    if (d.k === "head") {
+      const h = typeof d.h === "string" && HASH.test(d.h) ? d.h : "", of = whole(d.n), from = whole(d.from);
+      if (!h || of === null || from === null || of > 5000 || from > of) return "bad";
+      if (from === 0) {
+        const had = this.n > 0 || this.text !== "";
+        this.h = h; this.of = of; this.n = 0; this.text = ""; this.done = false;
+        return had ? "reset" : "head";
+      }
+      if (from !== this.n || h !== this.h) return "bad";          // not a continuation of what is here
+      this.of = of;
+      return "head";
+    }
+    if (d.k !== "p" && d.k !== "end") return "";
+    if (!this.h) return "bad";                                     // no head yet
+    if (d.k === "p") {
+      const i = whole(d.i);
+      if (i === null || i > this.n || this.n >= this.of) return "bad";   // a gap: ask again from n
+      if (i < this.n) return "";                                         // had it already
+      this.n++;
+      const t = cleanText(d.t, 6000);
+      this.last = this.text.length + t.length + 2 <= MAX_TEXT ? t : "";
+      if (this.last) this.text = this.text ? this.text + "\n\n" + this.last : this.last;
+      return "p";
+    }
+    if (this.n < this.of) return "bad";                            // ended early: ask for the rest
+    this.complete = d.complete === true;
+    this.note = cleanText(d.note, 200);
+    this.done = true;
+    return "end";
+  }
+  article(): Article { return { text: this.text, complete: this.complete, note: this.note, error: "" }; }
+}
+/** The whole lines in a growing buffer, and the unfinished rest. */
+export function takeLines(buf: string): [string[], string] {
+  const i = buf.lastIndexOf("\n");
+  return i < 0 ? [[], buf] : [buf.slice(0, i).split("\n"), buf.slice(i + 1)];
+}
+/** Seconds before try k (1, 2, ...): doubling from `first`, never over `most`. */
+export function backoff(k: number, first: number, most: number): number {
+  return Math.min(most, first * Math.pow(2, Math.max(0, Math.min(k, 30) - 1)));
 }
 
 /** "just now", "5m", "3h", "2d" - for ages in seconds. */
@@ -436,6 +510,12 @@ export function parsePredictions(raw: unknown): { hilo: Tide[]; error: string } 
 // falling and rising sides differ): with range R and fraction f of the way to
 // the next tide, |level - v| <= d until f = acos(1 - 2d/R) / pi. A side with
 // R <= d never gets d away and runs to the next tide: "whole", not a hold.
+/** Whether saved highs and lows (or current events) span from..to. NOAA's
+ *  predictions are astronomy, fixed far in advance: a saved copy that spans the
+ *  next day is as good as a new one, and costs no request. */
+export function covers(ev: [number, number, string][], from: number, to: number): boolean {
+  return Array.isArray(ev) && ev.some((e) => Array.isArray(e) && e[0] <= from) && ev.some((e) => Array.isArray(e) && e[0] >= to);
+}
 export const HOLD_FT = 1;
 export function nearWindow(hilo: Tide[], i: number, d = HOLD_FT): { start: number | null; end: number | null; whole: boolean } {
   const [t, v] = hilo[i];

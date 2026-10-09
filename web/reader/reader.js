@@ -12,8 +12,12 @@
 // the app asks it why (?why), getting one small answer instead of GitHub's
 // run listings, which are tens of KB each.
 //
+// Articles can come a paragraph per line (s=1), so the app shows the start at
+// once on a slow link, and after a dropped link asks only for what it is
+// missing (from=N&h=<hash>) instead of starting over.
+//
 // Deploy: lpn reader deploy. Start the 20-minute updates: lpn schedule.
-const VERSION = "9.7";
+const VERSION = "9.8";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;
@@ -357,12 +361,19 @@ async function fetchPage(url, timeoutMs) {
         clearTimeout(timer);
     }
 }
-async function listed(site, cat, url) {
-    const r = await fetch(site + "data/" + cat + ".json", { cf: { cacheTtl: 300 } });
-    if (!r.ok)
-        return false;
-    const d = await r.json();
-    return Array.isArray(d.items) && d.items.some((x) => Array.isArray(x) && x[3] === url);
+async function listed(site, cat, url, timeoutMs) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs); // GitHub's pages stalling must not hold the app
+    try {
+        const r = await fetch(site + "data/" + cat + ".json", { cf: { cacheTtl: 300 }, signal: ac.signal });
+        if (!r.ok)
+            return false;
+        const d = await r.json();
+        return Array.isArray(d.items) && d.items.some((x) => Array.isArray(x) && x[3] === url);
+    }
+    finally {
+        clearTimeout(timer);
+    }
 }
 export async function read(url, timeoutMs = TIMEOUT_MS) {
     // a paper's own API first: clean, reliable, and never an anti-bot wall
@@ -613,8 +624,44 @@ function reply(body, status, origin, cache = 0) {
     h.set("Cache-Control", cache ? "public, max-age=" + cache : "no-store");
     return new Response(JSON.stringify(body), { status, headers: h });
 }
+// ---- an article a paragraph at a time (s=1) --------------------------------
+// One JSON object per line: a head (the text's hash, how many paragraphs, and
+// where this answer starts), each paragraph, then an end. The app shows each
+// paragraph as it lands. After a dropped link it asks from=N&h=<hash> and gets
+// only the paragraphs it is missing; if the text changed since (another hash),
+// the head says from 0 and the whole text comes again. text/plain, not JSON:
+// Cloudflare compresses it, and a decompressing browser still hands the app
+// each line as it arrives.
+/** FNV-1a over the text's UTF-16 units: 8 hex digits, the same in every runtime. */
+export function hashText(s) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++)
+        h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+    return ("0000000" + (h >>> 0).toString(16)).slice(-8);
+}
+export function streamLines(out, from, h) {
+    const ps = out.text.split("\n\n");
+    const hash = hashText(out.text);
+    const start = h === hash && from > 0 && from <= ps.length ? from : 0;
+    const lines = [JSON.stringify({ k: "head", v: 1, h: hash, n: ps.length, c: out.text.length, from: start })];
+    for (let i = start; i < ps.length; i++)
+        lines.push(JSON.stringify({ k: "p", i, t: ps[i] }));
+    lines.push(JSON.stringify(out.note ? { k: "end", complete: out.complete, note: out.note } : { k: "end", complete: out.complete }));
+    return lines.join("\n") + "\n";
+}
+function streamReply(out, from, h, origin) {
+    return new Response(streamLines(out, from, h), { status: 200, headers: {
+            "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": origin, Vary: "Origin",
+            "X-Content-Type-Options": "nosniff", "X-LPN-Reader": VERSION, "Access-Control-Expose-Headers": "X-LPN-Reader",
+            "Cache-Control": "public, max-age=3600"
+        } });
+}
+// The longest the app is kept waiting for a page the reader is still fetching.
+// The work goes on after that (and after a dropped link): it lands in the edge
+// cache, so the app's next try is answered at once.
+const DEADLINE_MS = 20000;
 export default {
-    async fetch(req, env = {}) {
+    async fetch(req, env = {}, ctx) {
         const site = (env.SITE || SITE).replace(/\/?$/, "/");
         const allow = new URL(site).origin;
         const origin = req.headers.get("Origin") || "";
@@ -637,31 +684,48 @@ export default {
         const url = safeUrl(q.get("u"));
         if (!/^[a-z0-9_-]{1,24}$/.test(cat) || !url)
             return reply({ v: 1, error: "bad request" }, 400, allow);
+        // s=1: a paragraph per line; from and h continue an answer that was cut off
+        const stream = q.get("s") === "1";
+        const from = Math.min(100000, Math.max(0, parseInt(q.get("from") || "0", 10) || 0));
+        const h = /^[0-9a-f]{8}$/.test(q.get("h") || "") ? q.get("h") : "";
+        const answer = (out) => (stream ? streamReply(out, from, h, allow) : reply(out, 200, allow, 3600));
         const cache = globalThis.caches?.default;
         const key = new Request("https://reader.cache/" + encodeURIComponent(url));
         if (cache) {
             const hit = await cache.match(key);
             if (hit)
-                return reply(await hit.json(), 200, allow, 3600);
+                return answer(await hit.json());
         }
+        // an optional TIMEOUT_MS setting, bounded: 0.1 s to 30 s, default 10 s
+        const tmo = Math.min(30000, Math.max(100, Number(env.TIMEOUT_MS) || TIMEOUT_MS));
         let ok = false;
         try {
-            ok = await listed(site, cat, url);
+            ok = await listed(site, cat, url, Math.min(8000, Math.max(1000, tmo)));
         }
         catch {
             ok = false;
         }
         if (!ok)
             return reply({ v: 1, error: "not a story in the app right now" }, 404, allow);
-        // an optional TIMEOUT_MS setting, bounded: 0.1 s to 30 s, default 10 s
-        const tmo = Math.min(30000, Math.max(100, Number(env.TIMEOUT_MS) || TIMEOUT_MS));
-        const out = await read(url, tmo);
+        const job = read(url, tmo).then(async (out) => {
+            if (out.text && cache) {
+                try {
+                    await cache.put(key, new Response(JSON.stringify(out), { headers: { "Cache-Control": "public, max-age=21600" } }));
+                }
+                catch { /* the edge cache is a bonus */ }
+            }
+            return out;
+        }).catch(() => ({ v: 1, url, text: "", complete: false, error: "the reader failed on that page" }));
+        if (ctx)
+            ctx.waitUntil(job); // finished and kept even if the app gives up
+        let timer;
+        const late = new Promise((res) => { timer = setTimeout(() => res(null), Math.min(DEADLINE_MS, 2 * tmo + 500)); });
+        const out = await Promise.race([job, late]).finally(() => clearTimeout(timer));
+        if (!out)
+            return reply({ v: 1, error: "the site is slow to answer" }, 504, allow);
         if (!out.text)
             return reply({ v: 1, url, text: "", complete: false, error: out.error || "no readable text on that page" }, 502, allow);
-        if (cache) {
-            await cache.put(key, new Response(JSON.stringify(out), { headers: { "Cache-Control": "public, max-age=21600" } }));
-        }
-        return reply(out, 200, allow, 3600);
+        return answer(out);
     },
     // Cloudflare's cron (set up by lpn schedule): start the site's update on time
     async scheduled(_event, env = {}) {

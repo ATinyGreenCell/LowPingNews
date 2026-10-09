@@ -1,4 +1,4 @@
-export const APP_VERSION = "9.7";
+export const APP_VERSION = "9.8";
 export const SHOW = 10;
 export const MORE = 10;
 const ANSI = /(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,2000}(?:\x07|\x1b\\|\x9c)?|\x1b[@-Z\\\-_]/g;
@@ -91,6 +91,89 @@ export function parseArticle(raw) {
     const d = (raw && typeof raw === "object" ? raw : {});
     const text = typeof d.text === "string" ? d.text.split("\n\n").map((p) => cleanText(p, 6000)).filter(Boolean).join("\n\n").slice(0, 200000) : "";
     return { text, complete: d.complete === true, note: cleanText(d.note, 200), error: cleanText(d.error, 200) };
+}
+export const MAX_TEXT = 200000;
+const whole = (x) => (typeof x === "number" && Number.isInteger(x) && x >= 0 ? x : null);
+const HASH = /^[0-9a-f]{8}$/;
+export class Arrival {
+    constructor(saved) {
+        this.h = "";
+        this.of = 0;
+        this.n = 0;
+        this.text = "";
+        this.last = "";
+        this.complete = false;
+        this.note = "";
+        this.done = false;
+        const n = saved ? whole(saved.n) : null, of = saved ? whole(saved.of) : null;
+        if (saved && typeof saved.h === "string" && HASH.test(saved.h) && n && n <= 5000 && typeof saved.text === "string") {
+            this.h = saved.h;
+            this.n = n;
+            this.of = Math.max(n, of || 0);
+            this.text = saved.text.slice(0, MAX_TEXT);
+        }
+    }
+    resume() { return this.h && this.n ? "&from=" + this.n + "&h=" + this.h : ""; }
+    take(line) {
+        let d;
+        try {
+            d = JSON.parse(line);
+        }
+        catch {
+            return "";
+        }
+        if (!d || typeof d !== "object")
+            return "";
+        if (d.k === "head") {
+            const h = typeof d.h === "string" && HASH.test(d.h) ? d.h : "", of = whole(d.n), from = whole(d.from);
+            if (!h || of === null || from === null || of > 5000 || from > of)
+                return "bad";
+            if (from === 0) {
+                const had = this.n > 0 || this.text !== "";
+                this.h = h;
+                this.of = of;
+                this.n = 0;
+                this.text = "";
+                this.done = false;
+                return had ? "reset" : "head";
+            }
+            if (from !== this.n || h !== this.h)
+                return "bad";
+            this.of = of;
+            return "head";
+        }
+        if (d.k !== "p" && d.k !== "end")
+            return "";
+        if (!this.h)
+            return "bad";
+        if (d.k === "p") {
+            const i = whole(d.i);
+            if (i === null || i > this.n || this.n >= this.of)
+                return "bad";
+            if (i < this.n)
+                return "";
+            this.n++;
+            const t = cleanText(d.t, 6000);
+            this.last = this.text.length + t.length + 2 <= MAX_TEXT ? t : "";
+            if (this.last)
+                this.text = this.text ? this.text + "\n\n" + this.last : this.last;
+            return "p";
+        }
+        if (this.n < this.of)
+            return "bad";
+        this.complete = d.complete === true;
+        this.note = cleanText(d.note, 200);
+        this.done = true;
+        return "end";
+    }
+    article() { return { text: this.text, complete: this.complete, note: this.note, error: "" }; }
+}
+export function takeLines(buf) {
+    const i = buf.lastIndexOf("\n");
+    return i < 0 ? [[], buf] : [buf.slice(0, i).split("\n"), buf.slice(i + 1)];
+}
+export function backoff(k, first, most) {
+    return Math.min(most, first * Math.pow(2, Math.max(0, Math.min(k, 30) - 1)));
 }
 const PREPRINT = /^https?:\/\/(?:www\.|connect\.)?(biorxiv|medrxiv)\.org\/(?:content\/(?:early\/\d{4}\/\d{2}\/\d{2}\/)?|cgi\/content\/(?:short|abstract|full)\/)(?:10\.1101\/)?(\d{4}\.\d{2}\.\d{2}\.\d{5,8}|\d{6})(?:v\d+)?/i;
 export function preprintId(link) {
@@ -381,6 +464,9 @@ export function parsePredictions(raw) {
     }
     out.sort((a, b) => a[0] - b[0]);
     return { hilo: out, error: out.length ? "" : "no predictions" };
+}
+export function covers(ev, from, to) {
+    return Array.isArray(ev) && ev.some((e) => Array.isArray(e) && e[0] <= from) && ev.some((e) => Array.isArray(e) && e[0] >= to);
 }
 export const HOLD_FT = 1;
 export function nearWindow(hilo, i, d = HOLD_FT) {
