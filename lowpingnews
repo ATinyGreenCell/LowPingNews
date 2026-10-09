@@ -80,7 +80,76 @@ cmd_status() {
   fi
   [ -n "$iv" ] && [ -n "$rv" ] && [ "$iv" != "$rv" ] && \
     say "MISMATCH   installed $iv != repo $rv - run: lowpingnews install"
+  site_status
   return 0
+}
+
+# The phone web app's news is only as fresh as its last publish: when that
+# was, and if it has stopped, why - with the one command or setting that fixes it.
+gh_t() {   # gh, but a weak signal cannot hold lpn status for long
+  if command -v timeout >/dev/null 2>&1; then timeout 20 gh "$@"; else gh "$@"; fi
+}
+
+site_status() {
+  command -v gh >/dev/null 2>&1 || return 0
+  slug="$(repo_slug)"
+  case "$slug" in */*) ;; *) return 0 ;; esac
+  runs="$(gh_t run list -R "$slug" --workflow web.yml -L 20 \
+          --json number,databaseId,status,conclusion,createdAt,updatedAt,event 2>/dev/null)" \
+    || { say "site       (could not read the site's updates: gh auth status)"; return 0; }
+  rules="$(gh_t api "repos/$slug/environments/github-pages" --jq '[.protection_rules[]?.type] | join(",")' 2>/dev/null || true)"
+  sched=""; [ -f "$SCHED_FILE" ] && sched=on
+  printf '%s' "$runs" | "$PY" -c '
+import datetime, json, sys, time
+slug, rules, sched = sys.argv[1], sys.argv[2].split(","), sys.argv[3] == "on"
+def ts(s):
+    try:
+        return datetime.datetime.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return 0
+try:
+    runs = json.load(sys.stdin)
+except ValueError:
+    runs = []
+runs = sorted((r for r in runs if isinstance(r, dict) and ts(r.get("createdAt"))), key=lambda r: -ts(r["createdAt"]))
+now = time.time()
+def age(sec):
+    return "%dm" % (sec // 60) if sec < 3600 else "%dh" % (sec // 3600) if sec < 86400 else "%dd" % (sec // 86400)
+def when(t):
+    lt = time.localtime(t)
+    c = time.strftime("%I:%M %p", lt).lstrip("0")
+    return c if lt[:3] == time.localtime(now)[:3] else time.strftime("%a ", lt) + c
+say = lambda x: print("  " + x)
+if not runs:
+    say("site       no update runs found for %s" % slug)
+    sys.exit(0)
+ok = next((r for r in runs if r.get("conclusion") == "success"), None)
+since_ok = [r for r in runs if not ok or ts(r["createdAt"]) > ts(ok["createdAt"])]
+recent = [r for r in runs if now - ts(r["createdAt"]) < 7200]
+on_time = sum(1 for r in recent if r.get("event") == "workflow_dispatch") >= 3
+head = ("published %s ago" % age(now - ts(ok.get("updatedAt") or ok["createdAt"]))) if ok \
+    else "nothing published in the last %d runs" % len(runs)
+say("site       " + head + (" - updates started on time by Cloudflare" if on_time else ""))
+held = next((r for r in since_ok if r.get("status") == "waiting" and now - ts(r["createdAt"]) > 300), None)
+done = [r for r in since_ok if r.get("status") == "completed" and r.get("conclusion") not in ("cancelled", "skipped")]
+bad = [r for r in done if r.get("conclusion") in ("failure", "startup_failure", "timed_out")]
+newest = runs[0]
+if held:
+    say("           update #%s has waited since %s to publish" % (held.get("number"), when(ts(held["createdAt"]))))
+    if "required_reviewers" in rules:
+        say("           GitHub wants an approval each time: Settings > Environments > github-pages,")
+        say("           untick Required reviewers, Save protection rules")
+    else:
+        say("           nothing can approve it now - clear it: gh run cancel %s -R %s" % (held.get("databaseId"), slug))
+elif bad and not any(r.get("conclusion") == "success" for r in done):
+    say("           the last %d updates failed - why: gh run view %s -R %s --log-failed" % (len(bad), bad[0].get("databaseId"), slug))
+elif now - ts(newest["createdAt"]) > 90 * 60:
+    say("           no update started since %s - %s" % (when(ts(newest["createdAt"])),
+        "the 20-minute schedule stopped: lpn schedule (its GitHub token may have been revoked)" if sched
+        else "GitHub runs its own schedule a few times a day; for every 20 minutes: lpn schedule"))
+elif not sched and not on_time:
+    say("           every 20 minutes instead of a few times a day: lpn schedule")
+' "$slug" "$rules" "$sched"
 }
 
 sync_web() {   # sync_web VERSION: the web app's archive, only if it matches
@@ -535,7 +604,7 @@ cmd_reader_deploy() {
   cf_token
   cf_account
   out="$(cf_call -X PUT "$CF_API/accounts/$acct/workers/scripts/$READER_NAME" \
-    -F "metadata={\"main_module\":\"reader.js\",\"compatibility_date\":\"2024-09-23\"};type=application/json" \
+    -F "metadata={\"main_module\":\"reader.js\",\"compatibility_date\":\"2024-09-23\",\"keep_bindings\":[\"secret_text\"]};type=application/json" \
     -F "reader.js=@$f;type=application/javascript+module")" || die "could not reach Cloudflare"
   if [ "$(printf '%s' "$out" | cf_json success)" != "true" ]; then
     why="$(printf '%s' "$out" | cf_json errors.0.message)"
@@ -546,6 +615,14 @@ cmd_reader_deploy() {
     -H "Content-Type: application/json" --data '{"enabled":true}' >/dev/null 2>&1 || true
   sub="$(cf_call "$CF_API/accounts/$acct/workers/subdomain" | cf_json result.subdomain)"
   mkdir -p "$CF_DIR" && reader_sum > "$CF_STATE"
+  # the 20-minute schedule, if set up: its cron re-asserted, its token still there
+  # (keep_bindings above asks Cloudflare to keep secrets; this checks it did)
+  if [ -f "$SCHED_FILE" ]; then
+    sapi="$CF_API/accounts/$acct/workers/scripts/$READER_NAME"
+    sched_on >/dev/null 2>&1 || say "(could not re-set the 20-minute schedule: run lpn schedule)"
+    cf_call "$sapi/secrets" 2>/dev/null | grep -q '"GH_TOKEN"' \
+      || say "(the 20-minute schedule lost its GitHub token: run lpn schedule)"
+  fi
   url=""
   case "$sub" in ""|*[!A-Za-z0-9-]*) ;; *) url="https://$READER_NAME.$sub.workers.dev" ;; esac
   say "reader v$rv uploaded${url:+ to $url}"
@@ -566,6 +643,114 @@ cmd_reader_deploy() {
   if [ -n "$slug" ] && command -v gh >/dev/null 2>&1; then
     [ "$(gh variable get READER_URL -R "$slug" 2>/dev/null)" = "$url" ] || cmd_reader "$url"
   fi
+}
+
+# ---- the site's update, started every 20 minutes by the reader --------------
+# GitHub's own scheduler runs a "20-minute" job only a few times a day, so the
+# site's news went hours stale. Cloudflare's cron runs on time: the reader
+# starts the update with a GitHub token that can only start and read this
+# repository's workflow runs. The token is kept on Cloudflare, not here.
+GH_API="${LPN_GH_API:-https://api.github.com}"
+SCHED_FILE="$CF_DIR/schedule"            # the reader's cron, re-asserted by every deploy
+SCHED_CRON="*/20 * * * *"
+
+repo_slug() {
+  [ -n "${LPN_GH_REPO:-}" ] && { printf '%s\n' "$LPN_GH_REPO"; return; }
+  git -C "$REPO" remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\([^/]*/[^/.]*\).*#\1#p'
+}
+
+gh_req() {   # gh_req METHOD PATH [JSON]: GitHub as the schedule token -> HTTP status in $gh_code
+  if [ -n "${3:-}" ]; then
+    gh_out="$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$1" -H "Authorization: Bearer $gtok" \
+      -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+      -H "User-Agent: lowpingnews-lpn" -H "Content-Type: application/json" --data "$3" "$GH_API$2" 2>/dev/null)"
+  else
+    gh_out="$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$1" -H "Authorization: Bearer $gtok" \
+      -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+      -H "User-Agent: lowpingnews-lpn" "$GH_API$2" 2>/dev/null)"
+  fi
+  gh_code="$(printf '%s\n' "$gh_out" | tail -n 1)"
+  case "$gh_code" in [0-9][0-9][0-9]) ;; *) gh_code=000 ;; esac
+}
+
+sched_on() {   # the reader's cron: set, and remembered so deploys re-assert it
+  out="$(cf_call -X PUT "$sapi/schedules" -H "Content-Type: application/json" \
+         --data "[{\"cron\":\"$SCHED_CRON\"}]")" || return 1
+  [ "$(printf '%s' "$out" | cf_json success)" = "true" ] || return 1
+  mkdir -p "$CF_DIR" && printf '%s\n' "$SCHED_CRON" > "$SCHED_FILE"
+}
+
+cmd_schedule() {
+  command -v curl >/dev/null 2>&1 || die "needs curl (pkg install curl)"
+  slug="$(repo_slug)"
+  case "$slug" in */*) ;; *) die "no GitHub remote in $REPO" ;; esac
+  cf_token
+  cf_account
+  sapi="$CF_API/accounts/$acct/workers/scripts/$READER_NAME"
+  if [ "${1:-}" = "off" ]; then
+    cf_call -X PUT "$sapi/schedules" -H "Content-Type: application/json" --data '[]' >/dev/null 2>&1 || true
+    cf_call -X DELETE "$sapi/secrets/GH_TOKEN" >/dev/null 2>&1 || true
+    rm -f "$SCHED_FILE"
+    say "20-minute updates off: the site updates when GitHub's own scheduler runs (a few times a day)"
+    return 0
+  fi
+  grep -q 'scheduled' "$REPO/web/reader/reader.js" 2>/dev/null \
+    || die "this reader cannot start updates yet: lpn sync the newer web app first"
+  # the reader that starts updates has to be the one running on Cloudflare
+  [ "$(reader_sum)" = "$(cat "$CF_STATE" 2>/dev/null)" ] || ( cmd_reader_deploy ) || die "the reader did not deploy"
+  gtok="${LPN_GH_SCHED_TOKEN:-}"
+  if [ -z "$gtok" ]; then
+    [ -t 0 ] || die "run  lpn schedule  in a terminal: it asks for a GitHub token once"
+    owner="${slug%%/*}"; rname="${slug#*/}"
+    say "Cloudflare will start the site's update every 20 minutes. It needs a GitHub"
+    say "token that can only start and read $rname's update runs:"
+    link="https://github.com/settings/personal-access-tokens/new?name=LowPingNews+updates&description=Starts+the+LowPingNews+site+update+every+20+minutes&target_name=$owner&expires_in=none&actions=write"
+    say "  1. Open this link (it fills in the form: no expiry, Actions read and write):"
+    say "     $link"
+    # on the phone, straight to the browser: a long link is easy to mis-copy
+    command -v termux-open-url >/dev/null 2>&1 && termux-open-url "$link" >/dev/null 2>&1 \
+      && say "     (opened in your browser)"
+    say "  2. Repository access: Only select repositories > $rname"
+    say "  3. Generate token, Copy, and paste it here. It is kept on Cloudflare, not this phone."
+    # echo off BEFORE the prompt shows, as for the Cloudflare token
+    stty -echo 2>/dev/null
+    trap 'stty echo 2>/dev/null' EXIT INT TERM
+    printf "  token (hidden): "; read -r gtok; stty echo 2>/dev/null; trap - EXIT INT TERM; echo
+  fi
+  gtok="$(printf '%s' "$gtok" | tr -d ' \r\n\t')"
+  case "$gtok" in
+    github_pat_*) ;;
+    ghp_*|gho_*|ghu_*|ghs_*|ghr_*) die "that is a classic token, which can act on every repository you own.
+  Make a fine-grained one with the link: it can only start this site's update." ;;
+    *) die "that does not look like a GitHub token (fine-grained ones start github_pat_)" ;;
+  esac
+  case "$gtok" in *[!A-Za-z0-9_]*) die "that does not look like a GitHub token" ;; esac
+  [ ${#gtok} -ge 40 ] || die "that is too short to be a GitHub token"
+  gh_req GET "/repos/$slug/actions/workflows/web.yml"
+  case "$gh_code" in
+    200) ;;
+    401) die "GitHub did not accept that token (mistyped, expired or revoked)" ;;
+    403|404) die "that token cannot see $slug's update: under Repository access pick
+  Only select repositories > ${slug#*/}, and Actions: Read and write" ;;
+    000) die "could not reach GitHub" ;;
+    *) die "GitHub answered $gh_code" ;;
+  esac
+  gh_req POST "/repos/$slug/actions/workflows/web.yml/dispatches" '{"ref":"main"}'
+  case "$gh_code" in
+    200|201|204) ;;
+    403|404) die "that token can read but not start updates: give it Actions: Read and write" ;;
+    422) die "GitHub would not start the update (is workflow_dispatch in web.yml?)" ;;
+    000) die "could not reach GitHub" ;;
+    *) die "GitHub answered $gh_code when asked to start the update" ;;
+  esac
+  # stdin, so the token is never in a command line
+  out="$(printf '{"name":"GH_TOKEN","text":"%s","type":"secret_text"}' "$gtok" \
+         | cf_call -X PUT "$sapi/secrets" -H "Content-Type: application/json" --data-binary @-)" \
+    || die "could not reach Cloudflare"
+  [ "$(printf '%s' "$out" | cf_json success)" = "true" ] \
+    || die "Cloudflare would not keep the token: $(printf '%s' "$out" | cf_json errors.0.message)"
+  sched_on || die "Cloudflare would not set the 20-minute schedule"
+  say "done: Cloudflare starts the site's update every 20 minutes (one started just now)"
 }
 
 cmd_reader() {   # cmd_reader URL: point the web app at its article reader
@@ -631,6 +816,8 @@ dev:
   web             put the phone web app online (GitHub Pages) and print its address
   reader URL      give the web app its article reader (a Cloudflare Worker)
   reader deploy   upload the article reader to Cloudflare (asks for an API token once)
+  schedule        update the site every 20 minutes from Cloudflare (asks for a GitHub token once)
+  schedule off    back to GitHub's own scheduler (a few times a day)
   status          installed / repo / newest download / git, and flag mismatches
   sync            newest VALID download -> repo -> install  (never picks by filename)
   install         repo -> PATH, verifying the version actually landed
@@ -649,13 +836,14 @@ EOF
 # weather), so dispatch is unambiguous.
 c="${1:-}"
 case "$c" in
-  update|status|sync|install|test|pull|ship|release|clean|web|reader|-h|--help|help) shift ;;
+  update|status|sync|install|test|pull|ship|release|clean|web|reader|schedule|-h|--help|help) shift ;;
   *) run_news "$@" ;;
 esac
 case "$c" in
   update)  cmd_update ;;
   web)     cmd_web ;;
   reader)  cmd_reader "$@" ;;
+  schedule) cmd_schedule "$@" ;;
   status)  cmd_status ;;
   sync)    cmd_sync ;;
   install) cmd_install ;;

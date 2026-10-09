@@ -1,4 +1,4 @@
-export const APP_VERSION = "9.6";
+export const APP_VERSION = "9.7";
 export const SHOW = 10;
 export const MORE = 10;
 const ANSI = /(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,2000}(?:\x07|\x1b\\|\x9c)?|\x1b[@-Z\\\-_]/g;
@@ -400,3 +400,30 @@ export function nearWindow(hilo, i, d = HOLD_FT) {
     return { start, end, whole };
 }
 export const round5 = (t) => Math.round(t / 300) * 300;
+const WHY_STATES = ["ok", "running", "waiting", "approval", "failing", "idle", "unknown"];
+export function parseWhy(raw) {
+    const d = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    const num = (v) => (typeof v === "number" && isFinite(v) && v >= 0 && v < 1e11 ? v : 0);
+    const state = typeof d.state === "string" && WHY_STATES.includes(d.state) ? d.state : "unknown";
+    return { state, since: num(d.since), lastOk: num(d.lastOk), run: Math.floor(num(d.run)), schedule: d.schedule === true };
+}
+export function whenShort(t, now, timeZone) {
+    const day = (x) => new Date(x * 1000).toLocaleDateString("en-CA", timeZone ? { timeZone } : {});
+    if (day(t) === day(now))
+        return clock(t, false, "en-US", timeZone);
+    const opt = (o) => (timeZone ? { ...o, timeZone } : o);
+    if (now - t < 6 * 86400)
+        return new Date(t * 1000).toLocaleDateString("en-US", opt({ weekday: "short" })) + " " + clock(t, false, "en-US", timeZone);
+    return new Date(t * 1000).toLocaleDateString("en-US", opt({ month: "short", day: "numeric" }));
+}
+export function whyText(w, now, timeZone) {
+    const since = w.since && w.since <= now ? " since " + whenShort(w.since, now, timeZone) : "";
+    switch (w.state) {
+        case "approval": return "waiting for approval on GitHub" + since;
+        case "waiting": return "stuck on GitHub" + since;
+        case "failing": return "updates failing" + since;
+        case "idle": return "no update started" + since;
+        case "running": return "an update is running now";
+        default: return "";
+    }
+}

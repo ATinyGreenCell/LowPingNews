@@ -1,7 +1,7 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
-import type { Tide, CurrentStation, Flows } from "./core.js";
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT } from "./core.js";
+import type { Tide, CurrentStation, Flows, Why } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -54,8 +54,30 @@ function status(): void {
   const d = S.digest;
   if (!d) { s.textContent = S.offline ? "offline, and nothing saved yet" : "loading\u2026"; return; }
   const st = staleness(d.t, now());
-  s.textContent = (S.offline ? "offline \u00b7 saved copy, " : "") + st.text;
+  let text = st.text;
+  if (st.level === "stale") {                      // hours old: say why, when the reader can tell
+    if (WHY.forT === d.t && WHY.text) text = "news is " + ago(now() - d.t) + " old: " + WHY.text;
+    if (!S.offline) void diagnose(d);
+  }
+  s.textContent = (S.offline ? "offline \u00b7 saved copy, " : "") + text;
   s.classList.add(S.offline || st.level === "stale" ? "bad" : st.level === "aging" ? "warn" : "ok");
+}
+
+// Asked at most every 10 minutes per news file: the reader condenses GitHub's
+// record of the site's update runs into one small answer.
+const WHY = { at: 0, forT: 0, text: "" };
+async function diagnose(d: Digest): Promise<void> {
+  if (!d.reader || (WHY.forT === d.t && now() - WHY.at < 600)) return;
+  WHY.at = now(); WHY.forT = d.t; WHY.text = "";
+  let w: Why;
+  try {
+    const r = await fetch(d.reader + (d.reader.includes("?") ? "&" : "?") + "why=1", { cache: "no-store" });
+    w = parseWhy(r.ok ? await r.json() : null);
+  } catch { return; }                             // offline or no reader: the plain warning stands
+  if (S.digest !== d) return;                     // moved on meanwhile
+  if (w.state === "ok" && w.lastOk > d.t + 900) { void loadNews(S.view); return; }   // a newer copy is out: get it
+  WHY.text = whyText(w, now());
+  if (WHY.text) status();
 }
 
 // ---- news ---------------------------------------------------------------

@@ -297,5 +297,22 @@ test("fuzz: tides, currents and windows survive anything a tile or NOAA could se
     assert.ok(!bad.test(p.error || "") && !bad.test(cr.error || ""));
   }
 });
+test("why the news is stale, in words: this week's stuck update, and every other cause", () => {
+  const NY = "America/New_York";
+  const fri = Date.parse("2026-10-09T18:50:00Z") / 1000, tue = Date.parse("2026-10-06T09:26:36Z") / 1000;
+  const w = C.parseWhy({ v: 1, state: "waiting", since: tue, lastOk: tue - 25000, run: 24, schedule: false });
+  assert.equal(C.whyText(w, fri, NY), "stuck on GitHub since Tue 5:26 AM");
+  const today = Date.parse("2026-10-09T13:10:00Z") / 1000;
+  assert.equal(C.whyText(C.parseWhy({ state: "failing", since: today }), fri, NY), "updates failing since 9:10 AM");
+  assert.equal(C.whyText(C.parseWhy({ state: "idle", since: today }), fri, NY), "no update started since 9:10 AM");
+  assert.equal(C.whyText(C.parseWhy({ state: "approval", since: tue }), fri, NY), "waiting for approval on GitHub since Tue 5:26 AM");
+  assert.equal(C.whyText(C.parseWhy({ state: "running" }), fri, NY), "an update is running now");
+  assert.equal(C.whenShort(Date.parse("2026-09-28T12:00:00Z") / 1000, fri, NY), "Sep 28", "more than a week back: the date");
+  assert.equal(C.whyText(C.parseWhy({ state: "waiting", since: fri + 9999 }), fri, NY), "stuck on GitHub", "a time in the future is left out");
+  for (const junk of [null, 5, "x", [], { state: "<script>" }, { state: "ok" }, { state: "unknown" }, { state: 7 }])
+    assert.equal(C.whyText(C.parseWhy(junk), fri, NY), "", JSON.stringify(junk));
+  const odd = C.parseWhy({ state: "waiting", since: NaN, lastOk: -5, run: "24", schedule: "yes" });
+  assert.deepEqual([odd.since, odd.lastOk, odd.run, odd.schedule], [0, 0, 0, false]);
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

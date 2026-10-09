@@ -18,9 +18,14 @@ on:
 
 permissions: {}
 
+# One run at a time, and the NEWEST wins: a new run cancels one still going.
+# With the opposite (GitHub's starter setting), a run whose publish step got
+# stuck - waiting on an approval nobody could give - held this group for three
+# days, and each later run was dropped behind it. Every run republishes the
+# whole site from fresh feeds, so cutting an older one short loses nothing.
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:

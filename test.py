@@ -3740,10 +3740,13 @@ def t_sync_takes_the_web_archive_only_when_it_matches(env, srv):
 
 
 class _FakeCloudflare:
-    """Just enough of api.cloudflare.com to deploy a Worker: GET, PUT, POST."""
+    """Just enough of api.cloudflare.com to deploy a Worker, keep its secrets
+    and set its cron. Like the real one is feared to, an upload whose metadata
+    does not keep secret_text bindings drops the Worker's secrets."""
     def __init__(self, good="T" * 40, refuse=False):
         import http.server, socketserver, threading
         outer, self.good, self.refuse, self.uploads, self.calls = self, good, refuse, [], []
+        self.secrets, self.schedules, self.secret_bodies = {}, [], []
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -3769,21 +3772,86 @@ class _FakeCloudflare:
                     return self._reply({"success": True, "result": [{"id": "acct0123abcd"}]})
                 if p.endswith("/workers/scripts/lowpingnews-reader") and self.command == "PUT":
                     outer.uploads.append((dict(self.headers), body))
+                    meta = re.search(rb'name="metadata"\r\n(?:[^\r\n]*\r\n)*\r\n(\{.*?\})\r\n', body, re.S)
+                    keep = json.loads(meta.group(1)).get("keep_bindings", []) if meta else []
+                    if "secret_text" not in keep:
+                        outer.secrets.clear()
                     if outer.refuse:
                         return self._reply({"success": False, "errors": [{"message": "Script too large"}]})
                     return self._reply({"success": True})
+                if p.endswith("/lowpingnews-reader/secrets") and self.command == "PUT":
+                    outer.secret_bodies.append(body)
+                    d = json.loads(body)
+                    outer.secrets[d["name"]] = d["text"]
+                    return self._reply({"success": True, "result": {"name": d["name"], "type": d["type"]}})
+                if p.endswith("/lowpingnews-reader/secrets") and self.command == "GET":
+                    return self._reply({"success": True, "result": [{"name": k, "type": "secret_text"} for k in outer.secrets]})
+                if "/lowpingnews-reader/secrets/" in p and self.command == "DELETE":
+                    outer.secrets.pop(p.rsplit("/", 1)[1], None)
+                    return self._reply({"success": True, "result": None})
+                if p.endswith("/lowpingnews-reader/schedules"):
+                    if self.command == "PUT":
+                        outer.schedules = json.loads(body)
+                    return self._reply({"success": True, "result": {"schedules": outer.schedules}})
                 if p.endswith("/subdomain") and self.command == "POST":
                     return self._reply({"success": True})
                 if p.endswith("/accounts/acct0123abcd/workers/subdomain"):
                     return self._reply({"success": True, "result": {"subdomain": "sebastian"}})
                 self._reply({"success": False, "errors": [{"message": "unexpected " + p}]})
-            do_GET = do_PUT = do_POST = _any
+            do_GET = do_PUT = do_POST = do_DELETE = _any
 
         class TS(socketserver.ThreadingMixIn, http.server.HTTPServer):
             daemon_threads = True
         self.httpd = TS(("127.0.0.1", 0), H)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.api = "http://127.0.0.1:%d/client/v4" % self.httpd.server_address[1]
+
+
+class _FakeGitHub:
+    """api.github.com for one repository's update workflow. Tokens: GOOD can
+    read and start runs, READ only read, ELSE cannot see the repository."""
+    GOOD, READ, ELSE = "github_pat_" + "G" * 70, "github_pat_" + "R" * 70, "github_pat_" + "E" * 70
+
+    def __init__(self, slug="ATinyGreenCell/LowPingNews"):
+        import http.server, socketserver, threading
+        outer, self.slug, self.dispatches, self.seen = self, slug, [], []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj=None):
+                b = json.dumps(obj).encode() if obj is not None else b""
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def _any(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                tok = (self.headers.get("Authorization") or "").replace("Bearer ", "")
+                outer.seen.append((self.command, self.path, self.headers.get("User-Agent")))
+                base = "/repos/%s/actions/workflows/web.yml" % outer.slug
+                if tok not in (outer.GOOD, outer.READ, outer.ELSE):
+                    return self._send(401, {"message": "Bad credentials"})
+                if tok == outer.ELSE or not self.path.startswith(base):
+                    return self._send(404, {"message": "Not Found"})
+                if self.command == "GET" and self.path == base:
+                    return self._send(200, {"id": 1, "path": ".github/workflows/web.yml", "state": "active"})
+                if self.command == "POST" and self.path == base + "/dispatches":
+                    if tok != outer.GOOD:
+                        return self._send(403, {"message": "Resource not accessible by personal access token"})
+                    outer.dispatches.append(json.loads(body))
+                    return self._send(204)
+                self._send(404, {"message": "Not Found"})
+            do_GET = do_POST = _any
+
+        class TS(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+        self.httpd = TS(("127.0.0.1", 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.api = "http://127.0.0.1:%d" % self.httpd.server_address[1]
 
 
 @test
@@ -3845,6 +3913,167 @@ def t_the_reader_deploys_from_the_terminal(env, srv):
         assert rc == 0 and len(cf.uploads) == n + 1 and "token (hidden)" not in out, out
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_the_site_updates_every_20_minutes_from_cloudflare(env, srv):
+    """lpn schedule: checks a GitHub token can see and start this repository's
+    update, keeps it on Cloudflare (never on the phone, never on screen), sets
+    the reader's 20-minute cron; deploys keep both."""
+    tmp = tempfile.mkdtemp()
+    try:
+        repo = os.path.join(tmp, "repo")                 # no .git: can never touch a real repository
+        os.makedirs(os.path.join(repo, "web", "reader"))
+        shutil.copy(os.path.join(WEB, "reader", "reader.js"), os.path.join(repo, "web", "reader", "reader.js"))
+        cf, gh = _FakeCloudflare(), _FakeGitHub()
+        cfg = os.path.join(tmp, "cfg")
+        base = dict(env, LPN_REPO=repo, LPN_CF_API=cf.api, LPN_GH_API=gh.api, XDG_CONFIG_HOME=cfg, LPN_CF_VERIFY_TRIES="0",
+                    HOME=tmp, CLOUDFLARE_API_TOKEN="T" * 40, LPN_GH_REPO="ATinyGreenCell/LowPingNews")
+
+        def lpn(*a, **extra):
+            r = subprocess.run(["sh", os.path.join(HERE, "lowpingnews")] + list(a), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(base, **extra), timeout=60)
+            return r.returncode, r.stdout.decode("utf-8", "replace")
+        rc, out = lpn("schedule")
+        assert rc != 0 and "in a terminal" in out and not gh.seen, "no token and no terminal: say how, do not hang: " + out
+        for tok, want, asks_github in (("ghp_" + "C" * 36, "classic token", False), ("not a token", "does not look like", False),
+                                       ("github_pat_" + "X" * 70, "did not accept", True),
+                                       (gh.ELSE, "cannot see ATinyGreenCell/LowPingNews", True), (gh.READ, "can read but not start", True)):
+            n = len(gh.seen)
+            rc, out = lpn("schedule", LPN_GH_SCHED_TOKEN=tok)
+            assert rc != 0 and want in out, (want, out)
+            assert (len(gh.seen) > n) == asks_github, "a token refused on sight never reaches GitHub: " + want
+            assert not cf.secrets and not cf.schedules and not gh.dispatches, "nothing kept for a token that cannot do the job"
+            assert tok not in out, "a token is never printed"
+        rc, out = lpn("schedule", LPN_GH_SCHED_TOKEN=gh.GOOD)
+        assert rc == 0 and "every 20 minutes" in out, out
+        assert gh.GOOD not in out
+        assert gh.dispatches == [{"ref": "main"}], "the check starts one update right away"
+        assert cf.secrets == {"GH_TOKEN": gh.GOOD} and json.loads(cf.secret_bodies[-1])["type"] == "secret_text"
+        assert cf.schedules == [{"cron": "*/20 * * * *"}], cf.schedules
+        assert cf.uploads, "the reader that starts updates is deployed first"
+        assert io.open(os.path.join(cfg, "lowpingnews", "schedule")).read().strip() == "*/20 * * * *"
+        assert not any(gh.GOOD in io.open(os.path.join(dp, f), errors="replace").read()
+                       for dp, _d, fs in os.walk(tmp) for f in fs), "the GitHub token is kept on Cloudflare only"
+        assert all((ua or "").startswith("lowpingnews") for _m, _p, ua in gh.seen), "GitHub's API needs a User-Agent"
+        # a later deploy (lpn release): the token and the cron survive it
+        cf.schedules = []
+        io.open(os.path.join(repo, "web", "reader", "reader.js"), "a").write("\n// changed\n")
+        rc, out = lpn("reader", "deploy")
+        assert rc == 0 and cf.secrets == {"GH_TOKEN": gh.GOOD}, "a deploy must keep the scheduler's token: " + out
+        assert cf.schedules == [{"cron": "*/20 * * * *"}], "and re-assert its cron"
+        assert "lost its GitHub token" not in out
+        meta = re.search(rb'name="metadata"\r\n(?:[^\r\n]*\r\n)*\r\n(\{.*?\})\r\n', cf.uploads[-1][1], re.S)
+        assert json.loads(meta.group(1))["keep_bindings"] == ["secret_text"]
+        cf.secrets.clear()                               # if Cloudflare ever drops it anyway: said, not silent
+        io.open(os.path.join(repo, "web", "reader", "reader.js"), "a").write("\n// again\n")
+        rc, out = lpn("reader", "deploy")
+        assert rc == 0 and "lost its GitHub token: run lpn schedule" in out, out
+        rc, out = lpn("schedule", "off")
+        assert rc == 0 and cf.schedules == [] and "GH_TOKEN" not in cf.secrets, out
+        assert not os.path.exists(os.path.join(cfg, "lowpingnews", "schedule"))
+        # the real first run: the token pasted at a hidden prompt, never echoed
+        import pty
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ.update(base)
+            os.execvp("sh", ["sh", os.path.join(HERE, "lowpingnews"), "schedule"])
+        seen = _read_until(fd, lambda b: b"token (hidden):" in b, most=20.0)
+        assert b"personal-access-tokens/new?" in seen and b"expires_in=none&actions=write" in seen, seen[-600:]
+        os.write(fd, (gh.GOOD + "\n").encode())
+        seen += _read_until(fd, lambda b: b"every 20 minutes" in b or b"lowpingnews:" in b, most=30.0)
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        assert b"every 20 minutes" in seen and gh.GOOD.encode() not in seen, "the token must not be echoed: %r" % seen[-300:]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_status_says_why_the_site_stopped(env, srv):
+    """lpn status reads the site's update runs (gh) and names the cause and the
+    fix: this week's stuck run, an approval rule, failing builds, no scheduler."""
+    tmp = tempfile.mkdtemp()
+    try:
+        bin_ = os.path.join(tmp, "bin")
+        os.makedirs(bin_)
+        runs_f, rules_f = os.path.join(tmp, "runs.json"), os.path.join(tmp, "rules")
+        fake = os.path.join(bin_, "gh")
+        io.open(fake, "w").write('#!/bin/sh\ncase "$1 $2" in\n  "run list") [ -f "%s.fail" ] && exit 1; cat "%s" ;;\n'
+                                 '  "api repos/"*) cat "%s" 2>/dev/null ;;\n  *) exit 1 ;;\nesac\n' % (runs_f, runs_f, rules_f))
+        os.chmod(fake, 0o755)
+        cfg = os.path.join(tmp, "cfg")
+        e = dict(env, PATH=bin_ + os.pathsep + env.get("PATH", ""), LPN_NOFETCH="1", LPN_GH_REPO="ATinyGreenCell/LowPingNews",
+                 XDG_CONFIG_HOME=cfg, LPN_REPO=tmp, TZ="America/New_York")
+        now = time.time()
+        iso = lambda ago: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - ago))
+
+        def run_(n, ago, status, conclusion, event="schedule", rid=None):
+            return {"number": n, "databaseId": rid or 37000000000 + n, "status": status, "conclusion": conclusion,
+                    "createdAt": iso(ago), "updatedAt": iso(ago - 60), "event": event}
+
+        def status(runs, rules="", sched=False):
+            io.open(runs_f, "w").write(runs if isinstance(runs, str) else json.dumps(runs))
+            io.open(rules_f, "w").write(rules)
+            sf = os.path.join(cfg, "lowpingnews", "schedule")
+            if sched:
+                os.makedirs(os.path.dirname(sf), exist_ok=True)
+                io.open(sf, "w").write("*/20 * * * *\n")
+            elif os.path.exists(sf):
+                os.remove(sf)
+            r = subprocess.run(["sh", os.path.join(HERE, "lowpingnews"), "status"], env=e, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=60)
+            out = r.stdout.decode("utf-8", "replace")
+            assert r.returncode == 0 and "Traceback" not in out, out
+            return " ".join(out.split())
+        H = 3600
+        week = ([run_(37, 0.5 * H, "pending", None)] + [run_(36 - i, (6 + 6 * i) * H, "completed", "cancelled") for i in range(12)]
+                + [run_(24, 81 * H, "waiting", None, rid=37442978265), run_(23, 88 * H, "completed", "success")])
+        out = status(week)
+        assert "published 3d ago" in out and "update #24 has waited since" in out, out
+        assert "gh run cancel 37442978265 -R ATinyGreenCell/LowPingNews" in out, "the exact command that fixed it: " + out
+        out = status(week, rules="branch_policy,required_reviewers")
+        assert "untick Required reviewers" in out and "gh run cancel" not in out, out
+        out = status([run_(12, 0.3 * H, "completed", "failure", rid=111), run_(11, 0.7 * H, "completed", "failure"),
+                      run_(10, 1 * H, "completed", "success")])
+        assert "the last 2 updates failed" in out and "gh run view 111 -R ATinyGreenCell/LowPingNews --log-failed" in out, out
+        out = status([run_(9, 5 * H, "completed", "success")], sched=True)
+        assert "no update started since" in out and "the 20-minute schedule stopped: lpn schedule" in out, out
+        out = status([run_(9, 5 * H, "completed", "success")])
+        assert "GitHub runs its own schedule a few times a day" in out, out
+        healthy = [run_(20 - i, (0.1 + 0.33 * i) * H, "completed", "success", event="workflow_dispatch") for i in range(5)]
+        out = status(healthy, sched=True)
+        assert "published" in out and "updates started on time by Cloudflare" in out and "lpn schedule" not in out, out
+        assert "no update runs found" in status("not json at all") and "no update runs found" in status("[1, null, {}]")
+        io.open(runs_f + ".fail", "w").write("")
+        assert "could not read the site's updates" in status(healthy)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_the_site_workflow_cannot_get_stuck_and_holds_no_spare_rights(env, srv):
+    """The workflow that publishes the phone app: a newer run replaces a stuck
+    one (an older run held at its publish step blocked every update for three
+    days), it can be started by the 20-minute schedule, and each job has only
+    the rights it needs, with every action pinned to an exact commit."""
+    y = io.open(os.path.join(HERE, ".github", "workflows", "web.yml"), encoding="utf-8").read()
+    body = "\n".join(l for l in y.splitlines() if not l.lstrip().startswith("#"))
+    conc = re.search(r"^concurrency:\n((?:[ ]+.*\n)+)", body + "\n", re.M)
+    assert conc and re.search(r"cancel-in-progress:\s*true", conc.group(1)), "a stuck run must be replaced, not queued behind"
+    trig = re.search(r"^on:\n((?:[ ]+.*\n)+)", body + "\n", re.M).group(1)
+    assert re.search(r"^  workflow_dispatch:", trig, re.M), "the 20-minute schedule starts it by workflow_dispatch"
+    assert re.search(r"^  schedule:", trig, re.M), "GitHub's own schedule stays as a fallback"
+    assert re.search(r"^permissions:\s*\{\}\s*$", body, re.M), "no rights by default"
+    jobs = dict(re.findall(r"^  ([a-z]+):\n((?:(?:    .*)?\n)+)", body.split("\njobs:\n", 1)[1] + "\n", re.M))
+    perms = lambda j: dict(re.findall(r"^      ([a-z-]+):\s*([a-z]+)\s*$", re.search(r"^    permissions:\n((?:      .*\n)+)", jobs[j], re.M).group(1), re.M))
+    assert perms("build") == {"contents": "read"}, "the job that reads outside feeds can publish nothing: %r" % perms("build")
+    assert perms("deploy") == {"pages": "write", "id-token": "write"}, perms("deploy")
+    uses = re.findall(r"uses:\s*(\S+)", body)
+    assert uses and all(re.match(r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$", u) for u in uses), "pin every action to a commit: %r" % uses
+    assert re.search(r"persist-credentials:\s*false", jobs["build"]), "the build keeps no git credentials"
 
 
 @test

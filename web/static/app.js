@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT } from "./core.js";
+import { APP_VERSION, SHOW, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -63,8 +63,40 @@ function status() {
         return;
     }
     const st = staleness(d.t, now());
-    s.textContent = (S.offline ? "offline \u00b7 saved copy, " : "") + st.text;
+    let text = st.text;
+    if (st.level === "stale") {
+        if (WHY.forT === d.t && WHY.text)
+            text = "news is " + ago(now() - d.t) + " old: " + WHY.text;
+        if (!S.offline)
+            void diagnose(d);
+    }
+    s.textContent = (S.offline ? "offline \u00b7 saved copy, " : "") + text;
     s.classList.add(S.offline || st.level === "stale" ? "bad" : st.level === "aging" ? "warn" : "ok");
+}
+const WHY = { at: 0, forT: 0, text: "" };
+async function diagnose(d) {
+    if (!d.reader || (WHY.forT === d.t && now() - WHY.at < 600))
+        return;
+    WHY.at = now();
+    WHY.forT = d.t;
+    WHY.text = "";
+    let w;
+    try {
+        const r = await fetch(d.reader + (d.reader.includes("?") ? "&" : "?") + "why=1", { cache: "no-store" });
+        w = parseWhy(r.ok ? await r.json() : null);
+    }
+    catch {
+        return;
+    }
+    if (S.digest !== d)
+        return;
+    if (w.state === "ok" && w.lastOk > d.t + 900) {
+        void loadNews(S.view);
+        return;
+    }
+    WHY.text = whyText(w, now());
+    if (WHY.text)
+        status();
 }
 async function loadNews(cat, manual = false) {
     status();

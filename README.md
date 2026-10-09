@@ -81,11 +81,28 @@ when nothing has changed. Weather comes straight from Open-Meteo and
 weather.gov, a few KB each, and is reused for half an hour (alerts: five minutes).
 
 **How it works.** Phone browsers are not allowed to read most news feeds
-directly, so a GitHub Action reads them every 20 minutes using this program and
-publishes one small file per category beside the app. Nothing runs on a server.
+directly, so a GitHub Action reads them using this program and publishes one
+small file per category beside the app. Nothing runs on a server of yours.
 The app always says how old the news is, says when it is offline and showing a
 saved copy, names any feed that could not be read, and says "ALERTS UNKNOWN"
 rather than implying all-clear when weather.gov cannot be reached.
+
+**Keeping it on time.** GitHub's own scheduler runs a "20-minute" job only a
+few times a day, so on its own the news can be hours old. `lpn schedule` (once,
+after the reader is deployed) has Cloudflare's cron wake the reader every 20
+minutes to start the update. It asks for a GitHub token that can do one thing -
+start and read this repository's update runs - and opens GitHub's form already
+filled in (no expiry, Actions: read and write); you pick the repository and
+tap Generate. The token is checked, then kept on Cloudflare only; `lpn release`
+keeps it and the schedule in place. `lpn schedule off` goes back to GitHub's.
+
+A run is never left blocking the rest: each new run replaces one still going
+(an older run stuck at its publish step once held every update for three
+days). When the news is hours old anyway, the app says why in its status line -
+"stuck on GitHub since Tue 5:26 AM", "updates failing since 9:10 AM", "no update
+started since..." - from one small answer the reader condenses out of GitHub's
+run records, and `lpn status` gives the cause with the command or setting that
+fixes it.
 
 **Setting it up** (once, for the repository owner): sign `gh` in with permission
 to change workflows, release, then switch it on:
@@ -142,8 +159,9 @@ preview never looks like a cut-off article.
 
 The app is TypeScript in `web/src`, compiled to plain JavaScript in `web/static`
 (no frameworks, no dependencies); `web/build_digest.py` builds the news files.
-Scheduled builds stop if the repository sees no activity for 60 days; the app
-then says the news is old rather than showing it as current.
+GitHub turns its own schedule off after 60 days without activity in the
+repository; the 20-minute schedule (`lpn schedule`) is unaffected, and either
+way the app says the news is old rather than showing it as current.
 
 ## Install
 
@@ -758,11 +776,15 @@ and titles in scripts with no Latin characters.
 `lowpingnews` doubles as its own dev tool:
 
 ```sh
-lpn status          installed / repo / newest download / git, flags mismatches
+lpn status          installed / repo / newest download / git, flags mismatches,
+                    and when the site last published (and why not since)
 lpn sync            newest valid build -> repo -> install
 lpn test            smoke test the installed build
 lpn ship "msg"      install, commit, push
 lpn release 4.5     bump, install, test, commit, tag, gh release
+lpn web             put the phone web app on GitHub Pages
+lpn reader deploy   upload the article reader to Cloudflare
+lpn schedule        update the site every 20 minutes from Cloudflare (once)
 ```
 
 `sync` picks builds by parsed `VERSION`, never by filename, and refuses archives

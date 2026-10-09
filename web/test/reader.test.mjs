@@ -215,6 +215,95 @@ await test("hostile pages cost linear time, and the text stays clean", () => {
                "Long enough abstract text here. ".repeat(4) + "\"></head>"), /Long enough abstract/, "found past many broken tags");
   assert.deepEqual(R.metaTags("<META NAME=a CONTENT=b><meta name=c><meta name=d"), ["<META NAME=a CONTENT=b>", "<meta name=c>"]);
 });
+await test("the 20-minute schedule: one request to start the site's update, nothing without a token", async () => {
+  const seen = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = async (u, init = {}) => { seen.push({ u: String(u), init }); return new Response(null, { status: 204 }); };
+  try {
+    await W.scheduled({}, {});
+    await W.scheduled({}, { GH_TOKEN: "not a token!" });
+    assert.equal(seen.length, 0, "no token, or a malformed one: no request at all");
+    await W.scheduled({}, { GH_TOKEN: "github_pat_" + "A".repeat(40) });
+    assert.equal(seen.length, 1);
+    const { u, init } = seen[0];
+    assert.equal(u, "https://api.github.com/repos/atinygreencell/LowPingNews/actions/workflows/web.yml/dispatches");
+    assert.equal(init.method, "POST");
+    assert.deepEqual(JSON.parse(init.body), { ref: "main" });
+    assert.equal(init.headers.Authorization, "Bearer github_pat_" + "A".repeat(40));
+    assert.match(init.headers["User-Agent"], /^Mozilla\/5\.0 \(compatible; LowPingNewsReader\/[\d.]+; \+https:\/\//, "GitHub needs a User-Agent");
+    assert.equal(init.headers["X-GitHub-Api-Version"], "2022-11-28");
+    for (const [code, re] of [[401, /expired or revoked/], [404, /Actions: Read and write/], [403, /Actions: Read and write/], [422, /would not start/], [500, /answered 500/]]) {
+      globalThis.fetch = async () => new Response("{}", { status: code });
+      const r = await R.kick({ GH_TOKEN: "github_pat_" + "B".repeat(40) });
+      assert.ok(!r.ok && re.test(r.why), code + ": " + r.why);
+    }
+    globalThis.fetch = async () => { throw new TypeError("network down"); };
+    assert.match((await R.kick({ GH_TOKEN: "github_pat_" + "C".repeat(40) })).why, /could not be reached/);
+  } finally { globalThis.fetch = real; }
+});
+
+await test("the site's repository comes from its address, and nothing odd gets into the API path", () => {
+  assert.equal(R.repoOf("https://atinygreencell.github.io/LowPingNews/"), "atinygreencell/LowPingNews");
+  assert.equal(R.repoOf("https://someone.github.io/"), "someone/someone.github.io", "a user site's repository");
+  assert.equal(R.repoOf("https://news.example.com/x/"), "", "a custom domain needs GH_REPO");
+  assert.equal(R.repoOf("https://news.example.com/", "Owner/Repo.name_1"), "Owner/Repo.name_1");
+  for (const bad of ["a/..", "a/.", "../b", "a/b/c", "a b/c", "a/b?x=1", "-a/b", "a/" + "x".repeat(101), "a/b#", "a/b%2f"])
+    assert.equal(R.repoOf("https://x.github.io/y/", bad), "", bad);
+  assert.equal(R.repoOf("not a url"), "");
+});
+
+await test("why the news is stale: this week's stuck run, a failing build, a silent scheduler", () => {
+  const H = 3600, now = 1791300000;
+  const run = (n, ago, status, conclusion, done = ago - 60) => ({ run_number: n, status, conclusion,
+    created_at: new Date((now - ago) * 1000).toISOString(), updated_at: new Date((now - done) * 1000).toISOString() });
+  // this week: #24 held at its publish step for days, every later run cancelled behind it, the newest pending
+  const week = [run(37, 0.5 * H, "pending", null), ...Array.from({ length: 12 }, (_, i) => run(36 - i, (6 + 6 * i) * H, "completed", "cancelled")),
+                run(24, 81 * H, "waiting", null, 81 * H), run(23, 88 * H, "completed", "success")];
+  const p = R.pipeline({ workflow_runs: week }, now);
+  assert.deepEqual([p.state, p.run], ["waiting", 24], JSON.stringify(p));
+  assert.equal(p.since, now - 81 * H, "since the first run after the last good one");
+  assert.equal(p.lastOk, now - 88 * H + 60);
+  // the newest run held (approval needed on every run, each cancelled by the next)
+  assert.equal(R.pipeline({ workflow_runs: [run(9, 0.2 * H, "waiting", null), run(8, 0.6 * H, "completed", "cancelled"), run(7, 1 * H, "completed", "success")] }, now).state, "waiting");
+  assert.equal(R.pipeline({ workflow_runs: [run(9, 60, "waiting", null), run(7, 1 * H, "completed", "success")] }, now).state, "running", "a minute's wait is normal");
+  const fail = R.pipeline({ workflow_runs: [run(12, 0.3 * H, "completed", "failure"), run(11, 0.7 * H, "completed", "failure"),
+                                            run(10, 1 * H, "completed", "success")] }, now);
+  assert.deepEqual([fail.state, fail.run, fail.since], ["failing", 12, now - 0.7 * H]);
+  assert.equal(R.pipeline({ workflow_runs: [run(5, 5 * H, "completed", "success")] }, now).state, "idle", "nothing started for hours: the scheduler");
+  assert.equal(R.pipeline({ workflow_runs: [run(6, 0.1 * H, "in_progress", null), run(5, 0.5 * H, "completed", "success")] }, now).state, "running");
+  assert.equal(R.pipeline({ workflow_runs: [run(6, 2 * H, "queued", null), run(5, 3 * H, "completed", "success")] }, now).state, "waiting", "queued for hours");
+  assert.equal(R.pipeline({ workflow_runs: [run(6, 0.3 * H, "completed", "success")] }, now).state, "ok");
+  for (const junk of [null, 5, "x", [], {}, { workflow_runs: "no" }, { workflow_runs: [null, 1, { created_at: "garbage" }] }])
+    assert.equal(R.pipeline(junk, now).state, "unknown", JSON.stringify(junk));
+});
+
+await test("?why: one small answer for the app, kept at the edge, never for other sites", async () => {
+  const real = globalThis.fetch, store = new Map();
+  globalThis.caches = { default: { match: async (k) => store.get(k.url)?.clone(), put: async (k, r) => { store.set(k.url, r); } } };
+  let calls = 0;
+  const now = Date.now();
+  const ago = (s) => new Date(now - s * 1000).toISOString();
+  globalThis.fetch = async (u) => {
+    calls++;
+    if (String(u).includes("/environments/github-pages")) return new Response(JSON.stringify({ protection_rules: [{ type: "required_reviewers" }] }));
+    return new Response(JSON.stringify({ workflow_runs: [{ run_number: 3, status: "waiting", conclusion: null, created_at: ago(3600), updated_at: ago(3600) },
+                                                         { run_number: 2, status: "completed", conclusion: "success", created_at: ago(7200), updated_at: ago(7100) }] }));
+  };
+  try {
+    const ask = (origin) => W.fetch(new Request("https://reader.example/?why=1", { headers: { Origin: origin } }), { GH_TOKEN: "github_pat_" + "D".repeat(40) });
+    const r = await ask(ORIGIN);
+    const d = await r.json();
+    assert.deepEqual([d.state, d.run, d.schedule], ["approval", 3, true], JSON.stringify(d));
+    assert.ok(JSON.stringify(d).length < 200, "a few hundred bytes, not GitHub's 250 KB");
+    assert.equal(r.headers.get("access-control-allow-origin"), ORIGIN);
+    const before = calls;
+    assert.equal((await (await ask(ORIGIN)).json()).state, "approval");
+    assert.equal(calls, before, "the second phone is answered from the edge");
+    assert.equal((await ask("https://evil.example")).status, 403);
+    assert.ok(!JSON.stringify(d).includes("github_pat_"), "the token never leaves");
+  } finally { globalThis.fetch = real; delete globalThis.caches; }
+});
+
 await test("entities and control characters", () => {
   assert.equal(R.decodeEntities("&lt;b&gt; &#8212; &#x1F600; &bogus; &#0;"), "<b> \u2014 \ud83d\ude00 &bogus;  ");
   assert.equal(R.extract("<p>Ctrl \u0007chars\u202e and a long enough paragraph to keep here.</p>"), "Ctrl chars and a long enough paragraph to keep here.");

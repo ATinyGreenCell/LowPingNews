@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "9.6";
+export const APP_VERSION = "9.7";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -451,3 +451,36 @@ export function nearWindow(hilo: Tide[], i: number, d = HOLD_FT): { start: numbe
 }
 /** To five minutes: a window from a curve fit is not good to the minute. */
 export const round5 = (t: number): number => Math.round(t / 300) * 300;
+
+
+// ---- why the news is stale ------------------------------------------------------
+// When the news is hours old the app asks its reader why (?why), and the reader
+// answers from GitHub's record of the site's update runs, condensed to this.
+export interface Why { state: string; since: number; lastOk: number; run: number; schedule: boolean }
+const WHY_STATES = ["ok", "running", "waiting", "approval", "failing", "idle", "unknown"];
+export function parseWhy(raw: unknown): Why {
+  const d = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const num = (v: unknown): number => (typeof v === "number" && isFinite(v) && v >= 0 && v < 1e11 ? v : 0);
+  const state = typeof d.state === "string" && WHY_STATES.includes(d.state) ? d.state : "unknown";
+  return { state, since: num(d.since), lastOk: num(d.lastOk), run: Math.floor(num(d.run)), schedule: d.schedule === true };
+}
+/** A moment in few words: "9:10 AM" today, "Tue 5:26 AM" this week, "Oct 6" before. */
+export function whenShort(t: number, now: number, timeZone?: string): string {
+  const day = (x: number): string => new Date(x * 1000).toLocaleDateString("en-CA", timeZone ? { timeZone } : {});
+  if (day(t) === day(now)) return clock(t, false, "en-US", timeZone);
+  const opt = (o: Intl.DateTimeFormatOptions): Intl.DateTimeFormatOptions => (timeZone ? { ...o, timeZone } : o);
+  if (now - t < 6 * 86400) return new Date(t * 1000).toLocaleDateString("en-US", opt({ weekday: "short" })) + " " + clock(t, false, "en-US", timeZone);
+  return new Date(t * 1000).toLocaleDateString("en-US", opt({ month: "short", day: "numeric" }));
+}
+/** Why the news stopped updating, for the status line; "" when there is no clear reason. */
+export function whyText(w: Why, now: number, timeZone?: string): string {
+  const since = w.since && w.since <= now ? " since " + whenShort(w.since, now, timeZone) : "";
+  switch (w.state) {
+    case "approval": return "waiting for approval on GitHub" + since;
+    case "waiting": return "stuck on GitHub" + since;
+    case "failing": return "updates failing" + since;
+    case "idle": return "no update started" + since;
+    case "running": return "an update is running now";
+    default: return "";
+  }
+}

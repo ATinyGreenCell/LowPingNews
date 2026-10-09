@@ -6,16 +6,21 @@
 // It is not an open proxy: it answers only the app's own address, and only
 // fetches links that appear in the app's current headline files.
 //
-// Deploy: Cloudflare dashboard > Workers & Pages > Create > Worker, paste this
-// file (the compiled reader.js), Deploy. Then: lowpingnews reader <its URL>
+// It also keeps the site's news on time: every 20 minutes Cloudflare's cron
+// wakes it to start the site's update on GitHub, whose own scheduler runs a
+// "20-minute" job only a few times a day. And when the news has gone stale,
+// the app asks it why (?why), getting one small answer instead of GitHub's
+// run listings, which are tens of KB each.
+//
+// Deploy: lpn reader deploy. Start the 20-minute updates: lpn schedule.
 
-const VERSION = "9.6";
+const VERSION = "9.7";
 const SITE = "https://atinygreencell.github.io/LowPingNews/";   // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024;     // stop reading a page here
 const TIMEOUT_MS = 10000;
 const MAX_PARAS = 120;
 
-interface Env { SITE?: string; TIMEOUT_MS?: string }
+interface Env { SITE?: string; TIMEOUT_MS?: string; GH_TOKEN?: string; GH_REPO?: string; GH_REF?: string }
 interface Out { v: number; url: string; text: string; complete: boolean; note?: string; error?: string }
 
 // ---- HTML to text (a port of the terminal app's extract) ---------------
@@ -167,12 +172,14 @@ export function preprintDoi(u: string): { server: string; doi: string } | null {
   return m ? { server: m[1].toLowerCase(), doi: "10.1101/" + m[2] } : null;
 }
 
+// APIs get the crawler convention: NOAA's edge answers tool-like User-Agents
+// with a bare 404, and this still names us and where to find us
+const UA = "Mozilla/5.0 (compatible; LowPingNewsReader/" + VERSION + "; +https://github.com/ATinyGreenCell/LowPingNews)";
 let apiWhy = "";   // why the last API call failed, said in the error so a failure explains itself
 function getJSON(url: string, timeoutMs: number): Promise<unknown> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
-  return fetch(url, { signal: ac.signal, headers: { Accept: "application/json",
-    "User-Agent": "LowPingNewsReader/" + VERSION + " (+github.com/ATinyGreenCell/LowPingNews)" } })
+  return fetch(url, { signal: ac.signal, headers: { Accept: "application/json", "User-Agent": UA } })
     .then(async (r) => {
       if (!r.ok) { apiWhy = "answered " + r.status; return null; }
       const t = await r.text();
@@ -388,6 +395,116 @@ function noaa(body: unknown, d: { error?: { message?: unknown } } | null, allow:
     "Access-Control-Expose-Headers": "X-LPN-Reader" } });
 }
 
+// ---- the site's update: started on time, and explained when it is not ------
+const GH_API = "https://api.github.com";
+const SLUG = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+
+/** "owner/repo" behind the app's site: its github.io address says, or GH_REPO. */
+export function repoOf(site: string, override?: string): string {
+  const ok = (x: string): string => (SLUG.test(x) && !/\/\.\.?$/.test(x) ? x : "");
+  if (override) return ok(override.trim());
+  try {
+    const u = new URL(site);
+    const m = /^([a-z0-9-]{1,39})\.github\.io$/i.exec(u.hostname);
+    if (!m) return "";
+    const first = u.pathname.split("/").filter(Boolean)[0];
+    return ok(m[1] + "/" + (first || u.hostname));      // a user site's repository is named after its host
+  } catch { return ""; }
+}
+
+function ghHeaders(token: string): Record<string, string> {
+  const h: Record<string, string> = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": UA };
+  if (token) h.Authorization = "Bearer " + token;
+  return h;
+}
+const tokenOf = (env: Env): string => { const t = (env.GH_TOKEN || "").trim(); return /^[A-Za-z0-9_]{20,255}$/.test(t) ? t : ""; };
+
+/** Start the site's update: one request to GitHub. Without a token, nothing. */
+export async function kick(env: Env): Promise<{ ok: boolean; status: number; why: string }> {
+  const token = tokenOf(env), repo = repoOf(env.SITE || SITE, env.GH_REPO);
+  const ref = /^[A-Za-z0-9._\/-]{1,100}$/.test(env.GH_REF || "") ? env.GH_REF! : "main";
+  if (!token) return { ok: false, status: 0, why: env.GH_TOKEN ? "the token is malformed" : "no token yet: lpn schedule" };
+  if (!repo) return { ok: false, status: 0, why: "no repository for this site: set GH_REPO" };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 20000);
+  try {
+    const r = await fetch(GH_API + "/repos/" + repo + "/actions/workflows/web.yml/dispatches", {
+      method: "POST", signal: ac.signal, headers: { ...ghHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ ref }) });
+    const why = r.ok ? "" : r.status === 401 ? "GitHub refused the token (expired or revoked): lpn schedule"
+      : r.status === 403 || r.status === 404 ? "the token cannot start this repository's update (Actions: Read and write)"
+      : r.status === 422 ? "GitHub would not start the update (" + ref + ")" : "GitHub answered " + r.status;
+    return { ok: r.ok, status: r.status, why };
+  } catch (e) {
+    return { ok: false, status: 0, why: (e as Error).name === "AbortError" ? "GitHub took too long" : "GitHub could not be reached" };
+  } finally { clearTimeout(timer); }
+}
+
+export interface Pipeline { state: "ok" | "running" | "waiting" | "approval" | "failing" | "idle" | "unknown";
+                            since: number; lastOk: number; run: number }
+/** Where the site's update stands, from GitHub's list of its runs (newest
+ *  first): stuck waiting, failing, not being started, running, or fine. */
+export function pipeline(raw: unknown, now: number): Pipeline {
+  const out: Pipeline = { state: "unknown", since: 0, lastOk: 0, run: 0 };
+  const list = raw && typeof raw === "object" && Array.isArray((raw as { workflow_runs?: unknown }).workflow_runs)
+    ? (raw as { workflow_runs: unknown[] }).workflow_runs : [];
+  const t = (v: unknown): number => { const x = typeof v === "string" ? Date.parse(v) / 1000 : NaN; return isFinite(x) ? x : 0; };
+  const runs = list.filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+    .map((r) => ({ n: typeof r.run_number === "number" ? r.run_number : 0, status: String(r.status || ""),
+                   end: String(r.conclusion || ""), at: t(r.created_at), done: t(r.updated_at) }))
+    .filter((r) => r.at > 0 && r.at <= now + 600).sort((a, b) => b.at - a.at);
+  if (!runs.length) return out;
+  const ok = runs.find((r) => r.end === "success");
+  out.lastOk = ok ? ok.done || ok.at : 0;
+  const after = runs.filter((r) => !ok || r.at > ok.at);           // runs since the last good one, newest first
+  out.since = after.length ? after[after.length - 1].at : 0;
+  const newest = runs[0];
+  // a run held at its publish step blocks every run after it (they queue, or
+  // cancel each other): any one waiting more than a few minutes is the story
+  const held = after.find((r) => r.status === "waiting" && now - r.at > 300);
+  if (held) { out.state = "waiting"; out.run = held.n; return out; }
+  const bad = after.find((r) => r.status === "completed" && ["failure", "startup_failure", "timed_out", "action_required"].includes(r.end));
+  if (bad && after.filter((r) => r.status === "completed" && r.end !== "cancelled" && r.end !== "skipped").every((r) => r.end !== "success")) {
+    out.state = "failing"; out.run = bad.n; return out;
+  }
+  if (newest.status !== "completed" && now - newest.at > 30 * 60) { out.state = "waiting"; out.run = newest.n; return out; }  // queued for ages
+  if (now - newest.at > 90 * 60) { out.state = "idle"; out.since = newest.at; out.run = newest.n; return out; }
+  if (newest.status !== "completed") { out.state = "running"; out.run = newest.n; return out; }
+  out.state = "ok";
+  return out;
+}
+
+/** The app's question when its news is stale: why? One small answer, kept
+ *  five minutes at the edge so many phones cost GitHub one request. */
+async function why(env: Env, allow: string): Promise<Response> {
+  const cache = (globalThis as { caches?: { default?: Cache } }).caches?.default;
+  const key = new Request("https://reader.cache/why");
+  const send = (body: unknown, cacheable: boolean): Response => new Response(JSON.stringify(body), { status: 200, headers: {
+    "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": allow, Vary: "Origin",
+    "Cache-Control": cacheable ? "public, max-age=300" : "no-store", "X-LPN-Reader": VERSION, "Access-Control-Expose-Headers": "X-LPN-Reader" } });
+  if (cache) { const hit = await cache.match(key); if (hit) return send(await hit.json(), true); }
+  const token = tokenOf(env), repo = repoOf(env.SITE || SITE, env.GH_REPO);
+  const now = Date.now() / 1000;
+  let p: Pipeline = { state: "unknown", since: 0, lastOk: 0, run: 0 };
+  if (repo) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 8000);
+    try {
+      const r = await fetch(GH_API + "/repos/" + repo + "/actions/workflows/web.yml/runs?per_page=20&exclude_pull_requests=true",
+                            { signal: ac.signal, headers: ghHeaders(token) });
+      if (r.ok) p = pipeline(await r.json(), now);
+      if (p.state === "waiting") {        // held for approval, or stuck? the environment says
+        const e = await fetch(GH_API + "/repos/" + repo + "/environments/github-pages", { signal: ac.signal, headers: ghHeaders(token) });
+        const ej = e.ok ? await e.json() as { protection_rules?: { type?: string }[] } : null;
+        if (ej && Array.isArray(ej.protection_rules) && ej.protection_rules.some((x) => x && x.type === "required_reviewers")) p.state = "approval";
+      }
+    } catch { /* unknown, said as such */ } finally { clearTimeout(timer); }
+  }
+  const body = { v: 1, ...p, schedule: !!token };
+  if (cache && p.state !== "unknown") await cache.put(key, new Response(JSON.stringify(body), { headers: { "Cache-Control": "public, max-age=300" } }));
+  return send(body, p.state !== "unknown");
+}
+
 function reply(body: Out | { v: number; error: string }, status: number, origin: string, cache = 0): Response {
   const h = new Headers({ "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": origin,
                           Vary: "Origin", "X-Content-Type-Options": "nosniff", "X-LPN-Reader": VERSION,
@@ -409,6 +526,7 @@ export default {
     }
     if (req.method !== "GET") return reply({ v: 1, error: "GET only" }, 405, allow);
     const q = new URL(req.url).searchParams;
+    if (q.has("why")) return why(env, allow);
     if (q.has("tide")) return tide(q, allow);
     if (q.has("cur")) return current(q, allow);
     const cat = q.get("cat") || "";
@@ -428,5 +546,10 @@ export default {
       await cache.put(key, new Response(JSON.stringify(out), { headers: { "Cache-Control": "public, max-age=21600" } }));
     }
     return reply(out, 200, allow, 3600);
+  },
+  // Cloudflare's cron (set up by lpn schedule): start the site's update on time
+  async scheduled(_event: unknown, env: Env = {}): Promise<void> {
+    const r = await kick(env);
+    if (!r.ok) console.log("site update not started: " + r.why);
   },
 };
