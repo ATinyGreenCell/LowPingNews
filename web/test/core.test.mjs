@@ -439,5 +439,25 @@ test("saved tide predictions are reused while they span the next day", () => {
   assert.ok(C.covers(h, NOW - 7200, NOW + 100000), "the ends count");
   for (const bad of [[], null, "x", [[NaN, 1, "H"]], [["a", 1, "H"]], [null]]) assert.ok(!C.covers(bad, NOW, NOW), JSON.stringify(bad));
 });
+test("tab names are short where room is short", () => {
+  assert.equal(C.tabName("Hazards and emergencies"), "Hazards");
+  assert.equal(C.tabName("Biology and preprints"), "Biology");
+  assert.equal(C.tabName("Arts & culture"), "Arts");
+  for (const n of ["Headlines", "PubMed", "World", "Science and", "Band of brothers"]) assert.equal(C.tabName(n), n === "Science and" ? "Science and" : n);
+  assert.equal(C.tabName(" and more"), " and more", "never an empty tab");
+});
+test("a page's own copy of its headline is spotted, real text is not", () => {
+  const t = "Coastal towns brace as autumn storm brings gale-force winds and flooding risk";
+  assert.ok(C.isHeadline(t, t));
+  assert.ok(C.isHeadline("Coastal towns brace as autumn storm brings gale-force winds and flooding risk - BBC News", t), "with the site's name added");
+  assert.ok(C.isHeadline("COASTAL TOWNS BRACE AS AUTUMN STORM BRINGS GALE-FORCE WINDS AND FLOODING RISK", t), "in capitals");
+  assert.ok(C.isHeadline("Coastal towns brace as autumn storm brings gale‑force winds, and flooding risk", t), "other punctuation");
+  assert.ok(!C.isHeadline("Coastal towns brace as autumn storm brings gale-force winds and flooding risk, with forecasters warning that sea defences could fail overnight in several places", t), "a lede that goes on is text");
+  assert.ok(!C.isHeadline("Forecasters have issued amber warnings for parts of the coast.", t));
+  assert.ok(C.isHeadline("Storm", "Storm"), "an exact repeat, however short");
+  assert.ok(!C.isHeadline("Storm warning", "Storm warning issued for the coast"), "a short start of it: too little to judge, kept");
+  assert.ok(!C.isHeadline("", t) && !C.isHeadline(t, ""));
+  assert.ok(C.isHeadline("Café owners fight the new rent rules in the city centre", "Cafe owners fight the new rent rules in the city centre"), "accents");
+});
 console.log("web core tests\n  " + ran + " run, " + failed + " failed");
 process.exit(failed ? 1 : 0);

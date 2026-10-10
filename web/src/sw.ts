@@ -5,7 +5,7 @@
 // A plain script, not a module: classic service workers work in every browser.
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-const VERSION = "9.8";
+const VERSION = "9.9";
 const SHELL = "lpn-shell-" + VERSION;
 const DATA = "lpn-data";
 const CORE = ["./", "./index.html", "./app.js", "./core.js"];          // the app cannot run without these

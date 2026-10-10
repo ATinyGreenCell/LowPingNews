@@ -1,4 +1,4 @@
-import { APP_VERSION, SHOW, Arrival, takeLines, backoff, covers, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
+import { APP_VERSION, SHOW, Arrival, takeLines, backoff, covers, tabName, isHeadline, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
 function el(tag, cls, ...kids) {
     const e = document.createElement(tag);
     if (cls)
@@ -38,6 +38,7 @@ const S = {
     known: new Set(),
     fetched: 0,
     reading: null,
+    listY: 0,
     read: new Set(store("read", [])),
 };
 function markRead(k) {
@@ -143,7 +144,7 @@ async function getJSON(url, o = {}) {
         saved: sv === "slow" ? "slow" : sv || r.headers.get("x-lpn-offline") === "1" ? "offline" : "" };
 }
 const linkWord = () => (navigator.onLine === false ? "offline" : "slow");
-const NEWS = { gen: 0, tries: 0, timer: 0, checking: false };
+const NEWS = { gen: 0, tries: 0, timer: 0, checking: false, at: {} };
 async function savedSite(path) {
     try {
         const hit = await caches.match(new URL(path, location.href).href, { cacheName: "lpn-data" });
@@ -160,9 +161,20 @@ async function savedNews(cat) {
     const hit = await savedSite("./data/" + encodeURIComponent(cat) + ".json");
     return hit ? parseDigest(hit.body, now()) : null;
 }
-async function loadNews(cat, manual = false) {
+async function loadNews(cat, manual = false, cheap = false) {
     const gen = ++NEWS.gen;
     window.clearTimeout(NEWS.timer);
+    if (cheap && now() - (NEWS.at[cat] || 0) < 300) {
+        const saved = await savedNews(cat);
+        if (gen !== NEWS.gen || cat !== S.view)
+            return;
+        if (saved) {
+            if (!S.digest)
+                adopt(saved, false, true);
+            status();
+            return;
+        }
+    }
     const asked = getJSON("./data/" + encodeURIComponent(cat) + ".json", { lim: { wait: 12, idle: 10, total: 90 } })
         .catch(() => null);
     if (!S.digest) {
@@ -192,6 +204,8 @@ async function loadNews(cat, manual = false) {
     if (cat !== S.view)
         return;
     S.offline = how;
+    if (!how && raw)
+        NEWS.at[cat] = now();
     if (how) {
         NEWS.tries++;
         NEWS.timer = window.setTimeout(() => {
@@ -340,6 +354,10 @@ function card(it, kept) {
     c.tabIndex = 0;
     c.setAttribute("role", "button");
     c.onclick = () => openReader(it);
+    c.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openReader(it);
+    } };
     return c;
 }
 function renderNews() {
@@ -425,6 +443,7 @@ function stopReading() {
 }
 function openReader(it, fromHistory = false) {
     S.reading = it;
+    S.listY = window.scrollY;
     markRead(it.key);
     if (!fromHistory)
         history.pushState({ reading: it.key }, "");
@@ -437,6 +456,7 @@ function closeReader() {
     S.reading = null;
     stopReading();
     renderNews();
+    window.scrollTo(0, S.listY);
 }
 const NOTHING = { text: "", complete: false, note: "", error: "" };
 async function renderReader(it, force = false) {
@@ -444,7 +464,7 @@ async function renderReader(it, force = false) {
     const gen = READ.gen, cat = S.view;
     const live = () => gen === READ.gen && S.reading === it;
     const main = $("main");
-    const back = el("button", "back", "\u2039 Back");
+    const back = el("button", "back", "\u2039 " + sectionName());
     back.onclick = () => history.back();
     const paras = el("div", "paras"), prog = el("div", "prog"), notes = el("div", "notes");
     const body = el("div", "body", paras, prog, notes);
@@ -455,10 +475,14 @@ async function renderReader(it, force = false) {
         a_.rel = "noopener noreferrer";
         body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
     }
+    const back2 = el("button", "back last", "\u2039 Back to " + sectionName());
+    back2.onclick = () => history.back();
+    body.append(back2);
     main.replaceChildren(back, el("div", "meta", it.src + (it.t ? " \u00b7 " + ago(now() - it.t) + " ago" : "")), el("h1", "headline", it.title), body);
     let standIn = false;
+    const dup = (p, i) => i < 2 && p.length < 400 && isHeadline(p, it.title);
     const fill = (text, stand, cls = "") => {
-        paras.replaceChildren(...text.split("\n\n").filter(Boolean).map((p) => el("p", cls, p)));
+        paras.replaceChildren(...text.split("\n\n").filter((p, i) => p && !dup(p, i)).map((p) => el("p", cls, p)));
         standIn = stand;
     };
     const say = (text, warn = false, frac = -1, button) => {
@@ -482,10 +506,11 @@ async function renderReader(it, force = false) {
         if (a.text) {
             if (standIn || !paras.childElementCount)
                 fill(a.text, false);
+            const said = a.note ? a.note[0].toUpperCase() + a.note.slice(1) : "";
             if (!a.complete)
-                notes.append(el("p", "note warn", a.note || "This may be only part of the article."));
-            else if (a.note)
-                notes.append(el("p", "note", a.note));
+                notes.append(el("p", "note warn", said || "This may be only part of the article."));
+            else if (said)
+                notes.append(el("p", "note", said));
             if (why)
                 notes.append(el("p", "note warn", why));
             if (savedAgo >= 0)
@@ -565,7 +590,7 @@ async function renderReader(it, force = false) {
                 paras.replaceChildren();
                 standIn = false;
             }
-            if (arr.last)
+            if (arr.last && !dup(arr.last, arr.n - 1))
                 paras.append(el("p", "new", arr.last));
         }
         if (st === "head" || st === "p" || st === "reset")
@@ -691,15 +716,34 @@ async function renderReader(it, force = false) {
 }
 function renderTabs() {
     const nav = $("tabs");
+    const keep_ = nav.scrollLeft;
     nav.replaceChildren();
     const all = [["weather", "Weather"], ["tides", "Tides"], ...S.cats];
+    let on;
     for (const [id, name] of all) {
-        const b = el("button", id === S.view ? "tab on" : "tab", name);
+        const b = el("button", id === S.view ? "tab on" : "tab", tabName(name));
+        if (tabName(name) !== name)
+            b.title = name;
+        if (id === S.view) {
+            on = b;
+            b.setAttribute("aria-current", "page");
+        }
         b.onclick = () => go(id);
         nav.append(b);
     }
+    nav.scrollLeft = keep_;
+    if (on && (on.offsetLeft < nav.scrollLeft || on.offsetLeft + on.offsetWidth > nav.scrollLeft + nav.clientWidth))
+        nav.scrollLeft = Math.max(0, on.offsetLeft - (nav.clientWidth - on.offsetWidth) / 2);
+}
+function sectionName() {
+    const c = S.cats.find(([id]) => id === S.view);
+    return c ? tabName(c[1]) : "the list";
 }
 function go(view) {
+    if (view === S.view && S.reading) {
+        history.back();
+        return;
+    }
     if (view === S.view && view !== "weather" && view !== "tides") {
         void loadNews(view, true);
         return;
@@ -722,37 +766,54 @@ function go(view) {
         void showTides();
     else {
         renderNews();
-        void loadNews(view);
+        void loadNews(view, false, true);
     }
 }
 const US = /-US$/i.test(navigator.language || "") || (navigator.language || "") === "en";
 function spotLine(sp) {
-    const how = sp.via === "device" ? "your phone's location" : sp.via === "place" ? "set by place name" : sp.via;
+    const how = sp.via === "device" ? "from your location" : sp.via === "place" ? "from the place name" : sp.via;
     const age = ago(now() - sp.t);
-    return "For " + sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " (" + how + ", " + (/^\d/.test(age) ? age + " ago" : age) + ")";
+    return sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " \u00b7 set " + how + " " + (/^\d/.test(age) ? age + " ago" : age);
+}
+function placeBlock(sp, then) {
+    const wrap = el("section", "spot");
+    const input = el("input");
+    input.placeholder = "Town, State (e.g. Huntington, NY)";
+    input.autocomplete = "off";
+    input.enterKeyHint = "search";
+    input.setAttribute("aria-label", "Town or place");
+    const find = el("button", "", "Find");
+    const mine = el("button", "primary", "Use my location");
+    const editor = el("div", "where", input, find, mine);
+    find.onclick = () => void findPlace(input.value, then);
+    input.onkeydown = (e) => { if (e.key === "Enter")
+        void findPlace(input.value, then); };
+    mine.onclick = () => locate(then);
+    if (!sp) {
+        wrap.append(editor, el("p", "note", "Choose a place, or use your location. It is kept on this phone only."));
+        return wrap;
+    }
+    const change = el("button", "small", "Change");
+    change.setAttribute("aria-expanded", "false");
+    editor.hidden = true;
+    change.onclick = () => {
+        editor.hidden = !editor.hidden;
+        change.textContent = editor.hidden ? "Change" : "Cancel";
+        change.setAttribute("aria-expanded", String(!editor.hidden));
+        if (!editor.hidden)
+            input.focus();
+    };
+    wrap.append(el("div", "spothead", el("h2", "place", sp.label || "Your spot"), change), el("p", "spotline", spotLine(sp)), editor);
+    return wrap;
 }
 async function showWeather(force = false) {
     status();
     const main = $("main");
     main.replaceChildren();
     const sp = store("spot", null);
-    const box = el("div", "where");
-    const input = el("input");
-    input.placeholder = "Town, State (e.g. Huntington, NY)";
-    input.autocomplete = "off";
-    const find = el("button", "small", "Find");
-    const mine = el("button", "small", "Use my location");
-    box.append(input, find, mine);
-    main.append(box);
-    find.onclick = () => void findPlace(input.value);
-    input.onkeydown = (e) => { if (e.key === "Enter")
-        void findPlace(input.value); };
-    mine.onclick = () => locate();
-    if (!sp) {
-        main.append(el("p", "empty", "Choose a place, or use your location. It is kept on this phone only."));
+    main.append(placeBlock(sp, () => void showWeather(true)));
+    if (!sp)
         return;
-    }
-    main.append(el("h2", "place", sp.label || "Your spot"), el("p", "note", spotLine(sp)));
     const alertsBox = el("section", "alerts", el("p", "note", "Checking for alerts\u2026"));
     const wxBox = el("section", "wx", el("p", "empty", "Loading the forecast\u2026"));
     main.append(alertsBox, wxBox);
@@ -763,29 +824,19 @@ async function showWeather(force = false) {
     void renderForecast(sp, wxBox, force).then(missed);
 }
 const WX = { failed: false }, TD = { failed: false };
-function locate() {
+function locate(then) {
     if (!navigator.geolocation) {
         toast("this browser cannot share its location");
         return;
     }
-    toast("asking for your location\u2026");
-    navigator.geolocation.getCurrentPosition((p) => {
-        keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Here", via: "device", t: now() });
-        void showWeather(true);
-    }, () => toast("location not shared - type a place instead"), { enableHighAccuracy: false, maximumAge: 1800000, timeout: 15000 });
+    toast("finding your location\u2026");
+    const got = (p) => {
+        keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Your location", via: "device", t: now() });
+        then();
+    };
+    navigator.geolocation.getCurrentPosition(got, () => navigator.geolocation.getCurrentPosition(got, () => toast("location not shared - type a place instead"), { enableHighAccuracy: false, maximumAge: 1800000, timeout: 15000 }), { enableHighAccuracy: true, maximumAge: 300000, timeout: 20000 });
 }
 const COOPS = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
-function locatePrecise() {
-    if (!navigator.geolocation) {
-        toast("this browser cannot share its location");
-        return;
-    }
-    toast("finding your exact spot\u2026");
-    navigator.geolocation.getCurrentPosition((p) => {
-        keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Here", via: "device", t: now() });
-        void showTides(true);
-    }, () => toast("location not shared - set a place in Weather instead"), { enableHighAccuracy: true, maximumAge: 300000, timeout: 20000 });
-}
 const SPAN = 26 * 3600;
 async function predictions(sid, force, reader) {
     const t = now();
@@ -922,15 +973,10 @@ async function showTides(force = false) {
     status();
     const main = $("main");
     main.replaceChildren();
-    const mine = el("button", "small", "Use my precise location");
-    mine.onclick = () => locatePrecise();
-    main.append(el("div", "where", mine));
     const sp = store("spot", null);
-    if (!sp) {
-        main.append(el("p", "empty", "Tides need your spot: tap above, or set a place in Weather. It is kept on this phone only."));
+    main.append(placeBlock(sp, () => void showTides(true)));
+    if (!sp)
         return;
-    }
-    main.append(el("h2", "place", sp.label || "Your spot"), el("p", "note", spotLine(sp)));
     const box = el("section", "tides", el("p", "empty", "Loading tides\u2026"));
     main.append(box);
     const t = now();
@@ -1085,7 +1131,7 @@ async function showTides(force = false) {
                 bits.push("wind " + (b.dir !== null ? compass(b.dir) + " " : "") + Math.round(b.wind * 1.944) + " kt");
             if (b.air !== null)
                 bits.push("air " + deg(b.air));
-            box.append(el("div", "tbuoy", el("div", "n", el("strong", "", buoyName(b.name) || "Buoy " + b.id), el("span", "dimw", dot + mi(b.km) + dot + ago(t - b.t) + " ago")), el("p", "small", bits.join(dot) || "no readings")));
+            box.append(el("div", "tbuoy", el("div", "n", el("strong", "", buoyName(b.name) || "Buoy " + b.id), el("span", "dimw nw", dot + mi(b.km) + dot + ago(t - b.t) + " ago")), el("p", "small", bits.join(dot) || "no readings")));
         }
     }
     else if (nb >= 0) {
@@ -1095,7 +1141,7 @@ async function showTides(force = false) {
     box.append(el("p", "note", "Heights are above NOAA's average lowest tide (MLLW), so a low can read below 0. Windows: when the water is within " +
         HOLD_FT + " ft of each high or low, from NOAA's times, to about 5 min. Wind and pressure can shift real water a foot or more."));
 }
-async function findPlace(q) {
+async function findPlace(q, then) {
     var _a;
     const { town, quals } = placeParts(q);
     if (town.length < 2) {
@@ -1117,7 +1163,7 @@ async function findPlace(q) {
         keep("spot", { lat: h.latitude, lon: h.longitude, label, via: "place", t: now() });
         if (hits.length > 1)
             toast("chose " + label + " (" + (hits.length - 1) + " other matches)");
-        void showWeather(true);
+        then();
     }
     catch {
         toast("offline: could not look the place up");
@@ -1216,54 +1262,80 @@ function drawForecast(box, body, age, shown) {
         box.append(el("p", "note", "Forecast from " + since(age) + " \u00b7 updating\u2026"));
     else if (shown)
         box.append(el("p", "note warn", "Forecast from " + since(age) + (shown === "offline" ? " (no connection)" : " (could not update)")));
-    const u = US ? "\u00b0F" : "\u00b0C";
+    const u = US ? "°F" : "°C";
+    const num = (x) => (typeof x === "number" && isFinite(x) ? x : null);
+    const deg = (x) => (x === null ? "–" : Math.round(x) + "°");
     const c = f.current;
     const w = wmo(c.weather_code, c.is_day !== 0);
-    box.append(el("div", "now", el("span", "big", Math.round(c.temperature_2m) + u), el("span", "icon", w.icon), el("span", "", w.word)), el("p", "small", "Feels like " + Math.round(c.apparent_temperature) + "\u00b0 \u00b7 Humidity " + Math.round(c.relative_humidity_2m) +
-        "% \u00b7 Wind " + Math.round(c.wind_speed_10m) + (US ? " mph" : " km/h") +
-        (c.wind_gusts_10m > c.wind_speed_10m + 3 ? ", gusts " + Math.round(c.wind_gusts_10m) : "")));
+    const tNow = num(c.temperature_2m);
+    box.append(el("div", "now", el("span", "big", (tNow === null ? "–" : String(Math.round(tNow))) + u), el("span", "icon", w.icon), el("span", "", w.word)));
+    const feels = num(c.apparent_temperature), hum = num(c.relative_humidity_2m), wind = num(c.wind_speed_10m), gust = num(c.wind_gusts_10m);
+    const bits = [];
+    if (feels !== null)
+        bits.push("Feels like " + Math.round(feels) + "°");
+    if (hum !== null)
+        bits.push("Humidity " + Math.round(hum) + "%");
+    if (wind !== null)
+        bits.push("Wind " + Math.round(wind) + (US ? " mph" : " km/h") + (gust !== null && gust > wind + 3 ? ", gusts " + Math.round(gust) : ""));
+    if (bits.length)
+        box.append(el("p", "small", bits.join(" · ")));
     const n = Date.now() / 1000;
     const sun = [...f.daily.sunrise.map((t) => ["Sunrise", t]), ...f.daily.sunset.map((t) => ["Sunset", t])]
-        .filter(([, t]) => t > n).sort((a, b) => a[1] - b[1])[0];
-    if (sun)
-        box.append(el("p", "small", sun[0] + " " + clock(sun[1], false, undefined, tz)));
-    const pr = f.hourly.precipitation_probability.slice(0, 24);
-    const temps = f.hourly.temperature_2m.slice(0, 24);
+        .filter(([, t]) => num(t) !== null && t > n).sort((a, b) => a[1] - b[1]).slice(0, 2);
+    if (sun.length)
+        box.append(el("p", "small", sun.map(([w, t]) => w + " " + clock(t, false, undefined, tz)).join(" · ")));
+    const pr = f.hourly.precipitation_probability.slice(0, 24).map(num);
+    const temps = f.hourly.temperature_2m.slice(0, 24).map(num).filter((x) => x !== null);
     const W = 24 * 12, H = 60;
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 " + W + " " + (H + 16));
     svg.setAttribute("class", "chart");
     svg.setAttribute("role", "img");
+    let peak = -1;
     pr.forEach((p, i) => {
-        const h = Math.max(1, (Math.max(0, Math.min(100, p || 0)) / 100) * H);
-        const rect = document.createElementNS(svg.namespaceURI, "rect");
-        rect.setAttribute("x", String(i * 12 + 1));
-        rect.setAttribute("width", "10");
-        rect.setAttribute("y", String(H - h));
-        rect.setAttribute("height", String(h));
-        svg.append(rect);
-        if (i % 6 === 0) {
+        if (p !== null) {
+            if (peak < 0 || p > pr[peak])
+                peak = i;
+            const h = Math.max(1, (Math.max(0, Math.min(100, p)) / 100) * H);
+            const rect = document.createElementNS(svg.namespaceURI, "rect");
+            rect.setAttribute("x", String(i * 12 + 1));
+            rect.setAttribute("width", "10");
+            rect.setAttribute("y", String(H - h));
+            rect.setAttribute("height", String(h));
+            svg.append(rect);
+        }
+        const at = num(f.hourly.time[i]);
+        if (i % 6 === 0 && at !== null) {
             const t = document.createElementNS(svg.namespaceURI, "text");
             t.setAttribute("x", String(i * 12 + 1));
             t.setAttribute("y", String(H + 13));
-            t.textContent = clock(f.hourly.time[i], true, undefined, tz);
+            t.textContent = clock(at, true, undefined, tz);
             svg.append(t);
         }
     });
-    const peak = pr.reduce((b, p, i) => (p > pr[b] ? i : b), 0);
-    svg.setAttribute("aria-label", "Chance of rain over the next 24 hours, highest " + (pr[peak] || 0) + "%");
-    box.append(el("h3", "", "Next 24 hours \u00b7 " + Math.round(Math.min(...temps)) + "\u2013" + Math.round(Math.max(...temps)) + u), svg, el("p", (pr[peak] || 0) >= 10 ? "rain" : "small", (pr[peak] || 0) >= 10
-        ? "Rain " + pr[peak] + "% around " + clock(f.hourly.time[peak], false, undefined, tz) : "No rain expected"));
-    const lo = Math.min(...f.daily.temperature_2m_min), hi = Math.max(...f.daily.temperature_2m_max), span = (hi - lo) || 1;
+    const top = peak < 0 ? null : pr[peak], all = pr.every((p) => p !== null);
+    svg.setAttribute("aria-label", top === null ? "Chance of rain not reported" : "Chance of rain over the next 24 hours, highest " + Math.round(top) + "%");
+    box.append(el("h3", "", "Next 24 hours" + (temps.length ? " · " + Math.round(Math.min(...temps)) + "–" + Math.round(Math.max(...temps)) + u : "")), svg, el("p", top !== null && top >= 10 ? "rain" : "small", top === null ? "Rain chance not reported"
+        : top >= 10 ? "Rain chance by hour, highest " + Math.round(top) + "% around " + clock(f.hourly.time[peak], false, undefined, tz)
+            : all ? "Rain chance by hour stays under 10%: no rain expected" : "Rain chance by hour under 10% where reported"));
+    const mins = f.daily.temperature_2m_min.map(num), maxs = f.daily.temperature_2m_max.map(num);
+    const lows = mins.filter((x) => x !== null), highs = maxs.filter((x) => x !== null);
+    const lo = Math.min(...lows), hi = Math.max(...highs), span = (hi - lo) || 1;
     const days = el("div", "days");
     f.daily.time.forEach((t, i) => {
+        if (num(t) === null)
+            return;
         const dw = wmo(f.daily.weather_code[i]);
-        const a = f.daily.temperature_2m_min[i], b = f.daily.temperature_2m_max[i];
+        const a = mins[i], b = maxs[i], rain = num(f.daily.precipitation_probability_max[i]);
         const bar = el("span", "range", el("i"));
         const inner = bar.firstChild;
-        inner.style.left = ((a - lo) / span * 100).toFixed(1) + "%";
-        inner.style.width = Math.max(4, (b - a) / span * 100).toFixed(1) + "%";
-        days.append(el("div", "day", el("span", "d", new Date(t * 1000).toLocaleDateString(undefined, { weekday: "short", timeZone: tz })), el("span", "i", dw.icon), el("span", "w", dw.word), el("span", "t", Math.round(a) + "\u00b0"), bar, el("span", "t", Math.round(b) + "\u00b0"), el("span", (f.daily.precipitation_probability_max[i] || 0) >= 10 ? "p wet" : "p", (f.daily.precipitation_probability_max[i] || 0) + "%")));
+        if (a !== null && b !== null && isFinite(lo) && isFinite(hi)) {
+            inner.style.left = ((a - lo) / span * 100).toFixed(1) + "%";
+            inner.style.width = Math.max(4, (b - a) / span * 100).toFixed(1) + "%";
+        }
+        else
+            inner.hidden = true;
+        days.append(el("div", "day", el("span", "d", new Date(t * 1000).toLocaleDateString(undefined, { weekday: "short", timeZone: tz })), el("span", "i", dw.icon), el("span", "w", dw.word), el("span", "t", deg(a)), bar, el("span", "t", deg(b)), el("span", rain !== null && rain >= 10 ? "p wet" : "p", rain === null ? "–" : Math.round(rain) + "%")));
     });
     box.append(el("h3", "", "7 days"), days);
 }
@@ -1280,6 +1352,8 @@ function start() {
     };
     $("update").onclick = () => void updateNow($("update"));
     $("ver").textContent = "v" + APP_VERSION;
+    if ("scrollRestoration" in history)
+        history.scrollRestoration = "manual";
     renderTabs();
     if (S.view === "weather")
         void showWeather();

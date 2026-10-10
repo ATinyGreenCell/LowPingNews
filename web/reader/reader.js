@@ -17,7 +17,7 @@
 // missing (from=N&h=<hash>) instead of starting over.
 //
 // Deploy: lpn reader deploy. Start the 20-minute updates: lpn schedule.
-const VERSION = "9.8";
+const VERSION = "9.9";
 const SITE = "https://atinygreencell.github.io/LowPingNews/"; // override with a SITE variable
 const MAX_BYTES = 2 * 1024 * 1024; // stop reading a page here
 const TIMEOUT_MS = 10000;

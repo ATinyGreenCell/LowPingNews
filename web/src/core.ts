@@ -1,7 +1,7 @@
 // LowPingNews web: logic with no browser in it, so it can be tested in Node.
 // Everything downloaded is untrusted: parsed strictly, bounded, never HTML.
 
-export const APP_VERSION = "9.8";
+export const APP_VERSION = "9.9";
 export const SHOW = 10;          // stories shown at first
 export const MORE = 10;          // ...and added per "more"
 
@@ -185,6 +185,22 @@ export function takeLines(buf: string): [string[], string] {
 /** Seconds before try k (1, 2, ...): doubling from `first`, never over `most`. */
 export function backoff(k: number, first: number, most: number): number {
   return Math.min(most, first * Math.pow(2, Math.max(0, Math.min(k, 30) - 1)));
+}
+
+/** A section's name for its tab, where room is short: "Hazards and
+ *  emergencies" becomes "Hazards". */
+export function tabName(name: string): string {
+  return name.replace(/\s+(?:and|&)\s+.*$/i, "").trim() || name;
+}
+/** Whether a paragraph only repeats the headline: pages often carry their own
+ *  title as text, and the reader already shows it. */
+export function isHeadline(p: string, title: string): boolean {
+  const norm = (s: string): string => s.toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const a = norm(p), b = norm(title);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const [lo, hi] = a.length < b.length ? [a, b] : [b, a];
+  return lo.length >= 20 && hi.startsWith(lo) && lo.length >= 0.8 * hi.length;
 }
 
 /** "just now", "5m", "3h", "2d" - for ages in seconds. */

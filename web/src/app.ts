@@ -1,7 +1,7 @@
 // LowPingNews web: the page. Every piece of downloaded text goes in through
 // textContent, never as HTML.
 import type { Tide, CurrentStation, Flows, Why } from "./core.js";
-import { APP_VERSION, SHOW, Digest, Item, Alert, Article, Arrival, Step, takeLines, backoff, covers, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
+import { APP_VERSION, SHOW, Digest, Item, Alert, Article, Arrival, Step, takeLines, backoff, covers, tabName, isHeadline, parseDigest, parseArticle, staleness, ago, adoptWindow, moreWindow, clock, wmo, placeParts, placeFits, liveAlerts, preprintId, abstractFile, parseAbstractDoc, newerVersion, paperId, moon, tileKey, tideLevel, parseTile, parsePredictions, parseCurrents, flowAt, compass, nearWindow, round5, HOLD_FT, parseWhy, whyText } from "./core.js";
 
 type Kids = (Node | string | null | undefined | false)[];
 function el(tag: string, cls?: string, ...kids: Kids): HTMLElement {
@@ -30,6 +30,7 @@ const S = {
   known: new Set<string>(),
   fetched: 0,
   reading: null as Item | null,
+  listY: 0,                                     // where she was in the list when she opened a story
   read: new Set<string>(store<string[]>("read", [])),
 };
 function markRead(k: string): void {
@@ -128,7 +129,7 @@ const linkWord = (): "offline" | "slow" => (navigator.onLine === false ? "offlin
 // newer one. A link that stalls or drops leaves the saved copy up, says so,
 // and is tried again: after 10 s, 20 s, 40 s... (5 min at most), at once when
 // the phone says it is back online, and on returning to the app.
-const NEWS = { gen: 0, tries: 0, timer: 0, checking: false };
+const NEWS = { gen: 0, tries: 0, timer: 0, checking: false, at: {} as Record<string, number> };
 /** The service worker's saved copy of one of this site's files, and its age (s). */
 async function savedSite(path: string): Promise<{ body: unknown; age: number } | null> {
   try {
@@ -142,9 +143,16 @@ async function savedNews(cat: string): Promise<Digest | null> {
   const hit = await savedSite("./data/" + encodeURIComponent(cat) + ".json");
   return hit ? parseDigest(hit.body, now()) : null;
 }
-async function loadNews(cat: string, manual = false): Promise<void> {
+async function loadNews(cat: string, manual = false, cheap = false): Promise<void> {
   const gen = ++NEWS.gen;
   window.clearTimeout(NEWS.timer);
+  // flipping back to a section asked about in the last 5 minutes: the site
+  // rebuilds every 20, so the saved copy is the news - no request at all
+  if (cheap && now() - (NEWS.at[cat] || 0) < 300) {
+    const saved = await savedNews(cat);
+    if (gen !== NEWS.gen || cat !== S.view) return;
+    if (saved) { if (!S.digest) adopt(saved, false, true); status(); return; }
+  }
   // no-cache = ask the server whether it changed: an unchanged file costs a few
   // hundred bytes. The service worker answers from its copy when the link fails.
   const asked = getJSON("./data/" + encodeURIComponent(cat) + ".json", { lim: { wait: 12, idle: 10, total: 90 } })
@@ -166,6 +174,7 @@ async function loadNews(cat: string, manual = false): Promise<void> {
   NEWS.checking = false;
   if (cat !== S.view) return;                              // switched away meanwhile
   S.offline = how;
+  if (!how && raw) NEWS.at[cat] = now();
   if (how) {                                               // try again later, while she is looking
     NEWS.tries++;
     NEWS.timer = window.setTimeout(() => {
@@ -285,6 +294,7 @@ function card(it: Item, kept: Map<string, boolean>): HTMLElement {
   c.tabIndex = 0;
   c.setAttribute("role", "button");
   c.onclick = () => openReader(it);
+  c.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openReader(it); } };
   return c;
 }
 
@@ -363,6 +373,7 @@ function stopReading(): void {
 
 function openReader(it: Item, fromHistory = false): void {
   S.reading = it;
+  S.listY = window.scrollY;
   markRead(it.key);
   if (!fromHistory) history.pushState({ reading: it.key }, "");
   window.scrollTo(0, 0);
@@ -374,6 +385,7 @@ function closeReader(): void {
   S.reading = null;
   stopReading();
   renderNews();
+  window.scrollTo(0, S.listY);                  // back where she was, the story she read now dimmed
 }
 
 const NOTHING: Article = { text: "", complete: false, note: "", error: "" };
@@ -382,7 +394,8 @@ async function renderReader(it: Item, force = false): Promise<void> {
   const gen = READ.gen, cat = S.view;
   const live = (): boolean => gen === READ.gen && S.reading === it;
   const main = $("main");
-  const back = el("button", "back", "\u2039 Back");
+  // back buttons name where they go, at the top and at the end of the story
+  const back = el("button", "back", "\u2039 " + sectionName());
   back.onclick = () => history.back();
   const paras = el("div", "paras"), prog = el("div", "prog"), notes = el("div", "notes");
   const body = el("div", "body", paras, prog, notes);
@@ -391,13 +404,18 @@ async function renderReader(it: Item, force = false): Promise<void> {
     a_.href = it.link; a_.target = "_blank"; a_.rel = "noopener noreferrer";
     body.append(a_, el("p", "note", "The original page is the full website, which usually costs far more data."));
   }
+  const back2 = el("button", "back last", "\u2039 Back to " + sectionName());
+  back2.onclick = () => history.back();
+  body.append(back2);
   main.replaceChildren(back, el("div", "meta", it.src + (it.t ? " \u00b7 " + ago(now() - it.t) + " ago" : "")),
                        el("h1", "headline", it.title), body);
   // what is shown meanwhile may be a stand-in (the feed's summary, an older
   // copy): the first paragraph that arrives replaces it
   let standIn = false;
+  // a page that repeats its headline as its first lines: shown once, above
+  const dup = (p: string, i: number): boolean => i < 2 && p.length < 400 && isHeadline(p, it.title);
   const fill = (text: string, stand: boolean, cls = ""): void => {
-    paras.replaceChildren(...text.split("\n\n").filter(Boolean).map((p) => el("p", cls, p)));
+    paras.replaceChildren(...text.split("\n\n").filter((p, i) => p && !dup(p, i)).map((p) => el("p", cls, p)));
     standIn = stand;
   };
   const say = (text: string, warn = false, frac = -1, button?: [string, () => void]): void => {
@@ -415,8 +433,9 @@ async function renderReader(it: Item, force = false): Promise<void> {
     notes.replaceChildren();
     if (a.text) {
       if (standIn || !paras.childElementCount) fill(a.text, false);
-      if (!a.complete) notes.append(el("p", "note warn", a.note || "This may be only part of the article."));
-      else if (a.note) notes.append(el("p", "note", a.note));          // e.g. "This is the abstract."
+      const said = a.note ? a.note[0].toUpperCase() + a.note.slice(1) : "";
+      if (!a.complete) notes.append(el("p", "note warn", said || "This may be only part of the article."));
+      else if (said) notes.append(el("p", "note", said));              // e.g. "This is the abstract."
       if (why) notes.append(el("p", "note warn", why));
       if (savedAgo >= 0) notes.append(el("p", "note", "Saved on this phone " + (savedAgo < 60 ? "just now" : ago(savedAgo) + " ago")));
     } else {
@@ -469,7 +488,7 @@ async function renderReader(it: Item, force = false): Promise<void> {
     if (st === "reset") { paras.replaceChildren(); standIn = false; }
     if (st === "p") {
       if (standIn) { paras.replaceChildren(); standIn = false; }
-      if (arr.last) paras.append(el("p", "new", arr.last));
+      if (arr.last && !dup(arr.last, arr.n - 1)) paras.append(el("p", "new", arr.last));
     }
     if (st === "head" || st === "p" || st === "reset") say("Loading \u00b7 " + part(), false, arr.of ? arr.n / arr.of : 0);
   };
@@ -561,16 +580,30 @@ async function renderReader(it: Item, force = false): Promise<void> {
 // ---- tabs ---------------------------------------------------------------
 function renderTabs(): void {
   const nav = $("tabs");
+  const keep_ = nav.scrollLeft;
   nav.replaceChildren();
   const all: [string, string][] = [["weather", "Weather"], ["tides", "Tides"], ...S.cats];
+  let on: HTMLElement | undefined;
   for (const [id, name] of all) {
-    const b = el("button", id === S.view ? "tab on" : "tab", name);
+    const b = el("button", id === S.view ? "tab on" : "tab", tabName(name));
+    if (tabName(name) !== name) b.title = name;
+    if (id === S.view) { on = b; b.setAttribute("aria-current", "page"); }
     b.onclick = () => go(id);
     nav.append(b);
   }
+  nav.scrollLeft = keep_;
+  // the chosen tab in view, even far along the row (on opening the app, say)
+  if (on && (on.offsetLeft < nav.scrollLeft || on.offsetLeft + on.offsetWidth > nav.scrollLeft + nav.clientWidth))
+    nav.scrollLeft = Math.max(0, on.offsetLeft - (nav.clientWidth - on.offsetWidth) / 2);
+}
+/** The open section's name, as its tab shows it. */
+function sectionName(): string {
+  const c = S.cats.find(([id]) => id === S.view);
+  return c ? tabName(c[1]) : "the list";
 }
 
 function go(view: string): void {
+  if (view === S.view && S.reading) { history.back(); return; }      // the open section's tab: back to its list
   if (view === S.view && view !== "weather" && view !== "tides") { void loadNews(view, true); return; }
   S.view = view;
   keep("view", view);
@@ -580,7 +613,7 @@ function go(view: string): void {
   window.scrollTo(0, 0);
   if (view === "weather") void showWeather();
   else if (view === "tides") void showTides();
-  else { renderNews(); void loadNews(view); }
+  else { renderNews(); void loadNews(view, false, true); }
 }
 
 // ---- weather ------------------------------------------------------------
@@ -588,9 +621,41 @@ interface Spot { lat: number; lon: number; label: string; via: string; t: number
 const US = /-US$/i.test(navigator.language || "") || (navigator.language || "") === "en";
 
 function spotLine(sp: Spot): string {
-  const how = sp.via === "device" ? "your phone's location" : sp.via === "place" ? "set by place name" : sp.via;
+  const how = sp.via === "device" ? "from your location" : sp.via === "place" ? "from the place name" : sp.via;
   const age = ago(now() - sp.t);
-  return "For " + sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " (" + how + ", " + (/^\d/.test(age) ? age + " ago" : age) + ")";
+  return sp.lat.toFixed(3) + ", " + sp.lon.toFixed(3) + " \u00b7 set " + how + " " + (/^\d/.test(age) ? age + " ago" : age);
+}
+/** The place, on one line, with "Change" opening the ways to set it - kept out
+ *  of the way once it is set, since the forecast is what she came for. With no
+ *  place yet, they are open, and finding her location comes first. */
+function placeBlock(sp: Spot | null, then: () => void): HTMLElement {
+  const wrap = el("section", "spot");
+  const input = el("input") as HTMLInputElement;
+  input.placeholder = "Town, State (e.g. Huntington, NY)";
+  input.autocomplete = "off";
+  input.enterKeyHint = "search";
+  input.setAttribute("aria-label", "Town or place");
+  const find = el("button", "", "Find");
+  const mine = el("button", "primary", "Use my location");
+  const editor = el("div", "where", input, find, mine);
+  find.onclick = () => void findPlace(input.value, then);
+  input.onkeydown = (e) => { if (e.key === "Enter") void findPlace(input.value, then); };
+  mine.onclick = () => locate(then);
+  if (!sp) {
+    wrap.append(editor, el("p", "note", "Choose a place, or use your location. It is kept on this phone only."));
+    return wrap;
+  }
+  const change = el("button", "small", "Change");
+  change.setAttribute("aria-expanded", "false");
+  editor.hidden = true;
+  change.onclick = () => {
+    editor.hidden = !editor.hidden;
+    change.textContent = editor.hidden ? "Change" : "Cancel";
+    change.setAttribute("aria-expanded", String(!editor.hidden));
+    if (!editor.hidden) input.focus();
+  };
+  wrap.append(el("div", "spothead", el("h2", "place", sp.label || "Your spot"), change), el("p", "spotline", spotLine(sp)), editor);
+  return wrap;
 }
 
 async function showWeather(force = false): Promise<void> {
@@ -598,19 +663,8 @@ async function showWeather(force = false): Promise<void> {
   const main = $("main");
   main.replaceChildren();
   const sp = store<Spot | null>("spot", null);
-  const box = el("div", "where");
-  const input = el("input") as HTMLInputElement;
-  input.placeholder = "Town, State (e.g. Huntington, NY)";
-  input.autocomplete = "off";
-  const find = el("button", "small", "Find");
-  const mine = el("button", "small", "Use my location");
-  box.append(input, find, mine);
-  main.append(box);
-  find.onclick = () => void findPlace(input.value);
-  input.onkeydown = (e) => { if (e.key === "Enter") void findPlace(input.value); };
-  mine.onclick = () => locate();
-  if (!sp) { main.append(el("p", "empty", "Choose a place, or use your location. It is kept on this phone only.")); return; }
-  main.append(el("h2", "place", sp.label || "Your spot"), el("p", "note", spotLine(sp)));
+  main.append(placeBlock(sp, () => void showWeather(true)));
+  if (!sp) return;
   const alertsBox = el("section", "alerts", el("p", "note", "Checking for alerts\u2026"));
   const wxBox = el("section", "wx", el("p", "empty", "Loading the forecast\u2026"));
   main.append(alertsBox, wxBox);
@@ -621,27 +675,23 @@ async function showWeather(force = false): Promise<void> {
 }
 const WX = { failed: false }, TD = { failed: false };
 
-function locate(): void {
+/** Her location: the exact spot if the phone can get it in time (tides need
+ *  it), else a rough one. */
+function locate(then: () => void): void {
   if (!navigator.geolocation) { toast("this browser cannot share its location"); return; }
-  toast("asking for your location\u2026");
-  navigator.geolocation.getCurrentPosition((p) => {
-    keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Here", via: "device", t: now() });
-    void showWeather(true);
-  }, () => toast("location not shared - type a place instead"), { enableHighAccuracy: false, maximumAge: 1800000, timeout: 15000 });
+  toast("finding your location\u2026");
+  const got = (p: GeolocationPosition): void => {
+    keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Your location", via: "device", t: now() });
+    then();
+  };
+  navigator.geolocation.getCurrentPosition(got, () => navigator.geolocation.getCurrentPosition(got,
+    () => toast("location not shared - type a place instead"), { enableHighAccuracy: false, maximumAge: 1800000, timeout: 15000 }),
+    { enableHighAccuracy: true, maximumAge: 300000, timeout: 20000 });
 }
-
 // ---- tides -------------------------------------------------------------------
 // One tile from this site (stations and buoys near you, ~1-3 KB), NOAA's highs
-// and lows (~1 KB, kept 12 h), and the moon worked out on the phone.
+// and lows (~1 KB), and the moon worked out on the phone.
 const COOPS = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
-function locatePrecise(): void {
-  if (!navigator.geolocation) { toast("this browser cannot share its location"); return; }
-  toast("finding your exact spot\u2026");
-  navigator.geolocation.getCurrentPosition((p) => {
-    keep("spot", { lat: p.coords.latitude, lon: p.coords.longitude, label: "Here", via: "device", t: now() });
-    void showTides(true);
-  }, () => toast("location not shared - set a place in Weather instead"), { enableHighAccuracy: true, maximumAge: 300000, timeout: 20000 });
-}
 // NOAA's predictions are astronomy, fixed far ahead: a saved copy that spans the
 // next day is as good as a new one, so most visits ask NOAA nothing at all.
 const SPAN = 26 * 3600;
@@ -747,12 +797,9 @@ async function showTides(force = false): Promise<void> {
   status();
   const main = $("main");
   main.replaceChildren();
-  const mine = el("button", "small", "Use my precise location");
-  mine.onclick = () => locatePrecise();
-  main.append(el("div", "where", mine));
   const sp = store<Spot | null>("spot", null);
-  if (!sp) { main.append(el("p", "empty", "Tides need your spot: tap above, or set a place in Weather. It is kept on this phone only.")); return; }
-  main.append(el("h2", "place", sp.label || "Your spot"), el("p", "note", spotLine(sp)));
+  main.append(placeBlock(sp, () => void showTides(true)));
+  if (!sp) return;
   const box = el("section", "tides", el("p", "empty", "Loading tides\u2026"));
   main.append(box);
   const t = now();
@@ -900,7 +947,7 @@ async function showTides(force = false): Promise<void> {
       if (b.wind !== null) bits.push("wind " + (b.dir !== null ? compass(b.dir) + " " : "") + Math.round(b.wind * 1.944) + " kt");
       if (b.air !== null) bits.push("air " + deg(b.air));
       box.append(el("div", "tbuoy", el("div", "n", el("strong", "", buoyName(b.name) || "Buoy " + b.id),
-                                         el("span", "dimw", dot + mi(b.km) + dot + ago(t - b.t) + " ago")),
+                                         el("span", "dimw nw", dot + mi(b.km) + dot + ago(t - b.t) + " ago")),
                     el("p", "small", bits.join(dot) || "no readings")));
     }
   } else if (nb >= 0) {                     // a real tile: say why the list is empty
@@ -911,7 +958,7 @@ async function showTides(force = false): Promise<void> {
     HOLD_FT + " ft of each high or low, from NOAA's times, to about 5 min. Wind and pressure can shift real water a foot or more."));
 }
 
-async function findPlace(q: string): Promise<void> {
+async function findPlace(q: string, then: () => void): Promise<void> {
   const { town, quals } = placeParts(q);
   if (town.length < 2) { toast("type a town name"); return; }
   try {
@@ -925,7 +972,7 @@ async function findPlace(q: string): Promise<void> {
     const label = [h.name, h.admin1, h.country_code].filter((x) => typeof x === "string" && x).join(", ");
     keep("spot", { lat: h.latitude, lon: h.longitude, label, via: "place", t: now() });
     if (hits.length > 1) toast("chose " + label + " (" + (hits.length - 1) + " other matches)");
-    void showWeather(true);
+    then();
   } catch { toast("offline: could not look the place up"); }
 }
 
@@ -1021,58 +1068,79 @@ function drawForecast(box: HTMLElement, body: unknown, age: number, shown: Shown
   const tz = typeof f.timezone === "string" ? f.timezone : undefined;
   if (shown === "updating") box.append(el("p", "note", "Forecast from " + since(age) + " \u00b7 updating\u2026"));
   else if (shown) box.append(el("p", "note warn", "Forecast from " + since(age) + (shown === "offline" ? " (no connection)" : " (could not update)")));
-  const u = US ? "\u00b0F" : "\u00b0C";
+  const u = US ? "°F" : "°C";
+  // a reading the service left out stays out: never "Humidity 0%", a calm wind,
+  // a dry day or "no rain expected" made up from a missing number
+  const num = (x: unknown): number | null => (typeof x === "number" && isFinite(x) ? x : null);
+  const deg = (x: number | null): string => (x === null ? "–" : Math.round(x) + "°");
   const c = f.current;
   const w = wmo(c.weather_code, c.is_day !== 0);
-  box.append(el("div", "now", el("span", "big", Math.round(c.temperature_2m) + u), el("span", "icon", w.icon), el("span", "", w.word)),
-    el("p", "small", "Feels like " + Math.round(c.apparent_temperature) + "\u00b0 \u00b7 Humidity " + Math.round(c.relative_humidity_2m) +
-       "% \u00b7 Wind " + Math.round(c.wind_speed_10m) + (US ? " mph" : " km/h") +
-       (c.wind_gusts_10m > c.wind_speed_10m + 3 ? ", gusts " + Math.round(c.wind_gusts_10m) : "")));
+  const tNow = num(c.temperature_2m);
+  box.append(el("div", "now", el("span", "big", (tNow === null ? "–" : String(Math.round(tNow))) + u), el("span", "icon", w.icon), el("span", "", w.word)));
+  const feels = num(c.apparent_temperature), hum = num(c.relative_humidity_2m), wind = num(c.wind_speed_10m), gust = num(c.wind_gusts_10m);
+  const bits: string[] = [];
+  if (feels !== null) bits.push("Feels like " + Math.round(feels) + "°");
+  if (hum !== null) bits.push("Humidity " + Math.round(hum) + "%");
+  if (wind !== null) bits.push("Wind " + Math.round(wind) + (US ? " mph" : " km/h") + (gust !== null && gust > wind + 3 ? ", gusts " + Math.round(gust) : ""));
+  if (bits.length) box.append(el("p", "small", bits.join(" · ")));
   const n = Date.now() / 1000;
   const sun = [...f.daily.sunrise.map((t) => ["Sunrise", t] as [string, number]), ...f.daily.sunset.map((t) => ["Sunset", t] as [string, number])]
-    .filter(([, t]) => t > n).sort((a, b) => a[1] - b[1])[0];
-  if (sun) box.append(el("p", "small", sun[0] + " " + clock(sun[1], false, undefined, tz)));
-  // the next 24 hours: rain chance as bars, labelled every six hours
-  const pr = f.hourly.precipitation_probability.slice(0, 24);
-  const temps = f.hourly.temperature_2m.slice(0, 24);
+    .filter(([, t]) => num(t) !== null && t > n).sort((a, b) => a[1] - b[1]).slice(0, 2);
+  if (sun.length) box.append(el("p", "small", sun.map(([w, t]) => w + " " + clock(t, false, undefined, tz)).join(" · ")));
+  // the next 24 hours: rain chance as bars (none where it was not reported), labelled every six hours
+  const pr = f.hourly.precipitation_probability.slice(0, 24).map(num);
+  const temps = f.hourly.temperature_2m.slice(0, 24).map(num).filter((x): x is number => x !== null);
   const W = 24 * 12, H = 60;
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 " + W + " " + (H + 16));
   svg.setAttribute("class", "chart");
   svg.setAttribute("role", "img");
+  let peak = -1;
   pr.forEach((p, i) => {
-    const h = Math.max(1, (Math.max(0, Math.min(100, p || 0)) / 100) * H);
-    const rect = document.createElementNS(svg.namespaceURI, "rect");
-    rect.setAttribute("x", String(i * 12 + 1)); rect.setAttribute("width", "10");
-    rect.setAttribute("y", String(H - h)); rect.setAttribute("height", String(h));
-    svg.append(rect);
-    if (i % 6 === 0) {
+    if (p !== null) {
+      if (peak < 0 || p > (pr[peak] as number)) peak = i;
+      const h = Math.max(1, (Math.max(0, Math.min(100, p)) / 100) * H);
+      const rect = document.createElementNS(svg.namespaceURI, "rect");
+      rect.setAttribute("x", String(i * 12 + 1)); rect.setAttribute("width", "10");
+      rect.setAttribute("y", String(H - h)); rect.setAttribute("height", String(h));
+      svg.append(rect);
+    }
+    const at = num(f.hourly.time[i]);
+    if (i % 6 === 0 && at !== null) {
       const t = document.createElementNS(svg.namespaceURI, "text");
       t.setAttribute("x", String(i * 12 + 1)); t.setAttribute("y", String(H + 13));
-      t.textContent = clock(f.hourly!.time[i], true, undefined, tz);
+      t.textContent = clock(at, true, undefined, tz);
       svg.append(t);
     }
   });
-  const peak = pr.reduce((b, p, i) => (p > pr[b] ? i : b), 0);
-  svg.setAttribute("aria-label", "Chance of rain over the next 24 hours, highest " + (pr[peak] || 0) + "%");
-  box.append(el("h3", "", "Next 24 hours \u00b7 " + Math.round(Math.min(...temps)) + "\u2013" + Math.round(Math.max(...temps)) + u), svg,
-    el("p", (pr[peak] || 0) >= 10 ? "rain" : "small", (pr[peak] || 0) >= 10
-      ? "Rain " + pr[peak] + "% around " + clock(f.hourly.time[peak], false, undefined, tz) : "No rain expected"));
-  // seven days
-  const lo = Math.min(...f.daily.temperature_2m_min), hi = Math.max(...f.daily.temperature_2m_max), span = (hi - lo) || 1;
+  const top = peak < 0 ? null : pr[peak] as number, all = pr.every((p) => p !== null);
+  svg.setAttribute("aria-label", top === null ? "Chance of rain not reported" : "Chance of rain over the next 24 hours, highest " + Math.round(top) + "%");
+  box.append(el("h3", "", "Next 24 hours" + (temps.length ? " · " + Math.round(Math.min(...temps)) + "–" + Math.round(Math.max(...temps)) + u : "")), svg,
+    // the bars are the chance of rain, under a heading that gives temperatures: the caption says which is which
+    el("p", top !== null && top >= 10 ? "rain" : "small",
+       top === null ? "Rain chance not reported"
+       : top >= 10 ? "Rain chance by hour, highest " + Math.round(top) + "% around " + clock(f.hourly.time[peak], false, undefined, tz)
+       : all ? "Rain chance by hour stays under 10%: no rain expected" : "Rain chance by hour under 10% where reported"));
+  // seven days: a day the service gave no date for is left out; a missing number shows as a dash
+  const mins = f.daily.temperature_2m_min.map(num), maxs = f.daily.temperature_2m_max.map(num);
+  const lows = mins.filter((x): x is number => x !== null), highs = maxs.filter((x): x is number => x !== null);
+  const lo = Math.min(...lows), hi = Math.max(...highs), span = (hi - lo) || 1;
   const days = el("div", "days");
   f.daily.time.forEach((t, i) => {
-    const dw = wmo(f.daily!.weather_code[i]);
-    const a = f.daily!.temperature_2m_min[i], b = f.daily!.temperature_2m_max[i];
+    if (num(t) === null) return;
+    const dw = wmo(f.daily.weather_code[i]);
+    const a = mins[i], b = maxs[i], rain = num(f.daily.precipitation_probability_max[i]);
     const bar = el("span", "range", el("i"));
     const inner = bar.firstChild as HTMLElement;
-    inner.style.left = ((a - lo) / span * 100).toFixed(1) + "%";
-    inner.style.width = Math.max(4, (b - a) / span * 100).toFixed(1) + "%";
+    if (a !== null && b !== null && isFinite(lo) && isFinite(hi)) {
+      inner.style.left = ((a - lo) / span * 100).toFixed(1) + "%";
+      inner.style.width = Math.max(4, (b - a) / span * 100).toFixed(1) + "%";
+    } else inner.hidden = true;
     days.append(el("div", "day",
       el("span", "d", new Date(t * 1000).toLocaleDateString(undefined, { weekday: "short", timeZone: tz })),
       el("span", "i", dw.icon), el("span", "w", dw.word),
-      el("span", "t", Math.round(a) + "\u00b0"), bar, el("span", "t", Math.round(b) + "\u00b0"),
-      el("span", (f.daily!.precipitation_probability_max[i] || 0) >= 10 ? "p wet" : "p", (f.daily!.precipitation_probability_max[i] || 0) + "%")));
+      el("span", "t", deg(a)), bar, el("span", "t", deg(b)),
+      el("span", rain !== null && rain >= 10 ? "p wet" : "p", rain === null ? "–" : Math.round(rain) + "%")));
   });
   box.append(el("h3", "", "7 days"), days);
 }
@@ -1087,6 +1155,8 @@ function start(): void {
   };
   $("update").onclick = () => void updateNow($("update"));
   $("ver").textContent = "v" + APP_VERSION;
+  // the app puts her back in the list itself; the browser's own guess would fight it
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
   renderTabs();
   // the first view, as go() would show it - but opening the app is not a tap
   // on the tab, which would count as asking for a refresh

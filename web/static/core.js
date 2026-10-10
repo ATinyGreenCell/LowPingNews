@@ -1,4 +1,4 @@
-export const APP_VERSION = "9.8";
+export const APP_VERSION = "9.9";
 export const SHOW = 10;
 export const MORE = 10;
 const ANSI = /(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,2000}(?:\x07|\x1b\\|\x9c)?|\x1b[@-Z\\\-_]/g;
@@ -174,6 +174,19 @@ export function takeLines(buf) {
 }
 export function backoff(k, first, most) {
     return Math.min(most, first * Math.pow(2, Math.max(0, Math.min(k, 30) - 1)));
+}
+export function tabName(name) {
+    return name.replace(/\s+(?:and|&)\s+.*$/i, "").trim() || name;
+}
+export function isHeadline(p, title) {
+    const norm = (s) => s.toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const a = norm(p), b = norm(title);
+    if (!a || !b)
+        return false;
+    if (a === b)
+        return true;
+    const [lo, hi] = a.length < b.length ? [a, b] : [b, a];
+    return lo.length >= 20 && hi.startsWith(lo) && lo.length >= 0.8 * hi.length;
 }
 const PREPRINT = /^https?:\/\/(?:www\.|connect\.)?(biorxiv|medrxiv)\.org\/(?:content\/(?:early\/\d{4}\/\d{2}\/\d{2}\/)?|cgi\/content\/(?:short|abstract|full)\/)(?:10\.1101\/)?(\d{4}\.\d{2}\.\d{2}\.\d{5,8}|\d{6})(?:v\d+)?/i;
 export function preprintId(link) {
